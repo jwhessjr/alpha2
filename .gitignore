@@ -2,6 +2,7 @@
 ApiKey.txt
 fred_api.txt
 *.txt
+!requirements.txt
 
 #data files created in the running of the programs
 *.csv
