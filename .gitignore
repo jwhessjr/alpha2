@@ -1,0 +1,31 @@
+# keys & txt files
+ApiKey.txt
+fred_api.txt
+*.txt
+
+#data files created in the running of the programs
+*.csv
+
+# pdf files
+*.pdf
+
+# stock screen files
+*.numbers
+
+#  Extra inputs not used by the programs
+r&dAmortization.xlsx
+
+# miscellaneous testing programs
+alpha_vantage_get_financials.py
+erp.py
+r_and_d.py
+
+# directories & files
+__pycache__/
+test/
+.venv/
+.vscode/
+.cache/
+.pytest_cache/
+*.log
+.venv
