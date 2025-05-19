@@ -40,6 +40,7 @@ def get_inc_stmnt(company, apiKey):
     incomeStatement = {}
     operatingIncome = []
     incomeTaxExpense = []
+    interestExpense = []
     indx = 0
     for year in range(5):
         for qtr in range(indx + 4):
@@ -57,6 +58,12 @@ def get_inc_stmnt(company, apiKey):
                 + safe_float(incStmnt[indx + 3]["incomeTaxExpense"])
             )
 
+            yearInterestExpense = (
+                safe_float(incStmnt[indx]["interestExpense"])
+                + safe_float(incStmnt[indx + 1]["interestExpense"])
+                + safe_float(incStmnt[indx + 2]["interestExpense"])
+                + safe_float(incStmnt[indx + 3]["interestExpense"])
+            )
         operatingIncome.append(yearOperatingIncome)
         # print(f"Net Income = {yearoperatingIncome}")
         # print(f"Interest Income = {yearIntIncome}")
@@ -65,6 +72,7 @@ def get_inc_stmnt(company, apiKey):
         # incomeBeforeTax.append(yearIncBeforeTax)
         # print(f"Income Before Tax = {yearIncBeforeTax}")
         incomeTaxExpense.append(yearTaxExpense)
+        interestExpense.append(yearInterestExpense)
         # print(f"Tax Expense = {yearTaxExpense}")
         # ebit.append(yearEbit)
         # print(f"EBIT = {yearEbit}")
@@ -73,6 +81,7 @@ def get_inc_stmnt(company, apiKey):
             break
     incomeStatement["operating_income"] = operatingIncome
     incomeStatement["income_tax_expense"] = incomeTaxExpense
+    incomeStatement["interest_expense"] = interestExpense
     # print("incomeTaxExpense")
     # print(incomeStatement["operatingIncome"])
 
