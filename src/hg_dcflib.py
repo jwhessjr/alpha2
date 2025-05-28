@@ -9,7 +9,6 @@ from urllib.request import urlopen
 import certifi
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 # import logging
 
@@ -19,11 +18,13 @@ def safe_float(val):
         return float(val)
     except (TypeError, ValueError):
         return 0.0
+
+
 # Read statements from Alpha Vantage
 
 
 def get_jsonparsed_data(url):
-    response = urlopen(url, cafile=certifi.where())
+    response = urlopen(url)
     data = response.read().decode("utf-8")
     return json.loads(data)
 
@@ -145,7 +146,6 @@ def get_bal_sheet(company, apiKey):
         safe_float(balSheet[8]["currentLongTermDebt"]),
         safe_float(balSheet[12]["currentLongTermDebt"]),
         # safe_float(balSheet[16]["currentLongTermDebt"]),
-
     ]
     shortTermDebt = [
         safe_float(balSheet[0]["shortTermDebt"]),
@@ -199,14 +199,10 @@ def get_cash_flow(company, apiKey):
             )
 
             yearDeprec = (
-                safe_float(
-                    cashFlw[indx]["depreciationDepletionAndAmortization"])
-                + safe_float(cashFlw[indx + 1]
-                             ["depreciationDepletionAndAmortization"])
-                + safe_float(cashFlw[indx + 2]
-                             ["depreciationDepletionAndAmortization"])
-                + safe_float(cashFlw[indx + 3]
-                             ["depreciationDepletionAndAmortization"])
+                safe_float(cashFlw[indx]["depreciationDepletionAndAmortization"])
+                + safe_float(cashFlw[indx + 1]["depreciationDepletionAndAmortization"])
+                + safe_float(cashFlw[indx + 2]["depreciationDepletionAndAmortization"])
+                + safe_float(cashFlw[indx + 3]["depreciationDepletionAndAmortization"])
             )
             # yearAcquisition = (
             #     qrtrlyData[indx]["acquisitionsNet"]
@@ -242,6 +238,7 @@ def get_cash_flow(company, apiKey):
     # cshFlw["dividendsPaid"] = dividends
 
     return cashFlow
+
 
 # function to retrieve R&D expense so we can capitalize it
 
@@ -308,7 +305,7 @@ def get_risk_free(FRED_KEY):
         "api_key": FRED_KEY,
         "file_type": "json",
         "sort_order": "desc",
-        "limit": 1
+        "limit": 1,
     }
     # Fetch data
     response = requests.get(url, params=params, timeout=20)
@@ -326,7 +323,8 @@ def get_risk_free(FRED_KEY):
 
 def get_industry(company):
     indName = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/indname.xlsx", sheet_name="US by industry")
+        "/Users/jhess/Development/Alpha2/data/indname.xlsx", sheet_name="US by industry"
+    )
     for index, row in indName.iterrows():
         try:
             if company == row["Exchange:Ticker"].split(":")[1]:
@@ -342,13 +340,14 @@ def get_industry(company):
 
 
 def get_beta(industry):
-
     beta = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/betas.xlsx", sheet_name="Industry Averages", skiprows=9)
+        "/Users/jhess/Development/Alpha2/data/betas.xlsx",
+        sheet_name="Industry Averages",
+        skiprows=9,
+    )
 
     for index, row in beta.iterrows():
         try:
-
             if industry in row["Industry Name"]:
                 unleveredBeta = row["Unlevered beta corrected for cash"]
             else:
@@ -383,7 +382,8 @@ def get_default_spread(intCover):
 def get_rAndD_years(industry):
     amortYears = pd.read_excel(
         "/Users/jhess/Development/Alpha2/data/RD_Amortization.xlsx",
-        sheet_name="Amort Years",)
+        sheet_name="Amort Years",
+    )
 
     for index, row in amortYears.iterrows():
         try:
