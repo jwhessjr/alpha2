@@ -4,7 +4,7 @@ fred_api.txt
 *.txt
 !requirements.txt
 
-#data files created in the running of the programs
+#data files created for testing in the running of the programs
 *.csv
 
 # pdf files
@@ -23,6 +23,7 @@ r_and_d.py
 
 # directories & files
 __pycache__/
+*.pyc
 test/
 .venv/
 .vscode/

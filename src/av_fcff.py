@@ -1,22 +1,27 @@
 """
 
-    This Module calculates a value for a common stock using a Discounted Cash Flow.  The specific cash flow calculated is a Free Cash Flow to the Firm.  The valuation is then calcuated by adding back the cash and equivalents to the enterprise value and subtracting out debt.
+This Module calculates a value for a common stock using a Discounted Cash Flow.  The specific cash flow calculated is a Free Cash Flow to the Firm.  The valuation is then calcuated by adding back the cash and equivalents to the enterprise value and subtracting out debt.
 
 """
 
 import csv
 import hg_dcflib
 
-EQ_PREM = 0.0441    # Damodaran 05/01/2025
+EQ_PREM = 0.0441  # Damodaran 05/01/2025
 MARGINAL_TAX_RATE = 0.26
 STABLE_BETA = 1.0
 
 
 def calcCapitalExpenditures(cash_flw):
-    capex = (cash_flw["capex"][0] + cash_flw["capex"][1] + cash_flw["capex"]
-             [2] + cash_flw["capex"][3] + cash_flw["capex"][4]) / 5
+    capex = (
+        cash_flw["capex"][0]
+        + cash_flw["capex"][1]
+        + cash_flw["capex"][2]
+        + cash_flw["capex"][3]
+        + cash_flw["capex"][4]
+    ) / 5
 
-    return (capex)
+    return capex
 
 
 def capitalizerAndD(company, rd_years, MY_API_KEY):
@@ -37,8 +42,7 @@ def capitalizerAndD(company, rd_years, MY_API_KEY):
         if year == 0:
             curr_year_amortization.append(0.00)
         else:
-            curr_year_amortization.append(
-                rd_expense[year] * amort_percentage)
+            curr_year_amortization.append(rd_expense[year] * amort_percentage)
 
         rd_asset_value += unamort_amt[year]
         rd_amort_amt += curr_year_amortization[year]
@@ -102,32 +106,51 @@ def main():
     shares_outstanding = ent_quote[1]
     market_cap = ent_quote[2]
 
-    ebit = inc_stmnt["operatingIncome"][0] + \
-        amort_schedule["rAndDExpense"][0] - \
-        amort_schedule["RD_Amortization_Amt"]
+    ebit = (
+        inc_stmnt["operatingIncome"][0]
+        + amort_schedule["rAndDExpense"][0]
+        - amort_schedule["RD_Amortization_Amt"]
+    )
     capex = calcCapitalExpenditures(cash_flw)
-    deprec = (cash_flw["depreciation"][0])
+    deprec = cash_flw["depreciation"][0]
     inc_tax = inc_stmnt["incomeTaxExpense"][0]
     eff_tax_rate = inc_tax / ebit
-    book_value_debt = (bal_Sht["shortTermDebt"][0]) + (bal_Sht["longTermDebt"]
-                                                       [0] + bal_Sht["shortTermDebt"][1] + bal_Sht["longTermDebt"][1])/2
+    book_value_debt = (
+        (bal_Sht["shortTermDebt"][0])
+        + (
+            bal_Sht["longTermDebt"][0]
+            + bal_Sht["shortTermDebt"][1]
+            + bal_Sht["longTermDebt"][1]
+        )
+        / 2
+    )
     print("book_value_debt")
     print(bal_Sht["shortTermDebt"][0], bal_Sht["longTermDebt"][0])
-    book_value_equity = ((bal_Sht["totalStockholdersEquity"][0] +
-                          bal_Sht["totalStockholdersEquity"][1])/2) + amort_schedule["RD_Asset_Value"]
-    cash = (bal_Sht["cashAndEquivalents"][0])
+    book_value_equity = (
+        (bal_Sht["totalStockholdersEquity"][0] + bal_Sht["totalStockholdersEquity"][1])
+        / 2
+    ) + amort_schedule["RD_Asset_Value"]
+    cash = bal_Sht["cashAndEquivalents"][0]
 
     # Calculate Current Year Non Cash Working Capital
     # Calculate a moving average change in working capital
     curr_year_working_cap = (
         bal_Sht["totalCurrentAssets"][0] - bal_Sht["cashAndEquivalents"][0]
-    ) - (bal_Sht["totalCurrentLiabilities"][0] - bal_Sht["shortTermDebt"][0] - bal_Sht["currentLongDebt"][0])
+    ) - (
+        bal_Sht["totalCurrentLiabilities"][0]
+        - bal_Sht["shortTermDebt"][0]
+        - bal_Sht["currentLongDebt"][0]
+    )
     print(f"Current Working Capital = {curr_year_working_cap:,.2f}")
 
     # Calculate Prior Year Non Cash Working Capitalß
     prior_year_working_cap = (
         bal_Sht["totalCurrentAssets"][1] - bal_Sht["cashAndEquivalents"][1]
-    ) - (bal_Sht["totalCurrentLiabilities"][1] - bal_Sht["shortTermDebt"][1] - bal_Sht["currentLongDebt"][1])
+    ) - (
+        bal_Sht["totalCurrentLiabilities"][1]
+        - bal_Sht["shortTermDebt"][1]
+        - bal_Sht["currentLongDebt"][1]
+    )
     print(f"Prior Year Working Capital = {prior_year_working_cap:,.2f}")
 
     # Calculate Change in Non Cash Working Capital
@@ -150,15 +173,18 @@ def main():
     print(f"Income Tax = {inc_tax:,.2f}")
 
     # Calculate Griwth Rate in Operating Income
-    firmReinvestment = capex - deprec + change_working_cap + \
-        amort_schedule["rAndDExpense"][0] - \
-        amort_schedule["RD_Amortization_Amt"]
+    firmReinvestment = (
+        capex
+        - deprec
+        + change_working_cap
+        + amort_schedule["rAndDExpense"][0]
+        - amort_schedule["RD_Amortization_Amt"]
+    )
     print(f"Reinvestment = {firmReinvestment:,.2f}")
     reinvestmentRate = firmReinvestment / (ebit * (1 - eff_tax_rate))
     print(f"Reinvestment Rate = {reinvestmentRate}")
     print(book_value_debt, book_value_equity, cash)
-    ROC = (ebit * (1 - eff_tax_rate)) / \
-        (book_value_debt + book_value_equity - cash)
+    ROC = (ebit * (1 - eff_tax_rate)) / (book_value_debt + book_value_equity - cash)
     print(f"Return on Capital = {ROC}")
     expGrowthebit = reinvestmentRate * ROC
     print(f"Expected Growth in Op Income = {expGrowthebit}")
@@ -228,7 +254,7 @@ def main():
     valuePerShare = equityValue / shares_outstanding
     print(f"Value per share = {valuePerShare:,.2f}")
     print(f"Price per share = {price:,.2f}")
-    print(f"Over/Under Value = {(price / valuePerShare)-1:,.2f}")
+    print(f"Over/Under Value = {(price / valuePerShare) - 1:,.2f}")
 
 
 if __name__ == "__main__":
