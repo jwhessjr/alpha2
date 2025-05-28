@@ -5,8 +5,6 @@ This library is a collection of functions used in the Hess Group DCF model.
 
 import json
 from urllib.request import urlopen
-
-import certifi
 import pandas as pd
 import requests
 
@@ -360,7 +358,7 @@ def get_beta(industry):
 
 def get_default_spread(intCover):
     defaultSpread = pd.read_excel(
-        "/Users/jhess/Documents/Investing/Damodaran Reference/defaultSpread.xlsx"
+        "/Users/jhess/Development/Alpha2/data/defaultSpread.xlsx"
     )
 
     # for col in defaultSpread.columns:
