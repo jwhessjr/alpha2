@@ -45,6 +45,7 @@ class Stock_Value:
     #
     # calcukated values in dataclass methods
     growth_rate: float = None
+    cost_of_capital: float = None
     fcff_value: float = None
     terminal_value: float = None
     ent_value: float = None
@@ -266,11 +267,8 @@ def calc_discount_rate(
     return cost_of_capital
 
 
-def calc_pv_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD, discount_rate):
-    print("IN calc_pv")
-
+def calc_expected_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD):
     fcff_table = []
-    pv_fcff = 0
     for year in range(GROWTH_PERIOD):
         if year == 0:
             fcff_table.append(curr_yr_fcff * (1 + growth_rate))
@@ -279,7 +277,16 @@ def calc_pv_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD, discount_rate):
     for val in fcff_table:
         print(f"Expected FCFF = {val:,.2f}")
 
-    return pv_fcff
+    return fcff_table
+
+
+def calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate):
+    fcff_value = 0
+    for year in range(GROWTH_PERIOD):
+        fcff_pv = fcff_table[year] / (1 + discount_rate) ** (year + 1)
+        fcff_value += fcff_pv
+    print(f"FCFF Value = {fcff_value:,.2f}")
+    return fcff_value
 
 
 # %% [markdown]
@@ -349,34 +356,11 @@ def main():
     )
     print(f"disc rate {discount_rate:,.4}")
 
-    print("ENTER pv_fcff")
-    pv_fcff = calc_pv_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD, discount_rate)
+    fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD)
 
-    print(pv_fcff)
-    # import traceback
+    fcff_pv = calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate)
 
-    # print("✅ Start valuation process")
-
-    # try:
-    #     print(f"disc rate {discount_rate:,.4f}")
-    #     print(
-    #         f"Inputs: {curr_yr_fcff}, {growth_rate}, {GROWTH_PERIOD}, {discount_rate}"
-    #     )
-
-    #     print("➡️ Before calling calc_pv_fcff")
-    #     pv_fcff = calc_pv_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD, discount_rate)
-    #     print("✅ Successfully called calc_pv_fcff")
-
-    #     print(pv_fcff)
-    #     print(valuation.valuation_date)
-    #     print(valuation.ticker)
-    #     print(f"{valuation.shares_outstanding:,}")
-
-    #     print("🎉 DONE")
-    # except Exception as e:
-    #     print("💥 ERROR during valuation process:")
-    #     traceback.print_exc()
-
+    terminal_value = calc_terminal_value()
     print(valuation.valuation_date)
     print(valuation.ticker)
     print(f"{valuation.shares_outstanding:,}")
