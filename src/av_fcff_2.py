@@ -289,6 +289,28 @@ def calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate):
     return fcff_value
 
 
+def calc_terminal_value(fcff, GROWTH_PERIOD, RISK_FREE, discount_rate):
+    terminal_value = (fcff * (1 + RISK_FREE)) / (discount_rate - RISK_FREE)
+    terminal_value_pv = terminal_value / ((1 + discount_rate) ** GROWTH_PERIOD)
+    print(f"Terminal Value = {terminal_value_pv:,.2f}")
+    return terminal_value_pv
+
+
+def calc_intrinsic_value(
+    fcff_pv,
+    terminal_value_pv,
+    cash_and_equivalents,
+    adjusted_bv_debt,
+    shares_outstanding,
+):
+    enterprise_value = (
+        fcff_pv + terminal_value_pv + cash_and_equivalents - adjusted_bv_debt
+    )
+    intrinsic_value = enterprise_value / shares_outstanding
+    print(f"Intrinsic Value = {intrinsic_value:,.2f}")
+    return intrinsic_value
+
+
 # %% [markdown]
 # ## Main() Function
 
@@ -346,6 +368,7 @@ def main():
         adjusted_ebiat, adjusted_bv_equity, adjusted_bv_debt
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
+    valuation.growth_rate = growth_rate
     discount_rate = calc_discount_rate(
         EQ_PREM,
         UNLEVERED_BETA,
@@ -355,15 +378,33 @@ def main():
         adjusted_bv_debt,
     )
     print(f"disc rate {discount_rate:,.4}")
+    valuation.cost_of_capital = discount_rate
 
     fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD)
 
     fcff_pv = calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate)
+    terminal_cost_of_capital = calc_discount_rate(
+        EQ_PREM, STABLE_BETA, RISK_FREE, inc_stmnt, adjusted_bv_debt, adjusted_bv_equity
+    )
+    valuation.fcff_value = fcff_pv
+    terminal_value_pv = calc_terminal_value(
+        fcff_table[-1], GROWTH_PERIOD, RISK_FREE, terminal_cost_of_capital
+    )
+    valuation.terminal_value = terminal_value_pv
 
-    terminal_value = calc_terminal_value()
+    intrinsic_value = calc_intrinsic_value(
+        fcff_pv,
+        terminal_value_pv,
+        bal_sht["cash_and_equivalents"][0],
+        adjusted_bv_debt,
+        shares_outstanding,
+    )
+    valuation.share_value = intrinsic_value
+
     print(valuation.valuation_date)
     print(valuation.ticker)
     print(f"{valuation.shares_outstanding:,}")
+    print(f"Valuation: {valuation}")
 
     print("DONE")
 
