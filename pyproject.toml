@@ -1,7 +1,7 @@
 [project]
 name = "alpha2"
 version = "0.1.0"
-description = "Python Modules that will automate the ca;cu;lation the intrinsic value of a stock"
+description = "Python Modules that will automate the calculation of the intrinsic value of a stock"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
