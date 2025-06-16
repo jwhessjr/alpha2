@@ -1,19 +1,17 @@
-# %% [markdown]
+#
 # This Notebook will be used to refactor my av_fcff.py module to a more correct form
 #
 
-# %%
 from dataclasses import dataclass
 from typing import Optional
 from datetime import date
 import csv
 import hg_dcflib
 
-# %% [markdown]
+
 # ## Define the constants used in the module
 
-# %%
-EQ_PREM = 0.0441  # Damodaran 05/01/2025
+EQ_PREM = hg_dcflib.get_erp()
 MARGINAL_TAX_RATE = 0.26
 STABLE_BETA = 1.0
 COMPANY = input("Input company ticker: ").upper()
@@ -27,11 +25,8 @@ RD_YEARS = hg_dcflib.get_rAndD_years(INDUSTRY) + 1
 UNLEVERED_BETA = hg_dcflib.get_beta(INDUSTRY)
 RISK_FREE = hg_dcflib.get_risk_free(FRED_KEY)
 
-# %% [markdown]
+
 # ## Class for Valuation
-
-
-# %%
 @dataclass
 class Stock_Value:
     valuation_date: str
@@ -42,23 +37,19 @@ class Stock_Value:
     shares_outstanding: float
     risk_free_rate: float
     eq_premium: float
-    #
+
     # calcukated values in dataclass methods
     growth_rate: float = None
     cost_of_capital: float = None
     fcff_value: float = None
     terminal_value: float = None
-    ent_value: float = None
     share_value: float = None
     margin_of_safety: float = None
 
 
-# %% [markdown]
 # ## Functions
-#
 
 
-# %%
 def income_statement(COMPANY, MY_API_KEY):
     inc_stmnt = hg_dcflib.get_inc_stmnt(COMPANY, MY_API_KEY)
     # with open(f"data/{COMPANY}inc_stmnt.csv", "w", newline="") as f:
@@ -92,6 +83,7 @@ def enterprise_quote(COMPANY, MY_API_KEY):
 
 
 def calc_capital_expenditures(cash_flw):
+    # normalize capex
     capex = (
         cash_flw["capex"][0]
         + cash_flw["capex"][1]
@@ -120,7 +112,7 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     unamort_percent = []
     unamort_amt = []
     curr_year_amortization = []
-    amort_percentage = 1.0 / RD_YEARS
+    amort_percentage = 1.0 / (RD_YEARS - 1)
     rd_asset_value = 0
     rd_amort_amt = 0
     for year in range(RD_YEARS):
@@ -154,7 +146,7 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw):
     print(f"Change WC {chng_nc_wc:,.2f}")
     depreciation = cash_flw["depreciation"][0]
     print(f"Depreciation {depreciation:,.2f}")
-    fcff = ebiat - capex + depreciation + chng_nc_wc
+    fcff = ebiat - capex + depreciation - chng_nc_wc
     print(f"FCFF {fcff:,.2f}")
     fcff_data = [ebiat, capex, chng_nc_wc, depreciation, fcff]
     return fcff_data
@@ -172,12 +164,12 @@ def calc_reinvestment(ebiat, capex, depreciation, chng_nc_wc, amort_schedule):
     return firm_reinvestment
 
 
-def calc_adj_ebiat(ebiat, amort_schedule):
+def calc_adj_ebiat(inc_stmnt, amort_schedule, eff_tax_rate):
     adjusted_ebiat = (
-        ebiat
+        inc_stmnt["operating_income"][0]
         + amort_schedule["rAndDExpense"][0]
         - amort_schedule["RD_Amortization_Amt"]
-    )
+    ) * (1 - eff_tax_rate)
     print(f"Adjusted ebiat {adjusted_ebiat:,.2f}")
     return adjusted_ebiat
 
@@ -190,7 +182,7 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
     return adjusted_bv_equity
 
 
-def calc_adj_bv_debt(bal_sht):
+def calc_adj_bv_debt(bal_sht, amort_schedule):
     adj_bv_debt = (
         bal_sht["current_long_debt"][0]
         + bal_sht["long_term_debt"][0]
@@ -224,16 +216,8 @@ def calc_discount_rate(
     # The cost of capital is the weighted average of the cost of equity and the cost of debt
     # Cost of equity = risk free rate + Beta(Implied Equity Risk Premium)
 
-    cost_of_equity = RISK_FREE + UNLEVERED_BETA * EQ_PREM
+    cost_of_equity = RISK_FREE + (UNLEVERED_BETA * EQ_PREM)
     print(f"COE = {cost_of_equity:,.4}")
-
-    # Cost of debt = risk free rate + default spread * (1 - marginal tax rate)
-    # 1. Calculate Interest Coverage
-
-    # if inc_stmnt["interest_expense"][0] != 0:
-    #      int_cover = inc_stmnt["operating_income"][0] / inc_stmnt["interest_expense"][0]
-    # else:
-    #     int_cover = 25
 
     try:
         int_cover = inc_stmnt["operating_income"][0] / inc_stmnt["interest_expense"][0]
@@ -302,10 +286,7 @@ def calc_intrinsic_value(
     return intrinsic_value
 
 
-# %% [markdown]
 # ## Main() Function
-
-# %%
 
 
 def main():
@@ -334,9 +315,10 @@ def main():
     firm_reinvestment = calc_reinvestment(
         ebiat, capex, depreciation, chng_nc_wc, amort_schedule
     )
-    adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
+    eff_tax_rate = calc_tax_rate(inc_stmnt)
+    adjusted_ebiat = calc_adj_ebiat(inc_stmnt, amort_schedule, eff_tax_rate)
     adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
-    adjusted_bv_debt = calc_adj_bv_debt(bal_sht)
+    adjusted_bv_debt = calc_adj_bv_debt(bal_sht, amort_schedule)
     reinvestment_rate = firm_reinvestment / adjusted_ebiat
     print(f"Reinvestment rate = {reinvestment_rate:,.4f}")
     try:
@@ -354,7 +336,6 @@ def main():
     except Exception as e:
         print("An exception occured: ", e)
 
-    eff_tax_rate = calc_tax_rate(inc_stmnt)
     return_on_capital = calc_return_on_capital(
         adjusted_ebiat, adjusted_bv_equity, adjusted_bv_debt
     )

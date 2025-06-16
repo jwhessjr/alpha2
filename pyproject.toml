@@ -5,6 +5,7 @@ description = "Python Modules that will automate the calculation of the intrinsi
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "bs4>=0.0.2",
     "certifi>=2025.4.26",
     "ipykernel>=6.29.5",
     "openpyxl>=3.1.5",
