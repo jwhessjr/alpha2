@@ -3,9 +3,12 @@
 #
 
 from dataclasses import dataclass
-from typing import Optional
+
+# from typing import Optional
 from datetime import date
-import csv
+import sqlite3
+
+# import csv
 import hg_dcflib
 
 
@@ -29,25 +32,80 @@ RISK_FREE = hg_dcflib.get_risk_free(FRED_KEY)
 # ## Class for Valuation
 @dataclass
 class Stock_Value:
-    valuation_date: str
     ticker: str
+    valuation_date: str
+
     industry: str
     beta: float
+    market_cap: float
     price: float
     shares_outstanding: float
     risk_free_rate: float
     eq_premium: float
 
     # calcukated values in dataclass methods
-    growth_rate: float = None
-    cost_of_capital: float = None
-    fcff_value: float = None
-    terminal_value: float = None
-    share_value: float = None
-    margin_of_safety: float = None
+    growth_rate: float
+    cost_of_capital: float
+    fcff_value: float
+    terminal_value: float
+    share_value: float
+    margin_of_safety: float
 
 
 # ## Functions
+
+
+def create_table():
+    conn = sqlite3.connect("value.db")
+    c = conn.cursor()
+
+    c.execute("""CREATE TABLE IF NOT EXISTS valuation (
+              ticker TEXT NOT NULL,
+              valuation_date TEXT NOT NULL,
+              industry TEXT NOT NULL,
+              beta REAL NOT NULL,
+              price REAL NOT NULL,
+              shares_outstanding REAL NOT NULL,
+              risk_free_rate REAL NOT NULL,
+              eq_premium REAL NOT NULL,
+              growth_rate REAL NOT NULL,
+              cost_of_capital REAL NOT NULL,
+              fcff_value REAL NOT NULL,
+              terminal_value REAL NOT NULL,
+              share_value REAL NOT NULL,
+              margin_of_safety REAL NOT NULL,
+              PRIMARY KEY (ticker, valuation_date)
+              )
+              """)
+
+    conn.commit()
+
+
+def insert_valuation(conn, val):
+    c = conn.cursor()
+    c.execute(
+        """
+              INSERT OR REPLACE INTO valuation (ticker, valuation_date, industry, beta, price, shares_outstanding, risk_free_rate, eq_premium, growth_rate, cost_of_capital, fcff_value, terminal_value, share_value, margin_of_safety
+            )  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              """,
+        (
+            val.ticker,
+            val.valuation_date,
+            val.industry,
+            val.beta,
+            val.price,
+            val.shares_outstanding,
+            val.risk_free_rate,
+            val.eq_premium,
+            val.growth_rate,
+            val.cost_of_capital,
+            val.fcff_value,
+            val.terminal_value,
+            val.share_value,
+            val.margin_of_safety,
+        ),
+    )
+    conn.commit()
 
 
 def income_statement(COMPANY, MY_API_KEY):
@@ -182,7 +240,7 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
     return adjusted_bv_equity
 
 
-def calc_adj_bv_debt(bal_sht, amort_schedule):
+def calc_adj_bv_debt(bal_sht):
     adj_bv_debt = (
         bal_sht["current_long_debt"][0]
         + bal_sht["long_term_debt"][0]
@@ -209,9 +267,7 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
-def calc_discount_rate(
-    EQ_PREM, UNLEVERED_BETA, RISK_FREE, inc_stmnt, adjusted_bv_debt, adjusted_bv_equity
-):
+def calc_discount_rate(inc_stmnt, adjusted_bv_debt, adjusted_bv_equity):
     # Discount rate for free cah flow to the firm = cost of capital
     # The cost of capital is the weighted average of the cost of equity and the cost of debt
     # Cost of equity = risk free rate + Beta(Implied Equity Risk Premium)
@@ -242,7 +298,7 @@ def calc_discount_rate(
     return cost_of_capital
 
 
-def calc_expected_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD):
+def calc_expected_fcff(curr_yr_fcff, growth_rate):
     fcff_table = []
     for year in range(GROWTH_PERIOD):
         if year == 0:
@@ -255,7 +311,7 @@ def calc_expected_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD):
     return fcff_table
 
 
-def calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate):
+def calc_fcff_value(fcff_table, discount_rate):
     fcff_value = 0
     for year in range(GROWTH_PERIOD):
         fcff_pv = fcff_table[year] / (1 + discount_rate) ** (year + 1)
@@ -264,8 +320,8 @@ def calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate):
     return fcff_value
 
 
-def calc_terminal_value(fcff, GROWTH_PERIOD, RISK_FREE, discount_rate):
-    terminal_value = (fcff * (1 + RISK_FREE)) / (discount_rate - RISK_FREE)
+def calc_terminal_value(fcff_last, discount_rate):
+    terminal_value = (fcff_last * (1 + RISK_FREE)) / (discount_rate - RISK_FREE)
     terminal_value_pv = terminal_value / ((1 + discount_rate) ** GROWTH_PERIOD)
     print(f"Terminal Value = {terminal_value_pv:,.2f}")
     return terminal_value_pv
@@ -318,51 +374,28 @@ def main():
     eff_tax_rate = calc_tax_rate(inc_stmnt)
     adjusted_ebiat = calc_adj_ebiat(inc_stmnt, amort_schedule, eff_tax_rate)
     adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
-    adjusted_bv_debt = calc_adj_bv_debt(bal_sht, amort_schedule)
+    adjusted_bv_debt = calc_adj_bv_debt(bal_sht)
     reinvestment_rate = firm_reinvestment / adjusted_ebiat
     print(f"Reinvestment rate = {reinvestment_rate:,.4f}")
-    try:
-        valuation = Stock_Value(
-            valuation_date,
-            COMPANY,
-            INDUSTRY,
-            UNLEVERED_BETA,
-            price,
-            shares_outstanding,
-            RISK_FREE,
-            EQ_PREM,
-        )
-        print(valuation)
-    except Exception as e:
-        print("An exception occured: ", e)
 
     return_on_capital = calc_return_on_capital(
         adjusted_ebiat, adjusted_bv_equity, adjusted_bv_debt
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
-    valuation.growth_rate = growth_rate
     discount_rate = calc_discount_rate(
-        EQ_PREM,
-        UNLEVERED_BETA,
-        RISK_FREE,
         inc_stmnt,
         adjusted_bv_equity,
         adjusted_bv_debt,
     )
     print(f"disc rate {discount_rate:,.4}")
-    valuation.cost_of_capital = discount_rate
 
-    fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate, GROWTH_PERIOD)
+    fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate)
 
-    fcff_pv = calc_fcff_value(fcff_table, GROWTH_PERIOD, discount_rate)
+    fcff_pv = calc_fcff_value(fcff_table, discount_rate)
     terminal_cost_of_capital = calc_discount_rate(
-        EQ_PREM, STABLE_BETA, RISK_FREE, inc_stmnt, adjusted_bv_debt, adjusted_bv_equity
+        inc_stmnt, adjusted_bv_debt, adjusted_bv_equity
     )
-    valuation.fcff_value = fcff_pv
-    terminal_value_pv = calc_terminal_value(
-        fcff_table[-1], GROWTH_PERIOD, RISK_FREE, terminal_cost_of_capital
-    )
-    valuation.terminal_value = terminal_value_pv
+    terminal_value_pv = calc_terminal_value(fcff_table[-1], terminal_cost_of_capital)
 
     intrinsic_value = calc_intrinsic_value(
         fcff_pv,
@@ -371,16 +404,37 @@ def main():
         adjusted_bv_debt,
         shares_outstanding,
     )
-    valuation.share_value = intrinsic_value
+    safety_margin = price - intrinsic_value
+    print(f"Safety Margin: {safety_margin:,.2}")
+    try:
+        valuation = Stock_Value(
+            valuation_date,
+            COMPANY,
+            INDUSTRY,
+            UNLEVERED_BETA,
+            market_cap,
+            price,
+            shares_outstanding,
+            RISK_FREE,
+            EQ_PREM,
+            growth_rate,
+            discount_rate,
+            fcff_pv,
+            terminal_value_pv,
+            intrinsic_value,
+            safety_margin,
+        )
+        print(valuation)
+    except Exception as e:
+        print("An exception occured: ", e)
 
-    print(valuation.valuation_date)
-    print(valuation.ticker)
-    print(f"{valuation.shares_outstanding:,}")
-    print(f"Valuation: {valuation}")
+    conn = sqlite3.connect("valuation.db")
+
+    v = valuation
+    insert_valuation(conn, v)
 
     print("DONE")
 
 
-# %%
 if __name__ == "__main__":
     main()
