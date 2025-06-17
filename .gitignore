@@ -7,6 +7,7 @@ fred_api.txt
 #data files created for testing in the running of the programs
 *.csv
 *.xlsx
+*.db
 
 # pdf files
 *.pdf
@@ -22,6 +23,7 @@ alpha_vantage_get_financials.py
 av_financials.py
 erp.py
 r_and_d.py
+sqlitedb.py
 
 # directories & files
 __pycache__/

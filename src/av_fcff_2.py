@@ -56,10 +56,10 @@ class Stock_Value:
 
 
 def create_table():
-    conn = sqlite3.connect("value.db")
-    c = conn.cursor()
-
-    c.execute("""CREATE TABLE IF NOT EXISTS valuation (
+    # conn = sqlite3.connect("data/valuation.db")
+    database = "data/valuation.db"
+    statements = [
+        """CREATE TABLE IF NOT EXISTS valuation (
               ticker TEXT NOT NULL,
               valuation_date TEXT NOT NULL,
               industry TEXT NOT NULL,
@@ -76,9 +76,17 @@ def create_table():
               margin_of_safety REAL NOT NULL,
               PRIMARY KEY (ticker, valuation_date)
               )
-              """)
-
-    conn.commit()
+              ;"""
+    ]
+    try:
+        with sqlite3.connect(database) as conn:
+            cursor = conn.cursor()
+            for statement in statements:
+                cursor.execute(statement)
+            conn.commit()
+            print("Table created successfully")
+    except sqlite3.OperationalError as e:
+        print("Failed to create tables:")
 
 
 def insert_valuation(conn, val):
@@ -408,8 +416,8 @@ def main():
     print(f"Safety Margin: {safety_margin:,.2}")
     try:
         valuation = Stock_Value(
-            valuation_date,
             COMPANY,
+            valuation_date,
             INDUSTRY,
             UNLEVERED_BETA,
             market_cap,
@@ -428,10 +436,10 @@ def main():
     except Exception as e:
         print("An exception occured: ", e)
 
-    conn = sqlite3.connect("valuation.db")
-
-    v = valuation
-    insert_valuation(conn, v)
+    # write to db
+    create_table()
+    conn = sqlite3.connect("data/valuation.db")
+    insert_valuation(conn, valuation)
 
     print("DONE")
 
