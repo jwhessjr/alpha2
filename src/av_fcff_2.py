@@ -1,6 +1,8 @@
-#
-# This Notebook will be used to refactor my av_fcff.py module to a more correct form
-#
+"""
+Earnings whisper truth--
+Price dances with hope and fear,
+Worth hides in the mist.
+"""
 
 from dataclasses import dataclass
 
@@ -86,6 +88,7 @@ def create_table():
             conn.commit()
             print("Table created successfully")
     except sqlite3.OperationalError as e:
+        print(e)
         print("Failed to create tables:")
 
 
