@@ -263,8 +263,15 @@ def calc_tax_rate(inc_stmnt):
     return eff_tax_rate
 
 
-def calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, adj_bv_debt):
-    return_on_capital = adjusted_ebiat / (adjusted_bv_equity + adj_bv_debt)
+def calc_return_on_capital(
+    adjusted_ebiat, adjusted_bv_equity, adj_bv_debt, amort_schedule, bal_sht
+):
+    return_on_capital = adjusted_ebiat / (
+        adjusted_bv_equity
+        + adj_bv_debt
+        + amort_schedule["RD_Asset_Value"]
+        - bal_sht["cash_and_equivalents"][0]
+    )
     print(f"ROIC = {return_on_capital:,.4f}")
     return return_on_capital
 
@@ -322,7 +329,7 @@ def calc_expected_fcff(curr_yr_fcff, growth_rate):
 def calc_fcff_value(fcff_table, discount_rate):
     fcff_value = 0
     for year in range(GROWTH_PERIOD):
-        fcff_pv = fcff_table[year] / (1 + discount_rate) ** (year + 1)
+        fcff_pv = fcff_table[year] / ((1 + discount_rate) ** (year + 1))
         fcff_value += fcff_pv
     print(f"FCFF Value = {fcff_value:,.2f}")
     return fcff_value
@@ -387,7 +394,7 @@ def main():
     print(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
     return_on_capital = calc_return_on_capital(
-        adjusted_ebiat, adjusted_bv_equity, adjusted_bv_debt
+        adjusted_ebiat, adjusted_bv_equity, adjusted_bv_debt, amort_schedule, bal_sht
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
     discount_rate = calc_discount_rate(
