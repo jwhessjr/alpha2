@@ -372,9 +372,10 @@ def main():
     print(f"Cash Flow {cash_flw}")
     ent_quote = enterprise_quote(COMPANY, MY_API_KEY)
     print(f"Ent Quote {ent_quote}")
-    valuation_date = date.today()
+    valuation_date = str(date.today())
     price = ent_quote[0]
     shares_outstanding = ent_quote[1]
+    print(f"Shares Outstanding: {shares_outstanding}")
     market_cap = ent_quote[2]
     fcff_data = calc_fcff(inc_stmnt, bal_sht, cash_flw)
 
@@ -422,7 +423,7 @@ def main():
         adjusted_bv_debt,
         shares_outstanding,
     )
-    safety_margin = price - intrinsic_value
+    safety_margin = float(intrinsic_value - price)
     print(f"Safety Margin: {safety_margin:,.2}")
     try:
         valuation = Stock_Value(
