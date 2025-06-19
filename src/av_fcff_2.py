@@ -221,7 +221,7 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw):
     return fcff_data
 
 
-def calc_reinvestment(ebiat, capex, depreciation, chng_nc_wc, amort_schedule):
+def calc_reinvestment(capex, depreciation, chng_nc_wc, amort_schedule):
     firm_reinvestment = (
         capex
         - depreciation
@@ -233,12 +233,13 @@ def calc_reinvestment(ebiat, capex, depreciation, chng_nc_wc, amort_schedule):
     return firm_reinvestment
 
 
-def calc_adj_ebiat(inc_stmnt, amort_schedule, eff_tax_rate):
+def calc_adj_ebiat(ebiat, amort_schedule):
     adjusted_ebiat = (
-        inc_stmnt["operating_income"][0]
+        ebiat
         + amort_schedule["rAndDExpense"][0]
         - amort_schedule["RD_Amortization_Amt"]
-    ) * (1 - eff_tax_rate)
+    )
+
     print(f"Adjusted ebiat {adjusted_ebiat:,.2f}")
     return adjusted_ebiat
 
@@ -251,13 +252,13 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
     return adjusted_bv_equity
 
 
-def calc_adj_bv_debt(bal_sht):
-    adj_bv_debt = (
+def calc_bv_debt(bal_sht):
+    bv_debt = (
         bal_sht["current_long_debt"][0]
         + bal_sht["long_term_debt"][0]
         - bal_sht["cash_and_equivalents"][0]
     )
-    return adj_bv_debt
+    return bv_debt
 
 
 def calc_tax_rate(inc_stmnt):
@@ -266,14 +267,9 @@ def calc_tax_rate(inc_stmnt):
     return eff_tax_rate
 
 
-def calc_return_on_capital(
-    adjusted_ebiat, adjusted_bv_equity, adj_bv_debt, amort_schedule, bal_sht
-):
+def calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht):
     return_on_capital = adjusted_ebiat / (
-        adjusted_bv_equity
-        + adj_bv_debt
-        + amort_schedule["RD_Asset_Value"]
-        - bal_sht["cash_and_equivalents"][0]
+        adjusted_bv_equity + bv_debt - bal_sht["cash_and_equivalents"][0]
     )
     print(f"ROIC = {return_on_capital:,.4f}")
     return return_on_capital
@@ -388,23 +384,23 @@ def main():
     amort_schedule = capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY)
     print(f"Amortization Schedule {amort_schedule}")
     firm_reinvestment = calc_reinvestment(
-        ebiat, capex, depreciation, chng_nc_wc, amort_schedule
+        capex, depreciation, chng_nc_wc, amort_schedule
     )
     eff_tax_rate = calc_tax_rate(inc_stmnt)
-    adjusted_ebiat = calc_adj_ebiat(inc_stmnt, amort_schedule, eff_tax_rate)
+    adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
     adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
-    adjusted_bv_debt = calc_adj_bv_debt(bal_sht)
+    bv_debt = calc_bv_debt(bal_sht)
     reinvestment_rate = firm_reinvestment / adjusted_ebiat
     print(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
     return_on_capital = calc_return_on_capital(
-        adjusted_ebiat, adjusted_bv_equity, adjusted_bv_debt, amort_schedule, bal_sht
+        adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
     discount_rate = calc_discount_rate(
         inc_stmnt,
         adjusted_bv_equity,
-        adjusted_bv_debt,
+        bv_debt,
     )
     print(f"disc rate {discount_rate:,.4}")
 
@@ -412,7 +408,7 @@ def main():
 
     fcff_pv = calc_fcff_value(fcff_table, discount_rate)
     terminal_cost_of_capital = calc_discount_rate(
-        inc_stmnt, adjusted_bv_debt, adjusted_bv_equity
+        inc_stmnt, bv_debt, adjusted_bv_equity
     )
     terminal_value_pv = calc_terminal_value(fcff_table[-1], terminal_cost_of_capital)
 
@@ -420,7 +416,7 @@ def main():
         fcff_pv,
         terminal_value_pv,
         bal_sht["cash_and_equivalents"][0],
-        adjusted_bv_debt,
+        bv_debt,
         shares_outstanding,
     )
     safety_margin = float(intrinsic_value - price)
