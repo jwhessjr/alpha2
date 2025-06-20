@@ -206,8 +206,8 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     return rd_table
 
 
-def calc_fcff(inc_stmnt, bal_sht, cash_flw):
-    ebiat = inc_stmnt["operating_income"][0] - inc_stmnt["income_tax_expense"][0]
+def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
+    ebiat = inc_stmnt["operating_income"][0] * (1 - eff_tax_rate)
     print(f"ebiat {ebiat:,.2f}")
     capex = calc_capital_expenditures(cash_flw)
     print(f"Capex {capex:,.2f}")
@@ -373,7 +373,8 @@ def main():
     shares_outstanding = ent_quote[1]
     print(f"Shares Outstanding: {shares_outstanding}")
     market_cap = ent_quote[2]
-    fcff_data = calc_fcff(inc_stmnt, bal_sht, cash_flw)
+    eff_tax_rate = calc_tax_rate(inc_stmnt)
+    fcff_data = calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate)
 
     ebiat = fcff_data[0]
     capex = fcff_data[1]
@@ -386,7 +387,7 @@ def main():
     firm_reinvestment = calc_reinvestment(
         capex, depreciation, chng_nc_wc, amort_schedule
     )
-    eff_tax_rate = calc_tax_rate(inc_stmnt)
+
     adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
     adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
     bv_debt = calc_bv_debt(bal_sht)
