@@ -330,6 +330,7 @@ def calc_fcff_value(fcff_table, discount_rate):
     for year in range(GROWTH_PERIOD):
         fcff_pv = fcff_table[year] / ((1 + discount_rate) ** (year + 1))
         fcff_value += fcff_pv
+        print(f"Year: {year}")
     print(f"FCFF Value = {fcff_value:,.2f}")
     return fcff_value
 
@@ -421,7 +422,7 @@ def main():
         shares_outstanding,
     )
     safety_margin = float(intrinsic_value - price)
-    print(f"Safety Margin: {safety_margin:,.2}")
+    print(f"Safety Margin: {safety_margin:,.2f}")
     try:
         valuation = Stock_Value(
             COMPANY,
