@@ -421,7 +421,7 @@ def main():
         shares_outstanding,
     )
     safety_margin = float(intrinsic_value - price)
-    print(f"Safety Margin: {safety_margin:,.2}")
+    print(f"Safety Margin: {safety_margin:,.2f}")
     try:
         valuation = Stock_Value(
             COMPANY,
