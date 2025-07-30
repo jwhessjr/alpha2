@@ -58,8 +58,8 @@ class Stock_Value:
 
 
 def create_table():
-    # conn = sqlite3.connect("data/valuation.db")
-    database = "data/valuation.db"
+    # conn = sqlite3.connect("/Volumes/Financial Data/valuation.db")
+    database = "/Volumes/Financial Data/valuation.db"
     statements = [
         """CREATE TABLE IF NOT EXISTS valuation (
               ticker TEXT NOT NULL,
