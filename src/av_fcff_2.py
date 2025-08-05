@@ -175,7 +175,7 @@ def calc_chng_wc(bal_sht):
 
 
 def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
-    rdTable = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
+    rdTable, years_to_process = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
     rd_table = {}
     rd_expense = []
     unamort_percent = []
@@ -184,18 +184,30 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     amort_percentage = 1.0 / (RD_YEARS - 1)
     rd_asset_value = 0
     rd_amort_amt = 0
-    for year in range(RD_YEARS):
-        # print(year, rdTable['researchAndDevelopment'][year])
-        rd_expense.append(rdTable["research_and_development"][year])
-        unamort_percent.append(1.0 - (1.0 / RD_YEARS * year))
-        unamort_amt.append(rd_expense[year] * unamort_percent[year])
-        if year == 0:
-            curr_year_amortization.append(0.00)
-        else:
-            curr_year_amortization.append(rd_expense[year] * amort_percentage)
+    # for year in range(years_to_process):
+    #     rd_expense.append(rdTable["research_and_development"][year])
+    #     unamort_percent.append(1.0 - (1.0 / RD_YEARS * year))
+    #     unamort_amt.append(rd_expense[year] * unamort_percent[year])
+    #     if year == 0:
+    #         curr_year_amortization.append(0.00)
+    #     else:
+    #         curr_year_amortization.append(rd_expense[year] * amort_percentage)
 
-        rd_asset_value += unamort_amt[year]
-        rd_amort_amt += curr_year_amortization[year]
+    #     rd_asset_value += unamort_amt[year]
+    #     rd_amort_amt += curr_year_amortization[year]
+    for year in range(years_to_process):
+        expense = rdTable["research_and_development"][year]
+        percent_unamort = 1.0 - (amort_percentage * year)
+        unamort = expense * percent_unamort
+        amort = 0.0 if year == 0 else expense * amort_percentage
+
+        rd_expense.append(expense)
+        unamort_percent.append(percent_unamort)
+        unamort_amt.append(unamort)
+        curr_year_amortization.append(amort)
+
+        rd_asset_value += unamort
+        rd_amort_amt += amort
     rd_table["rAndDExpense"] = rd_expense
     rd_table["unamortized_percent"] = unamort_percent
     rd_table["unamort_amount"] = unamort_amt
@@ -423,6 +435,7 @@ def main():
     )
     safety_margin = float(intrinsic_value - price)
     print(f"Safety Margin: {safety_margin:,.2f}")
+
     try:
         valuation = Stock_Value(
             COMPANY,
@@ -449,6 +462,11 @@ def main():
     create_table()
     conn = sqlite3.connect("data/valuation.db")
     insert_valuation(conn, valuation)
+
+    if return_on_capital > discount_rate:
+        print("Wealth Creator")
+    else:
+        print("Weath Detroyer")
 
     print("DONE")
 
