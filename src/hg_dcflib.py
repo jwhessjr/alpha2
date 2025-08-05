@@ -380,6 +380,7 @@ def get_industry(company):
     indName = pd.read_excel(
         "/Users/jhess/Development/Alpha2/data/indname.xlsx", sheet_name="US by industry"
     )
+
     for index, row in indName.iterrows():
         try:
             if company == row["Exchange:Ticker"].split(":")[1]:
@@ -391,6 +392,8 @@ def get_industry(company):
             continue
         except AttributeError:
             continue
+        except Exception as e:
+            print(f"Error reading industry {e}")
     return industry
 
 
@@ -409,6 +412,7 @@ def get_beta(industry):
                 continue
         except TypeError:
             continue
+
     print(f"Beta {unleveredBeta}")
     return unleveredBeta
 
