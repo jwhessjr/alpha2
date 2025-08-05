@@ -274,40 +274,65 @@ def get_erp():
 
 
 def get_rAndD(company, rd_years, apiKey):
+    """
+    Fetches R&D expenses for a specified number of years from Alpha Vantage.
+
+    Args:
+        company (str): The company symbol.
+        rd_years (int): The number of years to fetch R&D data for.
+        apiKey (str): The Alpha Vantage API key.
+
+    Returns:
+        dict: A dictionary containing a list of yearly R&D expenses.
+    """
     url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
 
-    response = requests.get(url, timeout=20)
-    data = response.json()
-    rdExpense = data.get("quarterlyReports", [])
     rdTable = {}
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data from Alpha Vantage: {e}")
+        return {"research_and_development": []}
+
+    rdExpense = data.get("quarterlyReports", [])
+
+    if not rdExpense:
+        print("No quarterly reports found.")
+        return {"research_and_development": []}
+
     rd_Amount = []
-    indx = 0
-    for year in range(rd_years):
-        for qtr in range(indx + 4):
+
+    # We need to process quarters in chunks of 4 for each year.
+    # The number of available years is the length of the list divided by 4.
+    num_available_years = len(rdExpense) // 4
+    years_to_process = min(rd_years, num_available_years)
+
+    for i in range(years_to_process):
+        start_index = i * 4
+        end_index = start_index + 4
+
+        # Get the slice of the list for the current year's quarters
+        quarters = rdExpense[start_index:end_index]
+
+        # Calculate the sum of R&D expenses for the year
+        yearRDExpense = 0.0
+        for quarter in quarters:
             try:
-                yearRDExpense = (
-                    safe_float(rdExpense[indx]["researchAndDevelopment"])
-                    + safe_float(rdExpense[indx + 1]["researchAndDevelopment"])
-                    + safe_float(rdExpense[indx + 2]["researchAndDevelopment"])
-                    + safe_float(rdExpense[indx + 3]["researchAndDevelopment"])
-                )
-
-                rd_Amount.append(yearRDExpense)
-                indx += 4
-                if indx > 16:
-                    break
+                # Use .get() with a default value to prevent KeyError
+                rd_val = safe_float(quarter.get("researchAndDevelopment", "0"))
+                yearRDExpense += rd_val
             except ValueError:
-                yearRDExpense = 0.00
-                rd_Amount.append(yearRDExpense)
+                # If safe_float fails, just add 0 and continue.
+                pass
 
-                indx += 4
-                if indx > 16:
-                    break
+        rd_Amount.append(yearRDExpense)
+
     rdTable["research_and_development"] = rd_Amount
-    # print("Type RD Amount", type(rd_Amount[0]))
-    # print("rdTable", rdTable)
+    print(f"rdTable {rdTable}")
 
-    return rdTable
+    return rdTable, years_to_process
 
 
 # Function to get the current share price, shares outstanding, and market cap
