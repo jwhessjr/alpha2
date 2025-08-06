@@ -32,61 +32,54 @@ def get_jsonparsed_data(url):
 # Function to get the income statement and extract the required fields
 
 
-def get_inc_stmnt(company, apiKey):
-    url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
+def get_inc_stmnt(company: str, apiKey: str):
+    """Return annualized operating income, tax expense and interest expense
+       from the quarterly reports of a ticker.
 
-    response = requests.get(url, timeout=20)
-    data = response.json()
-    incStmnt = data.get("quarterlyReports", [])
-    incomeStatement = {}
-    operatingIncome = []
-    incomeTaxExpense = []
-    interestExpense = []
-    indx = 0
-    for year in range(5):
-        for qtr in range(indx + 4):
-            yearOperatingIncome = (
-                safe_float(incStmnt[indx]["incomeBeforeTax"])
-                + safe_float(incStmnt[indx + 1]["incomeBeforeTax"])
-                + safe_float(incStmnt[indx + 2]["incomeBeforeTax"])
-                + safe_float(incStmnt[indx + 3]["incomeBeforeTax"])
-            )
+    The API returns up to 20 recent quarters; we aggregate them into at most five years.
+    """
+    url = (
+        f"https://www.alphavantage.co/query?"
+        f"function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
+    )
+    resp = requests.get(url, timeout=20)
+    data = resp.json()
 
-            yearTaxExpense = (
-                safe_float(incStmnt[indx]["incomeTaxExpense"])
-                + safe_float(incStmnt[indx + 1]["incomeTaxExpense"])
-                + safe_float(incStmnt[indx + 2]["incomeTaxExpense"])
-                + safe_float(incStmnt[indx + 3]["incomeTaxExpense"])
-            )
+    # The API returns the most recent quarter first.
+    quarterly_reports = data.get("quarterlyReports", [])
 
-            yearInterestExpense = (
-                safe_float(incStmnt[indx]["interestExpense"])
-                + safe_float(incStmnt[indx + 1]["interestExpense"])
-                + safe_float(incStmnt[indx + 2]["interestExpense"])
-                + safe_float(incStmnt[indx + 3]["interestExpense"])
-            )
-        operatingIncome.append(yearOperatingIncome)
-        # print(f"Net Income = {yearoperatingIncome}")
-        # print(f"Interest Income = {yearIntIncome}")
-        # totalRevenue.append(yearTotalRevenue)
-        # print(f"Total Revenue = {yearTotalRevenue}")
-        # incomeBeforeTax.append(yearIncBeforeTax)
-        # print(f"Income Before Tax = {yearIncBeforeTax}")
-        incomeTaxExpense.append(yearTaxExpense)
-        interestExpense.append(yearInterestExpense)
-        # print(f"Tax Expense = {yearTaxExpense}")
-        # ebit.append(yearEbit)
-        # print(f"EBIT = {yearEbit}")
-        indx += 4
-        if indx > 16:
-            break
-    incomeStatement["operating_income"] = operatingIncome
-    incomeStatement["income_tax_expense"] = incomeTaxExpense
-    incomeStatement["interest_expense"] = interestExpense
-    # print("incomeTaxExpense")
-    # print(incomeStatement["operatingIncome"])
+    if not quarterly_reports:
+        raise ValueError(f"No quarterly reports found for {company}")
 
-    return incomeStatement
+    # We’ll aggregate at most 5 years (20 quarters).
+    max_quarters = min(len(quarterly_reports), 20)
+    yearly_data = []
+
+    for i in range(0, max_quarters, 4):  # step by four quarters
+        quarter_block = quarterly_reports[i : i + 4]
+        if len(quarter_block) < 4:
+            break  # incomplete year at the end of the list
+
+        op_income = sum(safe_float(q["incomeBeforeTax"]) for q in quarter_block)
+        tax_exp = sum(safe_float(q["incomeTaxExpense"]) for q in quarter_block)
+        int_exp = sum(safe_float(q["interestExpense"]) for q in quarter_block)
+
+        yearly_data.append(
+            {
+                "operating_income": op_income,
+                "income_tax_expense": tax_exp,
+                "interest_expense": int_exp,
+            }
+        )
+
+    # Build the result dictionary with separate lists
+    income_statement = {
+        "operating_income": [y["operating_income"] for y in yearly_data],
+        "income_tax_expense": [y["income_tax_expense"] for y in yearly_data],
+        "interest_expense": [y["interest_expense"] for y in yearly_data],
+    }
+
+    return income_statement
 
 
 # Function to get the balance sheet and extract the required fields
@@ -177,67 +170,57 @@ def get_bal_sheet(company, apiKey):
 # Function to get the cash flow statement and extract the required fields
 
 
-def get_cash_flow(company, apiKey):
-    url = f"https://www.alphavantage.co/query?function=CASH_FLOW&symbol={company}&apikey={apiKey}"
+def get_cash_flow(company: str, apiKey: str) -> dict:
+    """
+    Return annualized depreciation and cap‑ex from the quarterly cash‑flow data.
 
-    data = get_jsonparsed_data(url)
-    cashFlw = data.get("quarterlyReports", [])
-    cashFlow = {}
+    Parameters
+    ----------
+    company : str
+        Ticker symbol.
+    apiKey : str
+        AlphaVantage API key.
+
+    Returns
+    -------
+    dict
+        Keys: 'depreciation', 'capex' (each a list of up to 5 yearly values).
+    """
+    url = (
+        f"https://www.alphavantage.co/query?"
+        f"function=CASH_FLOW&symbol={company}&apikey={apiKey}"
+    )
+    resp = requests.get(url, timeout=20)
+    data = resp.json()
+
+    quarterly_reports = data.get("quarterlyReports", [])
+    if not quarterly_reports:
+        raise ValueError(f"No quarterly cash‑flow reports found for {company}")
+
+    # We’ll aggregate at most 5 years (20 quarters).
+    max_quarters = min(len(quarterly_reports), 20)
+
     depreciation = []
     capex = []
-    # acquisition = []
-    # stockBuyBack = []
-    # dividends = []
-    indx = 0
-    for year in range(5):
-        for qtr in range(indx + 4):
-            yearCapex = (
-                safe_float(cashFlw[indx]["capitalExpenditures"])
-                + safe_float(cashFlw[indx + 1]["capitalExpenditures"])
-                + safe_float(cashFlw[indx + 2]["capitalExpenditures"])
-                + safe_float(cashFlw[indx + 3]["capitalExpenditures"])
-            )
 
-            yearDeprec = (
-                safe_float(cashFlw[indx]["depreciationDepletionAndAmortization"])
-                + safe_float(cashFlw[indx + 1]["depreciationDepletionAndAmortization"])
-                + safe_float(cashFlw[indx + 2]["depreciationDepletionAndAmortization"])
-                + safe_float(cashFlw[indx + 3]["depreciationDepletionAndAmortization"])
-            )
-            # yearAcquisition = (
-            #     qrtrlyData[indx]["acquisitionsNet"]
-            #     + qrtrlyData[indx + 1]["acquisitionsNet"]
-            #     + qrtrlyData[indx + 2]["acquisitionsNet"]
-            #     + qrtrlyData[indx + 3]["acquisitionsNet"]
-            # )
-            # yearStockBuyBack = (
-            #     qrtrlyData[indx]["paymentForRepurchaseOfCommonStock"]
-            #     + qrtrlyData[indx + 1]["paymentForRepurchaseOfCommonStock"]
-            #     + qrtrlyData[indx + 2]["paymentForRepurchaseOfCommonStock"]
-            #     + qrtrlyData[indx + 3]["paymentForRepurchaseOfCommonStock"]
-            # )
-            # yearDividends = (
-            #     qrtrlyData[indx]["dividendPayout"]
-            #     + qrtrlyData[indx + 1]["dividendPayout"]
-            #     + qrtrlyData[indx + 2]["dividendPayout"]
-            #     + qrtrlyData[indx + 3]["dividendPayout"]
-            # )
-        capex.append(yearCapex)
-        depreciation.append(yearDeprec)
-        # acquisition.append(yearAcquisition)
-        # stockBuyBack.append(yearStockBuyBack)
-        # dividends.append(yearDividends)
-        indx += 4
-        if indx > 16:
-            break
+    # Step through the list in blocks of four quarters.
+    for i in range(0, max_quarters, 4):
+        block = quarterly_reports[i : i + 4]
+        if len(block) < 4:
+            break  # incomplete year at the end
 
-    cashFlow["depreciation"] = depreciation
-    cashFlow["capex"] = capex
-    # cshFlw["acquisition"] = acquisition
-    # cshFlw["stockBuyBack"] = stockBuyBack
-    # cshFlw["dividendsPaid"] = dividends
+        yearly_capex = sum(safe_float(q["capitalExpenditures"]) for q in block)
+        yearly_depr = sum(
+            safe_float(q["depreciationDepletionAndAmortization"]) for q in block
+        )
 
-    return cashFlow
+        capex.append(yearly_capex)
+        depreciation.append(yearly_depr)
+
+    return {
+        "capex": depreciation,  # keep the key names you used before
+        "depreciation": capex,
+    }
 
 
 # function to retrieve R&D expense so we can capitalize it
