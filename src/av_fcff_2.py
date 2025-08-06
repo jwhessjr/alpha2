@@ -13,6 +13,27 @@ import sqlite3
 # import csv
 import hg_dcflib
 
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Set the overall logger level
+
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+# Create a stream handler for the console
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.WARNING)  # only show INFO and above on console
+stream_handler.setFormatter(formatter)
+
+# Create a FileHandler for the log file
+file_handler = logging.FileHandler("data/value.log")
+file_handler.setLevel(logging.DEBUG)  # log all messages to the file
+file_handler.setFormatter(formatter)
+
+# Add the handlers to the logger
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
+
 
 # ## Define the constants used in the module
 
@@ -86,10 +107,9 @@ def create_table():
             for statement in statements:
                 cursor.execute(statement)
             conn.commit()
-            print("Table created successfully")
+            logger.info("Table created successfully")
     except sqlite3.OperationalError as e:
-        print(e)
-        print("Failed to create tables:")
+        logger.warning(f"Failed to create tables: {e}")
 
 
 def insert_valuation(conn, val):
@@ -220,15 +240,15 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
 
 def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
     ebiat = inc_stmnt["operating_income"][0] * (1 - eff_tax_rate)
-    print(f"ebiat {ebiat:,.2f}")
+    logger.info(f"ebiat {ebiat:,.2f}")
     capex = calc_capital_expenditures(cash_flw)
-    print(f"Capex {capex:,.2f}")
+    logger.info(f"Capex {capex:,.2f}")
     chng_nc_wc = calc_chng_wc(bal_sht)
-    print(f"Change WC {chng_nc_wc:,.2f}")
+    logger.info(f"Change WC {chng_nc_wc:,.2f}")
     depreciation = cash_flw["depreciation"][0]
-    print(f"Depreciation {depreciation:,.2f}")
+    logger.info(f"Depreciation {depreciation:,.2f}")
     fcff = ebiat - capex + depreciation - chng_nc_wc
-    print(f"FCFF {fcff:,.2f}")
+    logger.info(f"FCFF {fcff:,.2f}")
     fcff_data = [ebiat, capex, chng_nc_wc, depreciation, fcff]
     return fcff_data
 
@@ -241,7 +261,7 @@ def calc_reinvestment(capex, depreciation, chng_nc_wc, amort_schedule):
         + amort_schedule["rAndDExpense"][0]
         - amort_schedule["RD_Amortization_Amt"]
     )
-    print(f"Firm Reinvestment {firm_reinvestment:,.2f}")
+    logger.info(f"Firm Reinvestment {firm_reinvestment:,.2f}")
     return firm_reinvestment
 
 
@@ -252,7 +272,7 @@ def calc_adj_ebiat(ebiat, amort_schedule):
         - amort_schedule["RD_Amortization_Amt"]
     )
 
-    print(f"Adjusted ebiat {adjusted_ebiat:,.2f}")
+    logger.info(f"Adjusted ebiat {adjusted_ebiat:,.2f}")
     return adjusted_ebiat
 
 
@@ -260,7 +280,7 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
     adjusted_bv_equity = (
         bal_sht["total_stockholders_equity"][0] + amort_schedule["RD_Asset_Value"]
     )
-    print(f"adjusted BV Equity = {adjusted_bv_equity:,.2f}")
+    logger.info(f"adjusted BV Equity = {adjusted_bv_equity:,.2f}")
     return adjusted_bv_equity
 
 
@@ -275,7 +295,7 @@ def calc_bv_debt(bal_sht):
 
 def calc_tax_rate(inc_stmnt):
     eff_tax_rate = inc_stmnt["income_tax_expense"][0] / inc_stmnt["operating_income"][0]
-    print(f"Effective Tax Rate = {eff_tax_rate:,.4f}")
+    logger.info(f"Effective Tax Rate = {eff_tax_rate:,.4f}")
     return eff_tax_rate
 
 
@@ -283,14 +303,22 @@ def calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht)
     return_on_capital = adjusted_ebiat / (
         adjusted_bv_equity + bv_debt - bal_sht["cash_and_equivalents"][0]
     )
-    print(f"ROIC = {return_on_capital:,.4f}")
+    logger.info(f"ROIC = {return_on_capital:,.4f}")
     return return_on_capital
 
 
 def calc_growth_rate(reinvestment_rate, return_on_capital):
     growth_rate = reinvestment_rate * return_on_capital
-    print(f"Growth Rate = {growth_rate:,.4f}")
+    logger.info(f"Growth Rate = {growth_rate:,.4f}")
     return growth_rate
+
+
+# def calc_growth_rate(inc_stmnt):
+#     growth_rate = (
+#         inc_stmnt["operating_income"][0] - inc_stmnt["operating_income"][-1]
+#     ) / inc_stmnt["operating_income"][-1]
+#     logger.info(f"Growth Rate: {growth_rate:,.4f}")
+#     return growth_rate
 
 
 def calc_discount_rate(inc_stmnt, adjusted_bv_debt, adjusted_bv_equity):
@@ -299,24 +327,24 @@ def calc_discount_rate(inc_stmnt, adjusted_bv_debt, adjusted_bv_equity):
     # Cost of equity = risk free rate + Beta(Implied Equity Risk Premium)
 
     cost_of_equity = RISK_FREE + (UNLEVERED_BETA * EQ_PREM)
-    print(f"COE = {cost_of_equity:,.4}")
+    logger.info(f"COE = {cost_of_equity:,.4}")
 
     try:
         int_cover = inc_stmnt["operating_income"][0] / inc_stmnt["interest_expense"][0]
     except ZeroDivisionError:
         int_cover = 25  # forces default spread to the lowest level
 
-    print(f"Interest Coverage = {int_cover}")
+    logger.info(f"Interest Coverage = {int_cover}")
     def_spread = hg_dcflib.get_default_spread(int_cover)
-    print(f"Default Spread = {def_spread}")
+    logger.info(f"Default Spread = {def_spread}")
 
     # 2. Calcultate after tax cost of debt
     cost_of_debt = (RISK_FREE + def_spread) * (1 - MARGINAL_TAX_RATE)
-    print(f"Cost of Debt = {cost_of_debt}")
+    logger.info(f"Cost of Debt = {cost_of_debt}")
     percent_debt = adjusted_bv_debt / (adjusted_bv_equity + adjusted_bv_debt)
     percent_equity = 1 - percent_debt
-    print(f"% Debt {percent_debt:,.4}")
-    print(f"% Equity {percent_equity:,.4}")
+    logger.info(f"% Debt {percent_debt:,.4}")
+    logger.info(f"% Equity {percent_equity:,.4}")
 
     # 3 calcualte the weighted cost of capital
     cost_of_capital = (cost_of_debt * percent_debt) + (cost_of_equity * percent_equity)
@@ -332,7 +360,7 @@ def calc_expected_fcff(curr_yr_fcff, growth_rate):
         else:
             fcff_table.append(fcff_table[year - 1] * (1 + growth_rate))
     for val in fcff_table:
-        print(f"Expected FCFF = {val:,.2f}")
+        logger.info(f"Expected FCFF = {val:,.2f}")
 
     return fcff_table
 
@@ -342,15 +370,15 @@ def calc_fcff_value(fcff_table, discount_rate):
     for year in range(GROWTH_PERIOD):
         fcff_pv = fcff_table[year] / ((1 + discount_rate) ** (year + 1))
         fcff_value += fcff_pv
-        print(f"Year: {year}")
-    print(f"FCFF Value = {fcff_value:,.2f}")
+        logger.info(f"Year: {year}")
+    logger.info(f"FCFF Value = {fcff_value:,.2f}")
     return fcff_value
 
 
 def calc_terminal_value(fcff_last, discount_rate):
     terminal_value = (fcff_last * (1 + RISK_FREE)) / (discount_rate - RISK_FREE)
     terminal_value_pv = terminal_value / ((1 + discount_rate) ** GROWTH_PERIOD)
-    print(f"Terminal Value = {terminal_value_pv:,.2f}")
+    logger.info(f"Terminal Value = {terminal_value_pv:,.2f}")
     return terminal_value_pv
 
 
@@ -365,7 +393,7 @@ def calc_intrinsic_value(
         fcff_pv + terminal_value_pv + cash_and_equivalents - adjusted_bv_debt
     )
     intrinsic_value = enterprise_value / shares_outstanding
-    print(f"Intrinsic Value = {intrinsic_value:,.2f}")
+    logger.info(f"Intrinsic Value = {intrinsic_value:,.2f}")
     return intrinsic_value
 
 
@@ -374,17 +402,17 @@ def calc_intrinsic_value(
 
 def main():
     inc_stmnt = income_statement(COMPANY, MY_API_KEY)
-    print(f"Inc Stmnt {inc_stmnt}")
+    logger.info(f"Inc Stmnt {inc_stmnt}")
     bal_sht = balance_sheet(COMPANY, MY_API_KEY)
-    print(f"Bal Sheet {bal_sht}")
+    logger.info(f"Bal Sheet {bal_sht}")
     cash_flw = cash_flow_statement(COMPANY, MY_API_KEY)
-    print(f"Cash Flow {cash_flw}")
+    logger.info(f"Cash Flow {cash_flw}")
     ent_quote = enterprise_quote(COMPANY, MY_API_KEY)
-    print(f"Ent Quote {ent_quote}")
+    logger.info(f"Ent Quote {ent_quote}")
     valuation_date = str(date.today())
     price = ent_quote[0]
     shares_outstanding = ent_quote[1]
-    print(f"Shares Outstanding: {shares_outstanding}")
+    logger.info(f"Shares Outstanding: {shares_outstanding}")
     market_cap = ent_quote[2]
     eff_tax_rate = calc_tax_rate(inc_stmnt)
     fcff_data = calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate)
@@ -396,7 +424,7 @@ def main():
     curr_yr_fcff = fcff_data[4]
 
     amort_schedule = capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY)
-    print(f"Amortization Schedule {amort_schedule}")
+    logger.info(f"Amortization Schedule {amort_schedule}")
     firm_reinvestment = calc_reinvestment(
         capex, depreciation, chng_nc_wc, amort_schedule
     )
@@ -405,18 +433,19 @@ def main():
     adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
     bv_debt = calc_bv_debt(bal_sht)
     reinvestment_rate = firm_reinvestment / adjusted_ebiat
-    print(f"Reinvestment rate = {reinvestment_rate:,.4f}")
+    logger.info(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
     return_on_capital = calc_return_on_capital(
         adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
+    # growth_rate = calc_growth_rate(inc_stmnt)
     discount_rate = calc_discount_rate(
         inc_stmnt,
         adjusted_bv_equity,
         bv_debt,
     )
-    print(f"disc rate {discount_rate:,.4}")
+    logger.info(f"disc rate {discount_rate:,.4}")
 
     fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate)
 
@@ -434,7 +463,7 @@ def main():
         shares_outstanding,
     )
     safety_margin = float(intrinsic_value - price)
-    print(f"Safety Margin: {safety_margin:,.2f}")
+    logger.info(f"Safety Margin: {safety_margin:,.2f}")
 
     try:
         valuation = Stock_Value(
@@ -454,9 +483,9 @@ def main():
             intrinsic_value,
             safety_margin,
         )
-        print(valuation)
+        logger.info(valuation)
     except Exception as e:
-        print("An exception occured: ", e)
+        logger.debug(f"An exception occured: {e}")
 
     # write to db
     create_table()
@@ -464,9 +493,9 @@ def main():
     insert_valuation(conn, valuation)
 
     if return_on_capital > discount_rate:
-        print("Wealth Creator")
+        logger.info("Wealth Creator")
     else:
-        print("Weath Detroyer")
+        logger.info("Weath Detroyer")
 
     print("DONE")
 

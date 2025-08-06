@@ -10,7 +10,26 @@ import requests
 from bs4 import BeautifulSoup
 import re
 
-# import logging
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Set the overall logger level
+
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+# Create a stream handler for the console
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.WARNING)  # only show INFO and above on console
+stream_handler.setFormatter(formatter)
+
+# Create a FileHandler for the log file
+file_handler = logging.FileHandler("data/value.log")
+file_handler.setLevel(logging.DEBUG)  # log all messages to the file
+file_handler.setFormatter(formatter)
+
+# Add the handlers to the logger
+logger.addHandler(stream_handler)
+logger.addHandler(file_handler)
 
 
 def safe_float(val):
@@ -105,20 +124,7 @@ def get_bal_sheet(company, apiKey):
         safe_float(balSheet[12]["totalCurrentAssets"]),
         safe_float(balSheet[16]["totalCurrentAssets"]),
     ]
-    # totalAssets = [
-    #     qrtrlyData[0]["totalAssets"],
-    #     qrtrlyData[4]["totalAssets"],
-    #     qrtrlyData[8]["totalAssets"],
-    #     qrtrlyData[12]["totalAssets"],
-    #     qrtrlyData[16]["totalAssets"],
-    # ]
-    # accountsPayable = [
-    #     qrtrlyData[0]["currentAccountsPayables"],
-    #     qrtrlyData[4]["currentAccountsPayables"],
-    #     qrtrlyData[8]["currentAccountsPayables"],
-    #     qrtrlyData[12]["currentAccountsPayables"],
-    #     qrtrlyData[16]["currentAccountsPayables"],
-    # ]
+
     stockholdersEquity = [
         safe_float(balSheet[0]["totalShareholderEquity"]),
         safe_float(balSheet[4]["totalShareholderEquity"]),
@@ -250,10 +256,12 @@ def get_erp():
     match = re.search(r"(\d+\.\d+)%", text)
     if match:
         implied_erp = safe_float(match.group(1)) / 100
-        print(f"Implied ERP: {implied_erp}%")
+        # print(f"Implied ERP: {implied_erp}%")
+        logger.info(f"Implied ERP {implied_erp}")
         return implied_erp
     else:
-        print("Couldn't extract Implied ERP value")
+        # print("Couldn't extract Implied ERP value")
+        logger.debug("Couldn't extract ERP %s")
 
 
 def get_rAndD(company, rd_years, apiKey):
@@ -276,13 +284,13 @@ def get_rAndD(company, rd_years, apiKey):
         response.raise_for_status()  # Raise an exception for bad status codes
         data = response.json()
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching data from Alpha Vantage: {e}")
+        logger.debug(f"Error fetching data from Alpha Vantage: {e}")
         return {"research_and_development": []}
 
     rdExpense = data.get("quarterlyReports", [])
 
     if not rdExpense:
-        print("No quarterly reports found.")
+        logger.debug("No quarterly reports found.")
         return {"research_and_development": []}
 
     rd_Amount = []
@@ -313,7 +321,7 @@ def get_rAndD(company, rd_years, apiKey):
         rd_Amount.append(yearRDExpense)
 
     rdTable["research_and_development"] = rd_Amount
-    print(f"rdTable {rdTable}")
+    logger.info(f"rdTable {rdTable}")
 
     return rdTable, years_to_process
 
@@ -349,13 +357,13 @@ def get_risk_free(FRED_KEY):
     response = requests.get(url, params=params, timeout=20)
 
     if response.status_code != 200:
-        print(f"Error: Received status code {response.status_code}")
+        logger.debug(f"Error: Received status code {response.status_code}")
         return None
 
     # Parse JSON response
     data = response.json()
     RISK_FREE = safe_float(data["observations"][0]["value"]) / 100
-    print(RISK_FREE)
+    logger.info(f"Risk Free Rate {RISK_FREE}")
     return RISK_FREE
 
 
@@ -368,7 +376,7 @@ def get_industry(company):
         try:
             if company == row["Exchange:Ticker"].split(":")[1]:
                 industry = row["Industry Group"]
-                print(f"Industry Group {industry}")
+                logger.info(f"Industry Group {industry}")
             else:
                 continue
         except TypeError:
@@ -376,7 +384,7 @@ def get_industry(company):
         except AttributeError:
             continue
         except Exception as e:
-            print(f"Error reading industry {e}")
+            logger.debug(f"Error reading industry {e}")
     return industry
 
 
@@ -396,7 +404,7 @@ def get_beta(industry):
         except TypeError:
             continue
 
-    print(f"Beta {unleveredBeta}")
+    logger.info(f"Beta {unleveredBeta}")
     return unleveredBeta
 
 
@@ -431,7 +439,7 @@ def get_rAndD_years(industry):
         try:
             if industry == row["Industry"]:
                 rAndD_years = row["Years"]
-                print(f"Years = {rAndD_years}")
+                logger.info(f"Years = {rAndD_years}")
             else:
                 continue
         except TypeError:
