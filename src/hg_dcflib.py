@@ -32,7 +32,7 @@ def get_jsonparsed_data(url):
 # Function to get the income statement and extract the required fields
 
 
-def get_inc_stmnt(company: str, apiKey: str):
+def get_inc_stmnt(company: str, apiKey: str) -> dict:
     """Return annualized operating income, tax expense and interest expense
        from the quarterly reports of a ticker.
 
