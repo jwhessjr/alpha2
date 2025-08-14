@@ -80,7 +80,7 @@ class Stock_Value:
 
 def create_table():
     # conn = sqlite3.connect("/Volumes/Financial Data/valuation.db")
-    database = "/Volumes/Financial Data/valuation.db"
+    database = "/Volumes/Financial_Data/valuation.db"
     statements = [
         """CREATE TABLE IF NOT EXISTS valuation (
               ticker TEXT NOT NULL,
@@ -290,6 +290,7 @@ def calc_bv_debt(bal_sht):
         + bal_sht["long_term_debt"][0]
         - bal_sht["cash_and_equivalents"][0]
     )
+    logger.info(f"adjusted BV Debt = {bv_debt:,.2f}")
     return bv_debt
 
 
@@ -313,15 +314,7 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
-# def calc_growth_rate(inc_stmnt):
-#     growth_rate = (
-#         inc_stmnt["operating_income"][0] - inc_stmnt["operating_income"][-1]
-#     ) / inc_stmnt["operating_income"][-1]
-#     logger.info(f"Growth Rate: {growth_rate:,.4f}")
-#     return growth_rate
-
-
-def calc_discount_rate(inc_stmnt, adjusted_bv_debt, adjusted_bv_equity):
+def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
     # Discount rate for free cah flow to the firm = cost of capital
     # The cost of capital is the weighted average of the cost of equity and the cost of debt
     # Cost of equity = risk free rate + Beta(Implied Equity Risk Premium)
@@ -341,10 +334,10 @@ def calc_discount_rate(inc_stmnt, adjusted_bv_debt, adjusted_bv_equity):
     # 2. Calcultate after tax cost of debt
     cost_of_debt = (RISK_FREE + def_spread) * (1 - MARGINAL_TAX_RATE)
     logger.info(f"Cost of Debt = {cost_of_debt}")
-    percent_debt = adjusted_bv_debt / (adjusted_bv_equity + adjusted_bv_debt)
+    percent_debt = bv_debt / (adjusted_bv_equity + bv_debt)
     percent_equity = 1 - percent_debt
-    logger.info(f"% Debt {percent_debt:,.4}")
-    logger.info(f"% Equity {percent_equity:,.4}")
+    logger.info(f"% Debt {percent_debt:,.4f}")
+    logger.info(f"% Equity {percent_equity:,.4f}")
 
     # 3 calcualte the weighted cost of capital
     cost_of_capital = (cost_of_debt * percent_debt) + (cost_of_equity * percent_equity)
@@ -386,12 +379,10 @@ def calc_intrinsic_value(
     fcff_pv,
     terminal_value_pv,
     cash_and_equivalents,
-    adjusted_bv_debt,
+    bv_debt,
     shares_outstanding,
 ):
-    enterprise_value = (
-        fcff_pv + terminal_value_pv + cash_and_equivalents - adjusted_bv_debt
-    )
+    enterprise_value = fcff_pv + terminal_value_pv + cash_and_equivalents - bv_debt
     intrinsic_value = enterprise_value / shares_outstanding
     logger.info(f"Intrinsic Value = {intrinsic_value:,.2f}")
     return intrinsic_value
@@ -425,11 +416,11 @@ def main():
 
     amort_schedule = capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY)
     logger.info(f"Amortization Schedule {amort_schedule}")
+    adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
     firm_reinvestment = calc_reinvestment(
         capex, depreciation, chng_nc_wc, amort_schedule
     )
 
-    adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
     adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
     bv_debt = calc_bv_debt(bal_sht)
     reinvestment_rate = firm_reinvestment / adjusted_ebiat
@@ -439,12 +430,7 @@ def main():
         adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
-    # growth_rate = calc_growth_rate(inc_stmnt)
-    discount_rate = calc_discount_rate(
-        inc_stmnt,
-        adjusted_bv_equity,
-        bv_debt,
-    )
+    discount_rate = calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity)
     logger.info(f"disc rate {discount_rate:,.4}")
 
     fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate)
