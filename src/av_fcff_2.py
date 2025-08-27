@@ -290,7 +290,10 @@ def calc_bv_debt(bal_sht):
         + bal_sht["long_term_debt"][0]
         - bal_sht["cash_and_equivalents"][0]
     )
-    logger.info(f"adjusted BV Debt = {bv_debt:,.2f}")
+    # logger.info(f"Current Long Term Debt {bal_sht['current_long_debt'][0]:,.2f}")
+    # logger.info(f"Long Term Debt {bal_sht['long_term_debt'][0]:,.2f}")
+    # logger.info(f"Cash and Equivalents {bal_sht['cash_and_equivalents'][0]:,.2f}")
+    logger.info(f"BV Debt = {bv_debt:,.2f}")
     return bv_debt
 
 
