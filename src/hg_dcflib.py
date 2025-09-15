@@ -340,7 +340,8 @@ def get_quote(company, apiKey):
     # print(data)
     sharesOutstanding = safe_float(data["SharesOutstanding"])
     marketCap = safe_float(data["MarketCapitalization"])
-    entQuote = price, sharesOutstanding, marketCap
+    company_name = data["Name"]
+    entQuote = price, sharesOutstanding, marketCap, company_name
     return entQuote
 
 

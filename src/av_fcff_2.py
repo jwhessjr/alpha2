@@ -57,7 +57,7 @@ RISK_FREE = hg_dcflib.get_risk_free(FRED_KEY)
 class Stock_Value:
     ticker: str
     valuation_date: str
-
+    ent_name: str
     industry: str
     beta: float
     market_cap: float
@@ -69,10 +69,12 @@ class Stock_Value:
     # calcukated values in dataclass methods
     growth_rate: float
     cost_of_capital: float
+    wealth_pc: float
     fcff_value: float
     terminal_value: float
     share_value: float
     margin_of_safety: float
+    margin_of_safety_pc: float
 
 
 # ## Functions
@@ -85,18 +87,22 @@ def create_table():
         """CREATE TABLE IF NOT EXISTS valuation (
               ticker TEXT NOT NULL,
               valuation_date TEXT NOT NULL,
+              ent_name TEXT NOT NULL,
               industry TEXT NOT NULL,
               beta REAL NOT NULL,
+              market_cap REAL NOT NULL,
               price REAL NOT NULL,
               shares_outstanding REAL NOT NULL,
               risk_free_rate REAL NOT NULL,
               eq_premium REAL NOT NULL,
               growth_rate REAL NOT NULL,
               cost_of_capital REAL NOT NULL,
+              wealth_pc REAL NO NULL,
               fcff_value REAL NOT NULL,
               terminal_value REAL NOT NULL,
               share_value REAL NOT NULL,
               margin_of_safety REAL NOT NULL,
+              margin_of_safety_pc REAL NOT NULL,
               PRIMARY KEY (ticker, valuation_date)
               )
               ;"""
@@ -116,24 +122,28 @@ def insert_valuation(conn, val):
     c = conn.cursor()
     c.execute(
         """
-              INSERT OR REPLACE INTO valuation (ticker, valuation_date, industry, beta, price, shares_outstanding, risk_free_rate, eq_premium, growth_rate, cost_of_capital, fcff_value, terminal_value, share_value, margin_of_safety
-            )  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              INSERT OR REPLACE INTO valuation (ticker, valuation_date,ent_name, industry, beta, market_cap, price, shares_outstanding, risk_free_rate, eq_premium, growth_rate, cost_of_capital, wealth_pc, fcff_value, terminal_value, share_value, margin_of_safety, margin_of_safety_pc
+            )  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               """,
         (
             val.ticker,
             val.valuation_date,
+            val.ent_name,
             val.industry,
             val.beta,
+            val.market_cap,
             val.price,
             val.shares_outstanding,
             val.risk_free_rate,
             val.eq_premium,
             val.growth_rate,
             val.cost_of_capital,
+            val.wealth_pc,
             val.fcff_value,
             val.terminal_value,
             val.share_value,
             val.margin_of_safety,
+            val.margin_of_safety_pc,
         ),
     )
     conn.commit()
@@ -408,6 +418,7 @@ def main():
     shares_outstanding = ent_quote[1]
     logger.info(f"Shares Outstanding: {shares_outstanding}")
     market_cap = ent_quote[2]
+    ent_name = ent_quote[3]
     eff_tax_rate = calc_tax_rate(inc_stmnt)
     fcff_data = calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate)
 
@@ -453,11 +464,17 @@ def main():
     )
     safety_margin = float(intrinsic_value - price)
     logger.info(f"Safety Margin: {safety_margin:,.2f}")
-
+    safety_margin_pc = 1 - (price / intrinsic_value)
+    if return_on_capital > discount_rate:
+        logger.info("Wealth Creator")
+    else:
+        logger.info("Weath Detroyer")
+    wealth_pc = return_on_capital - discount_rate
     try:
         valuation = Stock_Value(
             COMPANY,
             valuation_date,
+            ent_name,
             INDUSTRY,
             UNLEVERED_BETA,
             market_cap,
@@ -467,10 +484,12 @@ def main():
             EQ_PREM,
             growth_rate,
             discount_rate,
+            wealth_pc,
             fcff_pv,
             terminal_value_pv,
             intrinsic_value,
             safety_margin,
+            safety_margin_pc,
         )
         logger.info(valuation)
     except Exception as e:
@@ -478,13 +497,8 @@ def main():
 
     # write to db
     create_table()
-    conn = sqlite3.connect("data/valuation.db")
+    conn = sqlite3.connect("/Volumes/Financial_Data/valuation.db")
     insert_valuation(conn, valuation)
-
-    if return_on_capital > discount_rate:
-        logger.info("Wealth Creator")
-    else:
-        logger.info("Weath Detroyer")
 
     print("DONE")
 
