@@ -358,17 +358,25 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
     return cost_of_capital
 
 
-def calc_expected_fcff(curr_yr_fcff, growth_rate):
-    fcff_table = []
+def calc_expected_fcff(ebiat, growth_rate, reinvestment_rate ):
+    # change this calculation to estimate the ebit and the use the reinvestment rate to calculate the expected FCFF
+
+    value_dict = {}
+    keys = ["ebiat_n", "fcff_n"]
+    for k in keys:
+        value_dict[k] = []
+
     for year in range(GROWTH_PERIOD):
         if year == 0:
-            fcff_table.append(curr_yr_fcff * (1 + growth_rate))
+            value_dict["ebiat_n"].append(ebiat * (1 + growth_rate))
         else:
-            fcff_table.append(fcff_table[year - 1] * (1 + growth_rate))
-    for val in fcff_table:
+            value_dict["ebiat_n"].append(value_dict["ebiat_n"][year - 1] * (1 + growth_rate))
+        
+        value_dict["fcff_n"].append(value_dict["ebiat_n"][year] * (1 - reinvestment_rate))
+    for val in value_dict["fcff_n"]:
         logger.info(f"Expected FCFF = {val:,.2f}")
 
-    return fcff_table
+    return value_dict["fcff_n"]
 
 
 def calc_fcff_value(fcff_table, discount_rate):
@@ -447,7 +455,7 @@ def main():
     discount_rate = calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity)
     logger.info(f"disc rate {discount_rate:,.4}")
 
-    fcff_table = calc_expected_fcff(curr_yr_fcff, growth_rate)
+    fcff_table = calc_expected_fcff(ebiat, growth_rate, reinvestment_rate)
 
     fcff_pv = calc_fcff_value(fcff_table, discount_rate)
     terminal_cost_of_capital = calc_discount_rate(
