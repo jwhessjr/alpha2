@@ -370,7 +370,7 @@ def get_risk_free(FRED_KEY):
 
 def get_industry(company):
     indName = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/indname.xlsx", sheet_name="US by industry"
+        "/Users/jhess/Development/Alpha2/data/indname.xlsx", sheet_name="Global by Industry"
     )
 
     for index, row in indName.iterrows():
