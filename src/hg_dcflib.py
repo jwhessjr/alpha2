@@ -330,6 +330,7 @@ def get_rAndD(company, rd_years, apiKey):
 
 
 def get_quote(company, apiKey):
+    # ADD exchange to this extract and add it to the database
     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={company}&apikey={apiKey}"
     data = get_jsonparsed_data(url)
     data = data.get("Global Quote", [])

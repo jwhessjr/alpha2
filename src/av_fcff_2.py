@@ -422,6 +422,7 @@ def main():
     ent_quote = enterprise_quote(COMPANY, MY_API_KEY)
     logger.info(f"Ent Quote {ent_quote}")
     valuation_date = str(date.today())
+    # Add exchange to this
     price = ent_quote[0]
     shares_outstanding = ent_quote[1]
     logger.info(f"Shares Outstanding: {shares_outstanding}")
