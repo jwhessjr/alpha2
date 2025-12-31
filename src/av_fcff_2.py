@@ -5,14 +5,9 @@ Worth hides in the mist.
 """
 
 from dataclasses import dataclass
-
-# from typing import Optional
 from datetime import date
 import sqlite3
-
-# import csv
 import hg_dcflib
-
 import logging
 
 logger = logging.getLogger(__name__)
@@ -205,7 +200,7 @@ def calc_chng_wc(bal_sht):
 
 
 def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
-    rdTable, years_to_process = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
+    years_to_process = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
     rd_table = {}
     rd_expense = []
     unamort_percent = []
@@ -340,6 +335,8 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
     except ZeroDivisionError:
         int_cover = 25  # forces default spread to the lowest level
 
+    logger.info(f"operating Incpme {inc_stmnt['operating_income'][0]}")
+    logger.info(f"interest expense {inc_stmnt['interest_expense'][0]}")
     logger.info(f"Interest Coverage = {int_cover}")
     def_spread = hg_dcflib.get_default_spread(int_cover)
     logger.info(f"Default Spread = {def_spread}")
@@ -358,7 +355,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
     return cost_of_capital
 
 
-def calc_expected_fcff(ebiat, growth_rate, reinvestment_rate ):
+def calc_expected_fcff(ebiat, growth_rate, reinvestment_rate):
     # change this calculation to estimate the ebit and the use the reinvestment rate to calculate the expected FCFF
 
     value_dict = {}
@@ -370,9 +367,13 @@ def calc_expected_fcff(ebiat, growth_rate, reinvestment_rate ):
         if year == 0:
             value_dict["ebiat_n"].append(ebiat * (1 + growth_rate))
         else:
-            value_dict["ebiat_n"].append(value_dict["ebiat_n"][year - 1] * (1 + growth_rate))
-        
-        value_dict["fcff_n"].append(value_dict["ebiat_n"][year] * (1 - reinvestment_rate))
+            value_dict["ebiat_n"].append(
+                value_dict["ebiat_n"][year - 1] * (1 + growth_rate)
+            )
+
+        value_dict["fcff_n"].append(
+            value_dict["ebiat_n"][year] * (1 - reinvestment_rate)
+        )
     for val in value_dict["fcff_n"]:
         logger.info(f"Expected FCFF = {val:,.2f}")
 
