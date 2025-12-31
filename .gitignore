@@ -27,6 +27,7 @@ sqlitedb.py
 av_fcff.py
 av_fcff.ipynb
 scrape_erp.py
+dataclass_schema.py
 
 # directories & files
 __pycache__/

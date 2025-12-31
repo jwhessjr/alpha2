@@ -201,9 +201,10 @@ def calc_chng_wc(bal_sht):
 
 def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     rdTable = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
-    rd_dict = rdTable[0]
-    years_to_process = rdTable[1]
-    logger.info(f"rdTable  {rdTable}")
+    rd_dict, years_to_process = rdTable
+    logger.info(f"rdTable = {rdTable}")
+    logger.info(f"rd_dict = {rd_dict}")
+    logger.info(f"Years to Process = {years_to_process}")
     rd_table = {}
     rd_expense = []
     unamort_percent = []
@@ -338,7 +339,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
     except ZeroDivisionError:
         int_cover = 25  # forces default spread to the lowest level
 
-    logger.info(f"operating Incpme {inc_stmnt['operating_income'][0]}")
+    logger.info(f"operating Income {inc_stmnt['operating_income'][0]}")
     logger.info(f"interest expense {inc_stmnt['interest_expense'][0]}")
     logger.info(f"Interest Coverage = {int_cover}")
     def_spread = hg_dcflib.get_default_spread(int_cover)
@@ -354,6 +355,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
 
     # 3 calcualte the weighted cost of capital
     cost_of_capital = (cost_of_debt * percent_debt) + (cost_of_equity * percent_equity)
+    logger.info(f"Cost of Capital = {cost_of_capital:,.4f}")
 
     return cost_of_capital
 

@@ -278,7 +278,7 @@ def get_rAndD(company, rd_years, apiKey):
     """
     url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
 
-    rdTable = {}
+    rd_table = {}
     try:
         response = requests.get(url)
         response.raise_for_status()  # Raise an exception for bad status codes
@@ -320,9 +320,8 @@ def get_rAndD(company, rd_years, apiKey):
 
         rd_Amount.append(yearRDExpense)
 
-    rdTable["research_and_development"] = rd_Amount
-    logger.info(f"rdTable {rdTable}")
-
+    rd_table["research_and_development"] = rd_Amount
+    rdTable = rd_table, years_to_process
     return rdTable
 
 
