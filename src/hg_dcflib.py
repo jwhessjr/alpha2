@@ -280,7 +280,7 @@ def get_rAndD(company, rd_years, apiKey):
 
     rdTable = {}
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(url)
         response.raise_for_status()  # Raise an exception for bad status codes
         data = response.json()
     except requests.exceptions.RequestException as e:
@@ -323,7 +323,7 @@ def get_rAndD(company, rd_years, apiKey):
     rdTable["research_and_development"] = rd_Amount
     logger.info(f"rdTable {rdTable}")
 
-    return rdTable, years_to_process
+    return rdTable
 
 
 # Function to get the current share price, shares outstanding, and market cap
@@ -371,7 +371,8 @@ def get_risk_free(FRED_KEY):
 
 def get_industry(company):
     indName = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/indname.xlsx", sheet_name="Global by Industry"
+        "/Users/jhess/Development/Alpha2/data/indname.xlsx",
+        sheet_name="Global by Industry",
     )
 
     for index, row in indName.iterrows():

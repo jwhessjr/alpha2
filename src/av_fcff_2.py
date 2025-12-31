@@ -200,7 +200,10 @@ def calc_chng_wc(bal_sht):
 
 
 def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
-    years_to_process = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
+    rdTable = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
+    rd_dict = rdTable[0]
+    years_to_process = rdTable[1]
+    logger.info(f"rdTable  {rdTable}")
     rd_table = {}
     rd_expense = []
     unamort_percent = []
@@ -221,7 +224,7 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     #     rd_asset_value += unamort_amt[year]
     #     rd_amort_amt += curr_year_amortization[year]
     for year in range(years_to_process):
-        expense = rdTable["research_and_development"][year]
+        expense = rd_dict["research_and_development"][year]
         percent_unamort = 1.0 - (amort_percentage * year)
         unamort = expense * percent_unamort
         amort = 0.0 if year == 0 else expense * amort_percentage
