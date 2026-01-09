@@ -483,7 +483,7 @@ def main():
     if return_on_capital > discount_rate:
         logger.info("Wealth Creator")
     else:
-        logger.info("Weath Detroyer")
+        logger.info("Wealth Detroyer")
     wealth_pc = return_on_capital - discount_rate
     try:
         valuation = Stock_Value(
