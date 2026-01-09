@@ -224,8 +224,8 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
         depreciation.append(yearly_depr)
 
     return {
-        "capex": depreciation,  # keep the key names you used before
-        "depreciation": capex,
+        "capex": capex,  # keep the key names you used before
+        "depreciation": depreciation,
     }
 
 

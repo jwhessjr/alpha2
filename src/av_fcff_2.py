@@ -191,10 +191,10 @@ def calc_capital_expenditures(cash_flw):
 def calc_chng_wc(bal_sht):
     curr_yr_nc_wc = (
         bal_sht["total_current_assets"][0] - bal_sht["cash_and_equivalents"][0]
-    ) - (bal_sht["total_current_liabilities"][0] - bal_sht["current_long_debt"][0])
+    ) - (bal_sht["total_current_liabilities"][0] - bal_sht["short_term_debt"][0])
     prior_yr_nc_wc = (
         bal_sht["total_current_assets"][1] - bal_sht["cash_and_equivalents"][1]
-    ) - (bal_sht["total_current_liabilities"][1] - bal_sht["current_long_debt"][1])
+    ) - (bal_sht["total_current_liabilities"][1] - bal_sht["short_term_debt"][1])
     chng_nc_wc = curr_yr_nc_wc - prior_yr_nc_wc
     return chng_nc_wc
 
@@ -295,11 +295,11 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
 
 def calc_bv_debt(bal_sht):
     bv_debt = (
-        bal_sht["current_long_debt"][0]
+        bal_sht["short_term_debt"][0]
         + bal_sht["long_term_debt"][0]
         - bal_sht["cash_and_equivalents"][0]
     )
-    # logger.info(f"Current Long Term Debt {bal_sht['current_long_debt'][0]:,.2f}")
+    # logger.info(f"Current Long Term Debt {bal_sht['short_term_debt'][0]:,.2f}")
     # logger.info(f"Long Term Debt {bal_sht['long_term_debt'][0]:,.2f}")
     # logger.info(f"Cash and Equivalents {bal_sht['cash_and_equivalents'][0]:,.2f}")
     logger.info(f"BV Debt = {bv_debt:,.2f}")
