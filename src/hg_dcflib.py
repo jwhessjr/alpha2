@@ -79,7 +79,7 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         if len(quarter_block) < 4:
             break  # incomplete year at the end of the list
 
-        op_income = sum(safe_float(q["incomeBeforeTax"]) for q in quarter_block)
+        op_income = sum(safe_float(q["ebit"]) for q in quarter_block)
         tax_exp = sum(safe_float(q["incomeTaxExpense"]) for q in quarter_block)
         int_exp = sum(safe_float(q["interestExpense"]) for q in quarter_block)
 
