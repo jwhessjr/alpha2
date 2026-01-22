@@ -144,7 +144,7 @@ def get_bal_sheet(company, apiKey):
         safe_float(balSheet[4]["currentLongTermDebt"]),
         safe_float(balSheet[8]["currentLongTermDebt"]),
         safe_float(balSheet[12]["currentLongTermDebt"]),
-        # safe_float(balSheet[16]["currentLongTermDebt"]),
+        safe_float(balSheet[16]["currentLongTermDebt"]),
     ]
     shortTermDebt = [
         safe_float(balSheet[0]["shortTermDebt"]),
