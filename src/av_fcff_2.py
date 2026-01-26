@@ -191,18 +191,10 @@ def calc_capital_expenditures(cash_flw):
 def calc_chng_wc(bal_sht):
     curr_yr_nc_wc = (
         bal_sht["total_current_assets"][0] - bal_sht["cash_and_equivalents"][0]
-    ) - (
-        bal_sht["total_current_liabilities"][0]
-        - bal_sht["short_term_debt"][0]
-        - bal_sht["current_long_debt"][0]
-    )
+    ) - (bal_sht["total_current_liabilities"][0] - bal_sht["short_term_debt"][0])
     prior_yr_nc_wc = (
         bal_sht["total_current_assets"][1] - bal_sht["cash_and_equivalents"][1]
-    ) - (
-        bal_sht["total_current_liabilities"][1]
-        - bal_sht["short_term_debt"][1]
-        - bal_sht["current_long_debt"][1]
-    )
+    ) - (bal_sht["total_current_liabilities"][1] - bal_sht["short_term_debt"][1])
     chng_nc_wc = curr_yr_nc_wc - prior_yr_nc_wc
     return chng_nc_wc
 
@@ -248,7 +240,7 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
 
 
 def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
-    ebiat = inc_stmnt["operating_income"][0] * (1 - eff_tax_rate)
+    ebiat = inc_stmnt["ebit"][0] * (1 - eff_tax_rate)
     logger.info(f"ebiat {ebiat:,.2f}")
     capex = calc_capital_expenditures(cash_flw)
     logger.info(f"Capex {capex:,.2f}")
@@ -294,11 +286,7 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
 
 
 def calc_bv_debt(bal_sht):
-    bv_debt = (
-        bal_sht["short_term_debt"][0]
-        + bal_sht["current_long_debt"][0]
-        + bal_sht["long_term_debt"][0]
-    )
+    bv_debt = bal_sht["short_term_debt"][0] + bal_sht["long_term_debt"][0]
     # logger.info(f"Current Long Term Debt {bal_sht['short_term_debt'][0]:,.2f}")
     # logger.info(f"Long Term Debt {bal_sht['long_term_debt'][0]:,.2f}")
     # logger.info(f"Cash and Equivalents {bal_sht['cash_and_equivalents'][0]:,.2f}")
@@ -307,7 +295,7 @@ def calc_bv_debt(bal_sht):
 
 
 def calc_tax_rate(inc_stmnt):
-    eff_tax_rate = inc_stmnt["income_tax_expense"][0] / inc_stmnt["operating_income"][0]
+    eff_tax_rate = inc_stmnt["income_tax_expense"][0] / inc_stmnt["incomeBeforeTax"][0]
     logger.info(f"Effective Tax Rate = {eff_tax_rate:,.4f}")
     return eff_tax_rate
 
@@ -326,20 +314,20 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
-def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
+def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity, beta):
     # Discount rate for free cah flow to the firm = cost of capital
     # The cost of capital is the weighted average of the cost of equity and the cost of debt
     # Cost of equity = risk free rate + Beta(Implied Equity Risk Premium)
 
-    cost_of_equity = RISK_FREE + (UNLEVERED_BETA * EQ_PREM)
+    cost_of_equity = RISK_FREE + (beta * EQ_PREM)
     logger.info(f"COE = {cost_of_equity:,.4}")
 
     try:
-        int_cover = inc_stmnt["operating_income"][0] / inc_stmnt["interest_expense"][0]
+        int_cover = inc_stmnt["ebit"][0] / inc_stmnt["interest_expense"][0]
     except ZeroDivisionError:
         int_cover = 25  # forces default spread to the lowest level
 
-    logger.info(f"operating Income {inc_stmnt['operating_income'][0]}")
+    logger.info(f"operating Income {inc_stmnt['ebit'][0]}")
     logger.info(f"interest expense {inc_stmnt['interest_expense'][0]}")
     logger.info(f"Interest Coverage = {int_cover}")
     def_spread = hg_dcflib.get_default_spread(int_cover)
@@ -360,7 +348,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity):
     return cost_of_capital
 
 
-def calc_expected_fcff(ebiat, growth_rate, reinvestment_rate):
+def calc_expected_fcff(adjusted_ebiat, growth_rate, reinvestment_rate):
     # change this calculation to estimate the ebit and the use the reinvestment rate to calculate the expected FCFF
 
     value_dict = {}
@@ -370,7 +358,7 @@ def calc_expected_fcff(ebiat, growth_rate, reinvestment_rate):
 
     for year in range(GROWTH_PERIOD):
         if year == 0:
-            value_dict["ebiat_n"].append(ebiat * (1 + growth_rate))
+            value_dict["ebiat_n"].append(adjusted_ebiat * (1 + growth_rate))
         else:
             value_dict["ebiat_n"].append(
                 value_dict["ebiat_n"][year - 1] * (1 + growth_rate)
@@ -395,9 +383,11 @@ def calc_fcff_value(fcff_table, discount_rate):
     return fcff_value
 
 
-def calc_terminal_value(fcff_last, discount_rate):
-    terminal_value = (fcff_last * (1 + RISK_FREE)) / (discount_rate - RISK_FREE)
-    terminal_value_pv = terminal_value / ((1 + discount_rate) ** GROWTH_PERIOD)
+def calc_terminal_value(fcff_last, stable_cost_of_capital, growth_cost_of_capital):
+    terminal_value = (fcff_last * (1 + RISK_FREE)) / (
+        stable_cost_of_capital - RISK_FREE
+    )
+    terminal_value_pv = terminal_value / ((1 + growth_cost_of_capital) ** GROWTH_PERIOD)
     logger.info(f"Terminal Value = {terminal_value_pv:,.2f}")
     return terminal_value_pv
 
@@ -411,6 +401,7 @@ def calc_intrinsic_value(
 ):
     enterprise_value = fcff_pv + terminal_value_pv + cash_and_equivalents - bv_debt
     intrinsic_value = enterprise_value / shares_outstanding
+    logger.info(f"Enterprise Value = {enterprise_value:,.2f}")
     logger.info(f"Intrinsic Value = {intrinsic_value:,.2f}")
     return intrinsic_value
 
@@ -459,16 +450,20 @@ def main():
         adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
     )
     growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
-    discount_rate = calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity)
+    discount_rate = calc_discount_rate(
+        inc_stmnt, bv_debt, adjusted_bv_equity, UNLEVERED_BETA
+    )
     logger.info(f"disc rate {discount_rate:,.4}")
 
-    fcff_table = calc_expected_fcff(ebiat, growth_rate, reinvestment_rate)
+    fcff_table = calc_expected_fcff(adjusted_ebiat, growth_rate, reinvestment_rate)
 
     fcff_pv = calc_fcff_value(fcff_table, discount_rate)
     terminal_cost_of_capital = calc_discount_rate(
-        inc_stmnt, bv_debt, adjusted_bv_equity
+        inc_stmnt, bv_debt, adjusted_bv_equity, STABLE_BETA
     )
-    terminal_value_pv = calc_terminal_value(fcff_table[-1], terminal_cost_of_capital)
+    terminal_value_pv = calc_terminal_value(
+        fcff_table[-1], terminal_cost_of_capital, discount_rate
+    )
 
     intrinsic_value = calc_intrinsic_value(
         fcff_pv,

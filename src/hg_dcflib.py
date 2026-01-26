@@ -52,7 +52,7 @@ def get_jsonparsed_data(url):
 
 
 def get_inc_stmnt(company: str, apiKey: str) -> dict:
-    """Return annualized operating income, tax expense and interest expense
+    """Return annualized ebit, tax expense and interest expense
        from the quarterly reports of a ticker.
 
     The API returns up to 20 recent quarters; we aggregate them into at most five years.
@@ -79,13 +79,15 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         if len(quarter_block) < 4:
             break  # incomplete year at the end of the list
 
-        op_income = sum(safe_float(q["ebit"]) for q in quarter_block)
+        ebit = sum(safe_float(q["ebit"]) for q in quarter_block)
+        incomeBeforeTax = sum(safe_float(q["incomeBeforeTax"]) for q in quarter_block)
         tax_exp = sum(safe_float(q["incomeTaxExpense"]) for q in quarter_block)
         int_exp = sum(safe_float(q["interestExpense"]) for q in quarter_block)
 
         yearly_data.append(
             {
-                "operating_income": op_income,
+                "ebit": ebit,
+                "incomeBeforeTax": incomeBeforeTax,
                 "income_tax_expense": tax_exp,
                 "interest_expense": int_exp,
             }
@@ -93,7 +95,8 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 
     # Build the result dictionary with separate lists
     income_statement = {
-        "operating_income": [y["operating_income"] for y in yearly_data],
+        "ebit": [y["ebit"] for y in yearly_data],
+        "incomeBeforeTax": [y["incomeBeforeTax"] for y in yearly_data],
         "income_tax_expense": [y["income_tax_expense"] for y in yearly_data],
         "interest_expense": [y["interest_expense"] for y in yearly_data],
     }
