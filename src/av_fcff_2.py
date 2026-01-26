@@ -217,40 +217,32 @@ def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     rd_expense = []
     unamort_percent = []
     unamort_amt = []
-    curr_year_amortization = []
     amort_percentage = 1.0 / (RD_YEARS - 1)
-    rd_asset_value = 0
-    rd_amort_amt = 0
-    # for year in range(years_to_process):
-    #     rd_expense.append(rdTable["research_and_development"][year])
-    #     unamort_percent.append(1.0 - (1.0 / RD_YEARS * year))
-    #     unamort_amt.append(rd_expense[year] * unamort_percent[year])
-    #     if year == 0:
-    #         curr_year_amortization.append(0.00)
-    #     else:
-    #         curr_year_amortization.append(rd_expense[year] * amort_percentage)
 
-    #     rd_asset_value += unamort_amt[year]
-    #     rd_amort_amt += curr_year_amortization[year]
+    # Calculate the current year's total amortization from all past R&D
+    current_year_total_amortization = 0
+    for year in range(1, min(years_to_process, RD_YEARS)):
+        current_year_total_amortization += (
+            rd_dict["research_and_development"][year] * amort_percentage
+        )
+
+    rd_asset_value = 0
+
     for year in range(years_to_process):
         expense = rd_dict["research_and_development"][year]
         percent_unamort = 1.0 - (amort_percentage * year)
         unamort = expense * percent_unamort
-        amort = 0.0 if year == 0 else expense * amort_percentage
 
         rd_expense.append(expense)
         unamort_percent.append(percent_unamort)
         unamort_amt.append(unamort)
-        curr_year_amortization.append(amort)
-
         rd_asset_value += unamort
-        rd_amort_amt += amort
+
     rd_table["rAndDExpense"] = rd_expense
     rd_table["unamortized_percent"] = unamort_percent
     rd_table["unamort_amount"] = unamort_amt
-    rd_table["amort_amt"] = curr_year_amortization
     rd_table["RD_Asset_Value"] = rd_asset_value
-    rd_table["RD_Amortization_Amt"] = rd_amort_amt
+    rd_table["Current_Year_Amortization"] = current_year_total_amortization
 
     return rd_table
 
@@ -276,7 +268,7 @@ def calc_reinvestment(capex, depreciation, chng_nc_wc, amort_schedule):
         - depreciation
         + chng_nc_wc
         + amort_schedule["rAndDExpense"][0]
-        - amort_schedule["RD_Amortization_Amt"]
+        - amort_schedule["Current_Year_Amortization"]
     )
     logger.info(f"Firm Reinvestment {firm_reinvestment:,.2f}")
     return firm_reinvestment
@@ -286,7 +278,7 @@ def calc_adj_ebiat(ebiat, amort_schedule):
     adjusted_ebiat = (
         ebiat
         + amort_schedule["rAndDExpense"][0]
-        - amort_schedule["RD_Amortization_Amt"]
+        - amort_schedule["Current_Year_Amortization"]
     )
 
     logger.info(f"Adjusted ebiat {adjusted_ebiat:,.2f}")
@@ -304,8 +296,8 @@ def calc_adj_bv_equity(bal_sht, amort_schedule):
 def calc_bv_debt(bal_sht):
     bv_debt = (
         bal_sht["short_term_debt"][0]
+        + bal_sht["current_long_debt"][0]
         + bal_sht["long_term_debt"][0]
-        - bal_sht["cash_and_equivalents"][0]
     )
     # logger.info(f"Current Long Term Debt {bal_sht['short_term_debt'][0]:,.2f}")
     # logger.info(f"Long Term Debt {bal_sht['long_term_debt'][0]:,.2f}")
