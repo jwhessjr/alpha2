@@ -34,7 +34,6 @@ logger.addHandler(file_handler)
 
 EQ_PREM = hg_dcflib.get_erp()
 MARGINAL_TAX_RATE = 0.26
-STABLE_BETA = 1.0
 COMPANY = input("Input company ticker: ").upper()
 GROWTH_PERIOD = int(input("Input growth period: "))
 INDUSTRY = hg_dcflib.get_industry(COMPANY)
@@ -174,6 +173,19 @@ def cash_flow_statement(COMPANY, MY_API_KEY):
 def enterprise_quote(COMPANY, MY_API_KEY):
     ent_quote = hg_dcflib.get_quote(COMPANY, MY_API_KEY)
     return ent_quote
+
+
+def calc_stable_beta(UNLEVERED_BETA):
+    if UNLEVERED_BETA < 0.5:
+        stable_beta = 0.8
+    elif UNLEVERED_BETA > 1.5:
+        stable_beta = 1.2
+    else:
+        stable_beta = 1.0
+
+    logger.info(f"Stable beta = {stable_beta:,.3f}")
+
+    return stable_beta
 
 
 def calc_capital_expenditures(cash_flw):
@@ -425,6 +437,7 @@ def main():
     logger.info(f"Shares Outstanding: {shares_outstanding}")
     market_cap = ent_quote[2]
     ent_name = ent_quote[3]
+    stable_beta = calc_stable_beta(UNLEVERED_BETA)
     eff_tax_rate = calc_tax_rate(inc_stmnt)
     fcff_data = calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate)
 
@@ -459,7 +472,7 @@ def main():
 
     fcff_pv = calc_fcff_value(fcff_table, discount_rate)
     terminal_cost_of_capital = calc_discount_rate(
-        inc_stmnt, bv_debt, adjusted_bv_equity, STABLE_BETA
+        inc_stmnt, bv_debt, adjusted_bv_equity, stable_beta
     )
     terminal_value_pv = calc_terminal_value(
         fcff_table[-1], terminal_cost_of_capital, discount_rate
