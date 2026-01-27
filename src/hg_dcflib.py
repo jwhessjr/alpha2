@@ -61,7 +61,7 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         f"https://www.alphavantage.co/query?"
         f"function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
     )
-    resp = requests.get(url, timeout=20)
+    resp = requests.get(url)
     data = resp.json()
 
     # The API returns the most recent quarter first.
@@ -199,7 +199,7 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
         f"https://www.alphavantage.co/query?"
         f"function=CASH_FLOW&symbol={company}&apikey={apiKey}"
     )
-    resp = requests.get(url, timeout=20)
+    resp = requests.get(url)
     data = resp.json()
 
     quarterly_reports = data.get("quarterlyReports", [])
@@ -358,7 +358,7 @@ def get_risk_free(FRED_KEY):
         "limit": 1,
     }
     # Fetch data
-    response = requests.get(url, params=params, timeout=20)
+    response = requests.get(url, params=params)
 
     if response.status_code != 200:
         logger.debug(f"Error: Received status code {response.status_code}")
