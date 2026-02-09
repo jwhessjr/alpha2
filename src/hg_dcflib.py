@@ -288,13 +288,13 @@ def get_rAndD(company, rd_years, apiKey):
         data = response.json()
     except requests.exceptions.RequestException as e:
         logger.debug(f"Error fetching data from Alpha Vantage: {e}")
-        return {"research_and_development": []}
+        return {"research_and_development": []}, 0
 
     rdExpense = data.get("quarterlyReports", [])
 
     if not rdExpense:
         logger.debug("No quarterly reports found.")
-        return {"research_and_development": []}
+        return {"research_and_development": []}, 0
 
     rd_Amount = []
 
