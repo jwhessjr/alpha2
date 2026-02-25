@@ -210,7 +210,6 @@ def calc_chng_wc(bal_sht):
     chng_nc_wc = curr_yr_nc_wc - prior_yr_nc_wc
     return chng_nc_wc
 
-
 def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     rdTable = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
     rd_dict, years_to_process = rdTable

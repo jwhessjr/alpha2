@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import re
-
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,8 @@ file_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 logger.addHandler(file_handler)
 
+DELAY = 1.0 / 5  # 0.2 seconds between calls
+
 
 def safe_float(val):
     try:
@@ -43,6 +45,7 @@ def safe_float(val):
 
 
 def get_jsonparsed_data(url):
+    time.sleep(DELAY)
     response = urlopen(url)
     data = response.read().decode("utf-8")
     return json.loads(data)
@@ -282,20 +285,13 @@ def get_rAndD(company, rd_years, apiKey):
     url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
 
     rd_table = {}
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        logger.debug(f"Error fetching data from Alpha Vantage: {e}")
-        return {"research_and_development": []}, 0
-
+    resp = requests.get(url)
+    data = resp.json()
     rdExpense = data.get("quarterlyReports", [])
 
     if not rdExpense:
         logger.debug("No quarterly reports found.")
         return {"research_and_development": []}, 0
-
     rd_Amount = []
 
     # We need to process quarters in chunks of 4 for each year.
