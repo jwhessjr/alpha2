@@ -110,73 +110,127 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 # Function to get the balance sheet and extract the required fields
 
 
+# def get_bal_sheet(company, apiKey):
+#     url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
+
+#     data = get_jsonparsed_data(url)
+#     balSheet = data.get("quarterlyReports", [])
+#     balSht = {}
+#     cashAndEquivalents = [
+#         safe_float(balSheet[0]["cashAndShortTermInvestments"]),
+#         safe_float(balSheet[4]["cashAndShortTermInvestments"]),
+#         safe_float(balSheet[8]["cashAndShortTermInvestments"]),
+#         safe_float(balSheet[12]["cashAndShortTermInvestments"]),
+#         safe_float(balSheet[16]["cashAndShortTermInvestments"]),
+#     ]
+#     currentAssets = [
+#         safe_float(balSheet[0]["totalCurrentAssets"]),
+#         safe_float(balSheet[4]["totalCurrentAssets"]),
+#         safe_float(balSheet[8]["totalCurrentAssets"]),
+#         safe_float(balSheet[12]["totalCurrentAssets"]),
+#         safe_float(balSheet[16]["totalCurrentAssets"]),
+#     ]
+
+#     stockholdersEquity = [
+#         safe_float(balSheet[0]["totalShareholderEquity"]),
+#         safe_float(balSheet[4]["totalShareholderEquity"]),
+#         safe_float(balSheet[8]["totalShareholderEquity"]),
+#         safe_float(balSheet[12]["totalShareholderEquity"]),
+#         safe_float(balSheet[16]["totalShareholderEquity"]),
+#     ]
+#     currentLiabilities = [
+#         safe_float(balSheet[0]["totalCurrentLiabilities"]),
+#         safe_float(balSheet[4]["totalCurrentLiabilities"]),
+#         safe_float(balSheet[8]["totalCurrentLiabilities"]),
+#         safe_float(balSheet[12]["totalCurrentLiabilities"]),
+#         safe_float(balSheet[16]["totalCurrentLiabilities"]),
+#     ]
+#     currentLongDebt = [
+#         safe_float(balSheet[0]["currentLongTermDebt"]),
+#         safe_float(balSheet[4]["currentLongTermDebt"]),
+#         safe_float(balSheet[8]["currentLongTermDebt"]),
+#         safe_float(balSheet[12]["currentLongTermDebt"]),
+#         safe_float(balSheet[16]["currentLongTermDebt"]),
+#     ]
+#     shortTermDebt = [
+#         safe_float(balSheet[0]["shortTermDebt"]),
+#         safe_float(balSheet[4]["shortTermDebt"]),
+#         safe_float(balSheet[8]["shortTermDebt"]),
+#         safe_float(balSheet[12]["shortTermDebt"]),
+#         safe_float(balSheet[16]["shortTermDebt"]),
+#     ]
+#     longTermDebt = [
+#         safe_float(balSheet[0]["longTermDebt"]),
+#         safe_float(balSheet[4]["longTermDebt"]),
+#         safe_float(balSheet[8]["longTermDebt"]),
+#         safe_float(balSheet[12]["longTermDebt"]),
+#         safe_float(balSheet[16]["longTermDebt"]),
+#     ]
+#     balSht["cash_and_equivalents"] = cashAndEquivalents
+#     balSht["total_current_assets"] = currentAssets
+#     # balSht["totalAssets"] = totalAssets
+#     # balSht["accountsPayable"] = accountsPayable
+#     balSht["current_long_debt"] = currentLongDebt
+#     balSht["short_term_debt"] = shortTermDebt
+#     balSht["long_term_debt"] = longTermDebt
+#     balSht["total_current_liabilities"] = currentLiabilities
+#     # balSht["totalLiabilities"] = liabilities
+#     balSht["total_stockholders_equity"] = stockholdersEquity
+#     return balSht
+
+
 def get_bal_sheet(company, apiKey):
-    url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
+    url = (
+        f"https://www.alphavantage.co/query?"
+        f"function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
+    )
+    resp = requests.get(url)
+    resp.raise_for_status()
+    data = resp.json()
 
-    data = get_jsonparsed_data(url)
-    balSheet = data.get("quarterlyReports", [])
-    balSht = {}
-    cashAndEquivalents = [
-        safe_float(balSheet[0]["cashAndShortTermInvestments"]),
-        safe_float(balSheet[4]["cashAndShortTermInvestments"]),
-        safe_float(balSheet[8]["cashAndShortTermInvestments"]),
-        safe_float(balSheet[12]["cashAndShortTermInvestments"]),
-        safe_float(balSheet[16]["cashAndShortTermInvestments"]),
-    ]
-    currentAssets = [
-        safe_float(balSheet[0]["totalCurrentAssets"]),
-        safe_float(balSheet[4]["totalCurrentAssets"]),
-        safe_float(balSheet[8]["totalCurrentAssets"]),
-        safe_float(balSheet[12]["totalCurrentAssets"]),
-        safe_float(balSheet[16]["totalCurrentAssets"]),
-    ]
+    quarterly_reports = data.get("quarterlyReports", [])
+    if not quarterly_reports:
+        raise ValueError(f"No quarterly balance sheet reports found for {company}")
 
-    stockholdersEquity = [
-        safe_float(balSheet[0]["totalShareholderEquity"]),
-        safe_float(balSheet[4]["totalShareholderEquity"]),
-        safe_float(balSheet[8]["totalShareholderEquity"]),
-        safe_float(balSheet[12]["totalShareholderEquity"]),
-        safe_float(balSheet[16]["totalShareholderEquity"]),
-    ]
-    currentLiabilities = [
-        safe_float(balSheet[0]["totalCurrentLiabilities"]),
-        safe_float(balSheet[4]["totalCurrentLiabilities"]),
-        safe_float(balSheet[8]["totalCurrentLiabilities"]),
-        safe_float(balSheet[12]["totalCurrentLiabilities"]),
-        safe_float(balSheet[16]["totalCurrentLiabilities"]),
-    ]
-    currentLongDebt = [
-        safe_float(balSheet[0]["currentLongTermDebt"]),
-        safe_float(balSheet[4]["currentLongTermDebt"]),
-        safe_float(balSheet[8]["currentLongTermDebt"]),
-        safe_float(balSheet[12]["currentLongTermDebt"]),
-        safe_float(balSheet[16]["currentLongTermDebt"]),
-    ]
-    shortTermDebt = [
-        safe_float(balSheet[0]["shortTermDebt"]),
-        safe_float(balSheet[4]["shortTermDebt"]),
-        safe_float(balSheet[8]["shortTermDebt"]),
-        safe_float(balSheet[12]["shortTermDebt"]),
-        safe_float(balSheet[16]["shortTermDebt"]),
-    ]
-    longTermDebt = [
-        safe_float(balSheet[0]["longTermDebt"]),
-        safe_float(balSheet[4]["longTermDebt"]),
-        safe_float(balSheet[8]["longTermDebt"]),
-        safe_float(balSheet[12]["longTermDebt"]),
-        safe_float(balSheet[16]["longTermDebt"]),
-    ]
-    balSht["cash_and_equivalents"] = cashAndEquivalents
-    balSht["total_current_assets"] = currentAssets
-    # balSht["totalAssets"] = totalAssets
-    # balSht["accountsPayable"] = accountsPayable
-    balSht["current_long_debt"] = currentLongDebt
-    balSht["short_term_debt"] = shortTermDebt
-    balSht["long_term_debt"] = longTermDebt
-    balSht["total_current_liabilities"] = currentLiabilities
-    # balSht["totalLiabilities"] = liabilities
-    balSht["total_stockholders_equity"] = stockholdersEquity
-    return balSht
+    # Balance sheet is point-in-time, so we take one snapshot per year
+    # (the last quarter of each annual block) rather than summing.
+    # Step through in blocks of 4, take the first quarter of each block
+    # (most recent quarter of that fiscal year).
+    max_quarters = min(len(quarterly_reports), 20)
+
+    cash_and_equivalents = []
+    total_current_assets = []
+    total_current_liabilities = []
+    short_term_debt = []
+    long_term_debt = []
+    total_stockholders_equity = []
+
+    for i in range(0, max_quarters, 4):
+        block = quarterly_reports[i : i + 4]
+        if len(block) < 4:
+            break  # incomplete year, skip
+
+        q = block[0]  # most recent quarter of this annual period
+        cash_and_equivalents.append(safe_float(q["cashAndShortTermInvestments"]))
+        total_current_assets.append(safe_float(q["totalCurrentAssets"]))
+        total_current_liabilities.append(safe_float(q["totalCurrentLiabilities"]))
+        short_term_debt.append(safe_float(q["shortTermDebt"]))
+        long_term_debt.append(safe_float(q["longTermDebt"]))
+        total_stockholders_equity.append(safe_float(q["totalShareholderEquity"]))
+
+    if not cash_and_equivalents:
+        raise ValueError(
+            f"Insufficient quarterly data to build balance sheet for {company}"
+        )
+
+    return {
+        "cash_and_equivalents": cash_and_equivalents,
+        "total_current_assets": total_current_assets,
+        "total_current_liabilities": total_current_liabilities,
+        "short_term_debt": short_term_debt,
+        "long_term_debt": long_term_debt,
+        "total_stockholders_equity": total_stockholders_equity,
+    }
 
 
 # Function to get the cash flow statement and extract the required fields

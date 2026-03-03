@@ -9,6 +9,7 @@ from datetime import date
 import sqlite3
 import hg_dcflib
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Set the overall logger level
@@ -17,7 +18,7 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 
 # Create a stream handler for the console
 stream_handler = logging.StreamHandler()
-stream_handler.setLevel(logging.WARNING)  # only show INFO and above on console
+stream_handler.setLevel(logging.WARNING)  # only show WARNING and above on console
 stream_handler.setFormatter(formatter)
 
 # Create a FileHandler for the log file
@@ -37,10 +38,16 @@ MARGINAL_TAX_RATE = 0.26
 COMPANY = input("Input company ticker: ").upper()
 GROWTH_PERIOD = int(input("Input growth period: "))
 INDUSTRY = hg_dcflib.get_industry(COMPANY)
-with open("/Users/jhess/Development/Alpha2/data/ApiKey.txt") as f:
-    MY_API_KEY = f.readline()
-with open("/Users/jhess/Development/Alpha2/data/fred_api.txt") as f:
-    FRED_KEY = f.readline()
+MY_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
+FRED_KEY = os.environ.get("FRED_API_KEY")
+if not MY_API_KEY:
+    raise EnvironmentError(
+        "ALPHA_VANTAGE_API_KEY is not set. Run: export ALPHA_VANTAGE_API_KEY='your_key'"
+    )
+if not FRED_KEY:
+    raise EnvironmentError(
+        "FRED_API_KEY is not set. Run: export FRED_API_KEY='your_key'"
+    )
 RD_YEARS = hg_dcflib.get_rAndD_years(INDUSTRY) + 1
 UNLEVERED_BETA = hg_dcflib.get_beta(INDUSTRY)
 RISK_FREE = hg_dcflib.get_risk_free(FRED_KEY)
@@ -60,7 +67,7 @@ class Stock_Value:
     risk_free_rate: float
     eq_premium: float
 
-    # calcukated values in dataclass methods
+    # calculated values in dataclass methods
     growth_rate: float
     cost_of_capital: float
     wealth_pc: float
@@ -91,7 +98,7 @@ def create_table():
               eq_premium REAL NOT NULL,
               growth_rate REAL NOT NULL,
               cost_of_capital REAL NOT NULL,
-              wealth_pc REAL NO NULL,
+              wealth_pc REAL NOT NULL,
               fcff_value REAL NOT NULL,
               terminal_value REAL NOT NULL,
               share_value REAL NOT NULL,
@@ -210,6 +217,7 @@ def calc_chng_wc(bal_sht):
     chng_nc_wc = curr_yr_nc_wc - prior_yr_nc_wc
     return chng_nc_wc
 
+
 def capitalizerAndD(COMPANY, RD_YEARS, MY_API_KEY):
     rdTable = hg_dcflib.get_rAndD(COMPANY, RD_YEARS, MY_API_KEY)
     rd_dict, years_to_process = rdTable
@@ -326,12 +334,12 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
 
 
 def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity, beta):
-    # Discount rate for free cah flow to the firm = cost of capital
+    # Discount rate for free cash flow to the firm = cost of capital
     # The cost of capital is the weighted average of the cost of equity and the cost of debt
     # Cost of equity = risk free rate + Beta(Implied Equity Risk Premium)
 
     cost_of_equity = RISK_FREE + (beta * EQ_PREM)
-    logger.info(f"COE = {cost_of_equity:,.4}")
+    logger.info(f"COE = {cost_of_equity:,.4f}")
 
     try:
         int_cover = inc_stmnt["ebit"][0] / inc_stmnt["interest_expense"][0]
@@ -344,7 +352,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity, beta):
     def_spread = hg_dcflib.get_default_spread(int_cover)
     logger.info(f"Default Spread = {def_spread}")
 
-    # 2. Calcultate after tax cost of debt
+    # 2. Calculate after tax cost of debt
     cost_of_debt = (RISK_FREE + def_spread) * (1 - MARGINAL_TAX_RATE)
     logger.info(f"Cost of Debt = {cost_of_debt}")
     percent_debt = bv_debt / (adjusted_bv_equity + bv_debt)
@@ -352,7 +360,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, adjusted_bv_equity, beta):
     logger.info(f"% Debt {percent_debt:,.4f}")
     logger.info(f"% Equity {percent_equity:,.4f}")
 
-    # 3 calcualte the weighted cost of capital
+    # 3 calculate the weighted cost of capital
     cost_of_capital = (cost_of_debt * percent_debt) + (cost_of_equity * percent_equity)
     logger.info(f"Cost of Capital = {cost_of_capital:,.4f}")
 
@@ -465,7 +473,7 @@ def main():
     discount_rate = calc_discount_rate(
         inc_stmnt, bv_debt, adjusted_bv_equity, UNLEVERED_BETA
     )
-    logger.info(f"disc rate {discount_rate:,.4}")
+    logger.info(f"disc rate {discount_rate:,.4f}")
 
     fcff_table = calc_expected_fcff(adjusted_ebiat, growth_rate, reinvestment_rate)
 
@@ -490,7 +498,7 @@ def main():
     if return_on_capital > discount_rate:
         logger.info("Wealth Creator")
     else:
-        logger.info("Wealth Detroyer")
+        logger.info("Wealth Destroyer")
     wealth_pc = return_on_capital - discount_rate
     try:
         valuation = Stock_Value(
@@ -514,13 +522,13 @@ def main():
             safety_margin_pc,
         )
         logger.info(valuation)
+        # write to db
+        create_table()
+        conn = sqlite3.connect("/Volumes/Financial_Data/valuation.db")
+        insert_valuation(conn, valuation)
+        conn.close()
     except Exception as e:
         logger.debug(f"An exception occured: {e}")
-
-    # write to db
-    create_table()
-    conn = sqlite3.connect("/Volumes/Financial_Data/valuation.db")
-    insert_valuation(conn, valuation)
 
     print("DONE")
 
