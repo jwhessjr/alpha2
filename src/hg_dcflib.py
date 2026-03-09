@@ -3,8 +3,6 @@ This library is a collection of functions used in the Hess Group DCF model.
 
 """
 
-import json
-from urllib.request import urlopen
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -46,15 +44,16 @@ def safe_float(val):
 
 def get_jsonparsed_data(url):
     time.sleep(DELAY)
-    response = urlopen(url)
-    data = response.read().decode("utf-8")
-    return json.loads(data)
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
 
 
 # Function to get the income statement and extract the required fields
 
 
 def get_inc_stmnt(company: str, apiKey: str) -> dict:
+    time.sleep(DELAY)
     """Return annualized ebit, tax expense and interest expense
        from the quarterly reports of a ticker.
 
@@ -86,6 +85,8 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         incomeBeforeTax = sum(safe_float(q["incomeBeforeTax"]) for q in quarter_block)
         tax_exp = sum(safe_float(q["incomeTaxExpense"]) for q in quarter_block)
         int_exp = sum(safe_float(q["interestExpense"]) for q in quarter_block)
+        revenue = sum(safe_float(q["totalRevenue"]) for q in quarter_block)
+        net_income = sum(safe_float(q["netIncome"]) for q in quarter_block)
 
         yearly_data.append(
             {
@@ -93,6 +94,8 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
                 "incomeBeforeTax": incomeBeforeTax,
                 "income_tax_expense": tax_exp,
                 "interest_expense": int_exp,
+                "totalRevenue": revenue,
+                "netIncome": net_income,
             }
         )
 
@@ -102,6 +105,8 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         "incomeBeforeTax": [y["incomeBeforeTax"] for y in yearly_data],
         "income_tax_expense": [y["income_tax_expense"] for y in yearly_data],
         "interest_expense": [y["interest_expense"] for y in yearly_data],
+        "totalRevenue": [y["totalRevenue"] for y in yearly_data],
+        "netIncome": [y["netIncome"] for y in yearly_data],
     }
 
     return income_statement
@@ -180,6 +185,7 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 
 
 def get_bal_sheet(company, apiKey):
+    time.sleep(DELAY)
     url = (
         f"https://www.alphavantage.co/query?"
         f"function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
@@ -190,6 +196,10 @@ def get_bal_sheet(company, apiKey):
 
     quarterly_reports = data.get("quarterlyReports", [])
     if not quarterly_reports:
+        logger.debug(
+            f"Balance sheet raw response keys for {company}: {list(data.keys())}"
+        )
+        logger.debug(f"Balance sheet raw response: {data}")
         raise ValueError(f"No quarterly balance sheet reports found for {company}")
 
     # Balance sheet is point-in-time, so we take one snapshot per year
@@ -237,6 +247,7 @@ def get_bal_sheet(company, apiKey):
 
 
 def get_cash_flow(company: str, apiKey: str) -> dict:
+    time.sleep(DELAY)
     """
     Return annualized depreciation and cap‑ex from the quarterly cash‑flow data.
 
@@ -268,6 +279,7 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
 
     depreciation = []
     capex = []
+    dividends_paid = []
 
     # Step through the list in blocks of four quarters.
     for i in range(0, max_quarters, 4):
@@ -279,13 +291,16 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
         yearly_depr = sum(
             safe_float(q["depreciationDepletionAndAmortization"]) for q in block
         )
+        yearly_divs = sum(safe_float(q["dividendPayout"]) for q in block)
 
         capex.append(yearly_capex)
         depreciation.append(yearly_depr)
+        dividends_paid.append(yearly_divs)
 
     return {
-        "capex": capex,  # keep the key names you used before
+        "capex": capex,
         "depreciation": depreciation,
+        "dividends_paid": dividends_paid,
     }
 
 
@@ -325,6 +340,7 @@ def get_erp():
 
 
 def get_rAndD(company, rd_years, apiKey):
+    time.sleep(DELAY)
     """
     Fetches R&D expenses for a specified number of years from Alpha Vantage.
 
@@ -421,25 +437,39 @@ def get_risk_free(FRED_KEY):
     return RISK_FREE
 
 
+_US_EXCHANGES = {"NYSE", "NasdaqGS", "NasdaqCM", "NasdaqNM", "NYSEMKT", "NYSEARCA", "BATS"}
+
+
 def get_industry(company):
     indName = pd.read_excel(
         "/Users/jhess/Development/Alpha2/data/indname.xlsx",
         sheet_name="Global by Industry",
     )
 
+    industry = None
     for index, row in indName.iterrows():
         try:
-            if company == row["Exchange:Ticker"].split(":")[1]:
-                industry = row["Industry Group"]
-                logger.info(f"Industry Group {industry}")
-            else:
+            parts = row["Exchange:Ticker"].split(":")
+            if len(parts) < 2 or parts[1] != company:
                 continue
-        except TypeError:
-            continue
-        except AttributeError:
+            matched_industry = row["Industry Group"]
+            exchange = parts[0]
+            if exchange in _US_EXCHANGES:
+                # US exchange match — use it immediately and stop
+                industry = matched_industry
+                logger.info(f"Industry Group {industry}")
+                break
+            else:
+                # Non-US match — keep as fallback but continue looking
+                industry = matched_industry
+                logger.info(f"Industry Group {industry}")
+        except (TypeError, AttributeError):
             continue
         except Exception as e:
             logger.debug(f"Error reading industry {e}")
+
+    if industry is None:
+        raise ValueError(f"Industry not found for {company}")
     return industry
 
 
