@@ -437,7 +437,15 @@ def get_risk_free(FRED_KEY):
     return RISK_FREE
 
 
-_US_EXCHANGES = {"NYSE", "NasdaqGS", "NasdaqCM", "NasdaqNM", "NYSEMKT", "NYSEARCA", "BATS"}
+_US_EXCHANGES = {
+    "NYSE",
+    "NasdaqGS",
+    "NasdaqCM",
+    "NasdaqNM",
+    "NYSEMKT",
+    "NYSEARCA",
+    "BATS",
+}
 
 
 def get_industry(company):

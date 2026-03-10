@@ -4,7 +4,7 @@ Price dances with hope and fear,
 Worth hides in the mist.
 
 S&P 500 / Russell 2000 batch valuation using FCFF DCF model.
-Outputs results to value_<index>_YYYYMMDD.html, sorted by margin of safety.
+Outputs results to value_<index>_YYYYMMDD.xlsx, sorted by margin of safety.
 
 NOTE: Alpha Vantage free tier allows ~25 API requests/day (5/min).
       Each stock requires ~4-5 calls; use --limit N to cap the number of stocks.
@@ -1590,112 +1590,104 @@ def generate_xlsx(d: dict, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTML report generation
+# XLSX report generation
 # ---------------------------------------------------------------------------
 
 
-def _fmt_pct(v: float) -> str:
-    return f"{v * 100:.1f}%"
+def generate_summary_xlsx(valuations: list, output_path: str, index_label: str = "S&P 500") -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Valuation Summary"
 
-def _fmt_cur(v: float) -> str:
-    return f"${v:,.2f}"
+    DARK_FILL = PatternFill("solid", fgColor="343A40")
+    GREEN_FILL = PatternFill("solid", fgColor="D4EDDA")
+    YELLOW_FILL = PatternFill("solid", fgColor="FFF3CD")
+    RED_FILL = PatternFill("solid", fgColor="F8D7DA")
+    HEADER_FONT = Font(bold=True, color="FFFFFF")
+    THIN = Side(style="thin", color="CCCCCC")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-
-def _row_color(mos_dollar: float) -> str:
-    """Green for undervalued (MoS >= $1), yellow for near-fair, red for overvalued."""
-    if mos_dollar >= 1:
-        return "#d4edda"
-    elif mos_dollar >= 0:
-        return "#fff3cd"
-    else:
-        return "#f8d7da"
-
-
-def generate_html(valuations: list, output_path: str, index_label: str = "S&P 500") -> None:
+    # Metadata rows
     today = date.today().strftime("%B %d, %Y")
-    rf_pct = _fmt_pct(RISK_FREE)
-    erp_pct = _fmt_pct(EQ_PREM)
+    ws.cell(row=1, column=1, value=f"{index_label} FCFF Valuation — {today}").font = Font(bold=True, size=13)
+    ws.cell(row=2, column=1,
+            value=f"Risk-free rate: {RISK_FREE*100:.2f}%  |  ERP: {EQ_PREM*100:.2f}%  |  "
+                  f"Growth period: {GROWTH_PERIOD} yrs  |  Stocks valued: {len(valuations)}"
+            ).font = Font(italic=True, color="666666")
 
-    rows = []
-    for v in valuations:
-        bg = _row_color(v.margin_of_safety)
-        rows.append(f"""
-        <tr style="background-color:{bg}">
-          <td>{v.ticker}</td>
-          <td>{v.ent_name}</td>
-          <td>{v.industry}</td>
-          <td>{_fmt_cur(v.price)}</td>
-          <td>{_fmt_cur(v.share_value)}</td>
-          <td>{_fmt_cur(v.margin_of_safety)}</td>
-          <td>{_fmt_pct(v.margin_of_safety_pc)}</td>
-          <td>{_fmt_pct(v.growth_rate)}</td>
-          <td>{_fmt_pct(v.cost_of_capital)}</td>
-          <td>{_fmt_pct(v.wealth_pc)}</td>
-          <td>{v.beta:.3f}</td>
-          <td>{_fmt_cur(v.market_cap / 1e9)}B</td>
-        </tr>""")
+    # Header row
+    headers = [
+        "Ticker", "Company", "Industry",
+        "Price", "Intrinsic Value",
+        "MoS ($)", "MoS (%)",
+        "Growth Rate", "Cost of Capital",
+        "Excess Return\n(ROIC-WACC)",
+        "Unlevered Beta", "Market Cap ($B)",
+    ]
+    HDR_ROW = 4
+    for col, hdr in enumerate(headers, 1):
+        c = ws.cell(row=HDR_ROW, column=col, value=hdr)
+        c.font = HEADER_FONT
+        c.fill = DARK_FILL
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+        c.border = BORDER
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{index_label} Valuation &mdash; {today}</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 20px; font-size: 13px; }}
-    h1 {{ color: #333; }}
-    .meta {{ color: #666; margin-bottom: 16px; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: right; white-space: nowrap; }}
-    th {{ background-color: #343a40; color: #fff; text-align: center; position: sticky; top: 0; }}
-    td:nth-child(1), td:nth-child(2), td:nth-child(3) {{ text-align: left; }}
-    tr:hover {{ filter: brightness(0.95); }}
-    .legend {{ margin-top: 12px; font-size: 12px; }}
-    .legend span {{ display: inline-block; width: 14px; height: 14px; margin-right: 4px; vertical-align: middle; border: 1px solid #aaa; }}
-  </style>
-</head>
-<body>
-  <h1>{index_label} FCFF Valuation &mdash; {today}</h1>
-  <p class="meta">
-    Risk-free rate: {rf_pct} &nbsp;|&nbsp;
-    Equity risk premium: {erp_pct} &nbsp;|&nbsp;
-    Growth period: {GROWTH_PERIOD} years &nbsp;|&nbsp;
-    Stocks valued: {len(valuations)}
-    &nbsp;(sorted by margin of safety, best first)
-  </p>
-  <table>
-    <thead>
-      <tr>
-        <th>Ticker</th>
-        <th>Company</th>
-        <th>Industry</th>
-        <th>Price</th>
-        <th>Intrinsic Value</th>
-        <th>Margin of Safety $</th>
-        <th>Margin of Safety %</th>
-        <th>Growth Rate</th>
-        <th>Cost of Capital</th>
-        <th>Excess Return (ROIC&minus;WACC)</th>
-        <th>Unlevered Beta</th>
-        <th>Market Cap</th>
-      </tr>
-    </thead>
-    <tbody>
-      {"".join(rows)}
-    </tbody>
-  </table>
-  <div class="legend">
-    <b>Legend:</b>
-    <span style="background:#d4edda;"></span> Undervalued (MoS &ge; $1) &nbsp;
-    <span style="background:#fff3cd;"></span> Near fair value ($0&ndash;$1) &nbsp;
-    <span style="background:#f8d7da;"></span> Overvalued
-  </div>
-</body>
-</html>"""
+    ws.row_dimensions[HDR_ROW].height = 30
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    # Data rows
+    for row_idx, v in enumerate(valuations, HDR_ROW + 1):
+        if v.margin_of_safety >= 1:
+            row_fill = GREEN_FILL
+        elif v.margin_of_safety >= 0:
+            row_fill = YELLOW_FILL
+        else:
+            row_fill = RED_FILL
+
+        row_data = [
+            v.ticker,
+            v.ent_name,
+            v.industry,
+            v.price,
+            v.share_value,
+            v.margin_of_safety,
+            v.margin_of_safety_pc,
+            v.growth_rate,
+            v.cost_of_capital,
+            v.wealth_pc,
+            v.beta,
+            v.market_cap / 1e9,
+        ]
+        num_fmts = [
+            None, None, None,
+            '"$"#,##0.00', '"$"#,##0.00',
+            '"$"#,##0.00', '0.0%',
+            '0.0%', '0.0%', '0.0%',
+            '0.000', '#,##0.00',
+        ]
+        for col, (val, fmt) in enumerate(zip(row_data, num_fmts), 1):
+            c = ws.cell(row=row_idx, column=col, value=val)
+            c.fill = row_fill
+            c.border = BORDER
+            if fmt:
+                c.number_format = fmt
+            if col <= 3:
+                c.alignment = Alignment(horizontal="left")
+            else:
+                c.alignment = Alignment(horizontal="right")
+
+    # Column widths
+    col_widths = [8, 28, 20, 10, 14, 10, 10, 12, 14, 16, 13, 14]
+    for col, w in enumerate(col_widths, 1):
+        from openpyxl.utils import get_column_letter
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+    # Freeze header
+    ws.freeze_panes = ws.cell(row=HDR_ROW + 1, column=1)
+
+    wb.save(output_path)
     print(f"Saved: {output_path}")
 
 
@@ -1794,8 +1786,8 @@ def main():
     valuations.sort(key=lambda v: v.margin_of_safety, reverse=True)
 
     _index_display = {"sp500": "S&P 500", "r2000": "Russell 2000"}.get(index_label, index_label)
-    output_file = f"/Users/jhess/Development/Alpha2/data/value_{index_label}_{date.today().strftime('%Y%m%d')}.html"
-    generate_html(valuations, output_file, _index_display)
+    output_file = f"/Users/jhess/Development/Alpha2/data/value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx"
+    generate_summary_xlsx(valuations, output_file, _index_display)
     print(f"Done. {len(valuations)}/{len(tickers)} stocks valued successfully.")
 
 
