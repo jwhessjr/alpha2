@@ -18,6 +18,7 @@ import hg_dcflib
 import logging
 import os
 import sys
+import time
 import traceback
 import io
 import pandas as pd
@@ -154,9 +155,17 @@ def enterprise_quote(ticker, api_key):
 # ---------------------------------------------------------------------------
 
 _FINANCIAL_KEYWORDS = {
-    "bank", "banks", "financial services", "insurance",
-    "brokerage", "investment banking", "thrift", "savings",
-    "credit", "mortgage", "asset management",
+    "bank",
+    "banks",
+    "financial services",
+    "insurance",
+    "brokerage",
+    "investment banking",
+    "thrift",
+    "savings",
+    "credit",
+    "mortgage",
+    "asset management",
 }
 
 _INSURANCE_KEYWORDS = {"insurance", "reinsurance", "surety", "title insurance"}
@@ -306,7 +315,16 @@ def calc_bv_debt(bal_sht):
 
 
 def calc_tax_rate(inc_stmnt):
-    eff_tax_rate = inc_stmnt["income_tax_expense"][0] / inc_stmnt["incomeBeforeTax"][0]
+    income_before_tax = inc_stmnt["incomeBeforeTax"][0]
+    if income_before_tax <= 0:
+        # Loss-making company: effective rate is meaningless; use marginal rate
+        logger.info(
+            f"Negative/zero pre-tax income — using marginal tax rate {MARGINAL_TAX_RATE:.4f}"
+        )
+        return MARGINAL_TAX_RATE
+    eff_tax_rate = inc_stmnt["income_tax_expense"][0] / income_before_tax
+    # Clamp to [0, marginal rate] to prevent sign-flip in FCFF projections
+    eff_tax_rate = min(max(eff_tax_rate, 0.0), MARGINAL_TAX_RATE)
     logger.info(f"Effective Tax Rate = {eff_tax_rate:,.4f}")
     return eff_tax_rate
 
@@ -325,9 +343,7 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
-def calc_discount_rate(
-    inc_stmnt, bv_debt, adjusted_bv_equity, beta, risk_free, eq_prem
-):
+def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, eq_prem):
     cost_of_equity = risk_free + (beta * eq_prem)
     logger.info(f"COE = {cost_of_equity:,.4f}")
 
@@ -342,7 +358,8 @@ def calc_discount_rate(
 
     cost_of_debt = (risk_free + def_spread) * (1 - MARGINAL_TAX_RATE)
     logger.info(f"Cost of Debt = {cost_of_debt}")
-    percent_debt = bv_debt / (adjusted_bv_equity + bv_debt)
+    total_capital = market_cap_equity + bv_debt
+    percent_debt = bv_debt / total_capital if total_capital > 0 else 0.5
     percent_equity = 1 - percent_debt
 
     cost_of_capital = (cost_of_debt * percent_debt) + (cost_of_equity * percent_equity)
@@ -497,8 +514,9 @@ def insert_valuation(conn, val):
 # ---------------------------------------------------------------------------
 
 
-def _bank_payout_ratio(net_income: float, bv_equity_curr: float,
-                       bv_equity_prior: float, cash_flw: dict) -> float:
+def _bank_payout_ratio(
+    net_income: float, bv_equity_curr: float, bv_equity_prior: float, cash_flw: dict
+) -> float:
     """
     Determine payout ratio for a bank using the most reliable source available.
 
@@ -524,7 +542,7 @@ def _bank_payout_ratio(net_income: float, bv_equity_curr: float,
     if payout is None and net_income > 0:
         equity_change = bv_equity_curr - bv_equity_prior
         retention = equity_change / net_income
-        if 0.0 <= retention <= 0.80:          # AOCI likely not distorting
+        if 0.0 <= retention <= 0.80:  # AOCI likely not distorting
             payout = 1.0 - retention
             logger.info(f"Payout ratio from equity change: {payout:.4f}")
 
@@ -547,32 +565,33 @@ def value_bank_stock(ticker: str, growth_period: int):
     - No debt/cash adjustment — we work at the equity level throughout
     - No R&D capitalisation (not applicable to financials)
     """
-    print(f"Valuing {ticker} (FCFE — financial firm) ...", flush=True)
     logger.info(f"Valuing {ticker} as financial firm (FCFE)")
     try:
         industry = hg_dcflib.get_industry(ticker)
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
-        bal_sht   = balance_sheet(ticker, MY_API_KEY)
-        cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
+        bal_sht = balance_sheet(ticker, MY_API_KEY)
+        cash_flw = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
 
-        valuation_date    = str(date.today())
-        price             = ent_quote[0]
+        valuation_date = str(date.today())
+        price = ent_quote[0]
         shares_outstanding = ent_quote[1]
-        market_cap        = ent_quote[2]
-        ent_name          = ent_quote[3]
+        market_cap = ent_quote[2]
+        ent_name = ent_quote[3]
 
         reported_net_income = inc_stmnt["netIncome"][0]
-        bv_equity_curr  = bal_sht["total_stockholders_equity"][0]
+        bv_equity_curr = bal_sht["total_stockholders_equity"][0]
         bv_equity_prior = bal_sht["total_stockholders_equity"][1]
 
         # Insurance firms: normalize NI over available years to smooth
         # underwriting cycles and catastrophe years.
         if is_insurance_firm(industry):
             net_income, ni_years = _normalized_net_income(inc_stmnt["netIncome"])
-            logger.info(f"Insurance: normalized NI over {ni_years} years = {net_income:,.0f}  (TTM = {reported_net_income:,.0f})")
+            logger.info(
+                f"Insurance: normalized NI over {ni_years} years = {net_income:,.0f}  (TTM = {reported_net_income:,.0f})"
+            )
         else:
             net_income = reported_net_income
             ni_years = 1
@@ -581,10 +600,14 @@ def value_bank_stock(ticker: str, growth_period: int):
         roe = net_income / bv_equity_curr if bv_equity_curr != 0 else 0.0
         logger.info(f"ROE = {roe:.4f}")
 
-        payout_ratio    = _bank_payout_ratio(reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw)
+        payout_ratio = _bank_payout_ratio(
+            reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
+        )
         retention_ratio = 1.0 - payout_ratio
-        growth_rate     = roe * retention_ratio
-        logger.info(f"Growth rate = {growth_rate:.4f}  (ROE={roe:.4f} × retention={retention_ratio:.4f})")
+        growth_rate = min(roe * retention_ratio, 0.30)
+        logger.info(
+            f"Growth rate = {growth_rate:.4f}  (ROE={roe:.4f} × retention={retention_ratio:.4f})"
+        )
 
         # --- Cost of equity (no WACC — debt is operational for banks) ---
         cost_of_equity = RISK_FREE + (unlevered_beta * EQ_PREM)
@@ -593,32 +616,36 @@ def value_bank_stock(ticker: str, growth_period: int):
         # --- Project FCFE ---
         # Grow net income; FCFE = net income retained as dividends (payout fraction)
         payout_ratio = 1.0 - retention_ratio
-        ni_n   = []
+        ni_n = []
         fcfe_n = []
         for year in range(growth_period):
             ni = net_income * (1 + growth_rate) ** (year + 1)
             ni_n.append(ni)
             fcfe_n.append(ni * payout_ratio)
-            logger.info(f"FCFE year {year+1} = {fcfe_n[-1]:,.2f}")
+            logger.info(f"FCFE year {year + 1} = {fcfe_n[-1]:,.2f}")
 
-        fcfe_pv = sum(fcfe_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period))
+        fcfe_pv = sum(
+            fcfe_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period)
+        )
 
         # --- Stable phase ---
         # In stable phase ROE converges to cost of equity (competitive equilibrium)
         stable_beta = calc_stable_beta(unlevered_beta)
         stable_cost_of_equity = RISK_FREE + (stable_beta * EQ_PREM)
         stable_growth = RISK_FREE
-        stable_reinv  = stable_growth / stable_cost_of_equity   # stable ROE = stable CoE
-        stable_fcfe   = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        stable_reinv = stable_growth / stable_cost_of_equity  # stable ROE = stable CoE
+        stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value = stable_fcfe / (stable_cost_of_equity - stable_growth)
         terminal_value_pv = terminal_value / (1 + cost_of_equity) ** growth_period
 
-        equity_value    = fcfe_pv + terminal_value_pv
-        intrinsic_value = equity_value / shares_outstanding   # both in consistent units
+        equity_value = fcfe_pv + terminal_value_pv
+        intrinsic_value = equity_value / shares_outstanding  # both in consistent units
 
-        safety_margin    = float(intrinsic_value - price)
-        safety_margin_pc = 1 - (price / intrinsic_value) if intrinsic_value != 0 else 0.0
-        wealth_pc        = roe - cost_of_equity
+        safety_margin = float(intrinsic_value - price)
+        safety_margin_pc = (
+            1 - (price / intrinsic_value) if intrinsic_value != 0 else 0.0
+        )
+        wealth_pc = roe - cost_of_equity
 
         logger.info(f"Intrinsic value = {intrinsic_value:.2f}  Price = {price:.2f}")
 
@@ -634,9 +661,9 @@ def value_bank_stock(ticker: str, growth_period: int):
             risk_free_rate=RISK_FREE,
             eq_premium=EQ_PREM,
             growth_rate=growth_rate,
-            cost_of_capital=cost_of_equity,       # equity rate, not WACC
+            cost_of_capital=cost_of_equity,  # equity rate, not WACC
             wealth_pc=wealth_pc,
-            fcff_value=fcfe_pv,                   # PV of FCFE
+            fcff_value=fcfe_pv,  # PV of FCFE
             terminal_value=terminal_value_pv,
             share_value=intrinsic_value,
             margin_of_safety=safety_margin,
@@ -677,7 +704,6 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
     FCFF DCF valuation for non-financial firms.
     Returns a Stock_Value dataclass or None if any step fails.
     """
-    print(f"Valuing {ticker} ...", flush=True)
     logger.info(f"Valuing {ticker} ...")
     try:
         rd_years = hg_dcflib.get_rAndD_years(industry) + 1
@@ -735,7 +761,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
 
         discount_rate = calc_discount_rate(
-            inc_stmnt, bv_debt, adjusted_bv_equity, unlevered_beta, RISK_FREE, EQ_PREM
+            inc_stmnt, bv_debt, market_cap, unlevered_beta, RISK_FREE, EQ_PREM
         )
         logger.info(f"disc rate {discount_rate:,.4f}")
 
@@ -745,7 +771,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         fcff_pv = calc_fcff_value(fcff_table, discount_rate, growth_period)
 
         terminal_cost_of_capital = calc_discount_rate(
-            inc_stmnt, bv_debt, adjusted_bv_equity, stable_beta, RISK_FREE, EQ_PREM
+            inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM
         )
         terminal_value_pv = calc_terminal_value(
             fcff_table[-1],
@@ -810,7 +836,6 @@ def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
       - Financial firms → FCFE bank detail
       - All others      → FCFF detail
     """
-    print(f"Valuing {ticker} ...", flush=True)
     try:
         industry = hg_dcflib.get_industry(ticker)
     except Exception as e:
@@ -822,37 +847,43 @@ def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
     return _value_stock_detail_fcff(ticker, growth_period, industry)
 
 
-def _value_bank_stock_detail(ticker: str, growth_period: int, industry: str) -> dict | None:
+def _value_bank_stock_detail(
+    ticker: str, growth_period: int, industry: str
+) -> dict | None:
     """FCFE detail dict for bank/financial firms (used for Excel output)."""
     try:
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
-        bal_sht   = balance_sheet(ticker, MY_API_KEY)
-        cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
+        bal_sht = balance_sheet(ticker, MY_API_KEY)
+        cash_flw = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
 
-        price              = ent_quote[0]
+        price = ent_quote[0]
         shares_outstanding = ent_quote[1]
-        market_cap         = ent_quote[2]
-        ent_name           = ent_quote[3]
+        market_cap = ent_quote[2]
+        ent_name = ent_quote[3]
 
         reported_net_income = inc_stmnt["netIncome"][0]
-        bv_equity_curr  = bal_sht["total_stockholders_equity"][0]
+        bv_equity_curr = bal_sht["total_stockholders_equity"][0]
         bv_equity_prior = bal_sht["total_stockholders_equity"][1]
-        equity_change   = bv_equity_curr - bv_equity_prior
+        equity_change = bv_equity_curr - bv_equity_prior
 
         if is_insurance_firm(industry):
             net_income, ni_years = _normalized_net_income(inc_stmnt["netIncome"])
-            logger.info(f"Insurance: normalized NI over {ni_years} years = {net_income:,.0f}  (TTM = {reported_net_income:,.0f})")
+            logger.info(
+                f"Insurance: normalized NI over {ni_years} years = {net_income:,.0f}  (TTM = {reported_net_income:,.0f})"
+            )
         else:
             net_income = reported_net_income
             ni_years = 1
 
-        roe             = net_income / bv_equity_curr if bv_equity_curr != 0 else 0.0
-        payout_ratio    = _bank_payout_ratio(reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw)
+        roe = net_income / bv_equity_curr if bv_equity_curr != 0 else 0.0
+        payout_ratio = _bank_payout_ratio(
+            reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
+        )
         retention_ratio = 1.0 - payout_ratio
-        growth_rate     = roe * retention_ratio
+        growth_rate = roe * retention_ratio
 
         cost_of_equity = RISK_FREE + (unlevered_beta * EQ_PREM)
 
@@ -862,20 +893,28 @@ def _value_bank_stock_detail(ticker: str, growth_period: int, industry: str) -> 
             ni_n.append(ni)
             fcfe_n.append(ni * payout_ratio)
 
-        fcfe_pv = sum(fcfe_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period))
+        fcfe_pv = sum(
+            fcfe_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period)
+        )
 
-        stable_beta           = calc_stable_beta(unlevered_beta)
+        stable_beta = calc_stable_beta(unlevered_beta)
         stable_cost_of_equity = RISK_FREE + (stable_beta * EQ_PREM)
-        stable_growth         = RISK_FREE
-        stable_reinv          = stable_growth / stable_cost_of_equity
-        stable_fcfe           = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
-        terminal_value_undiscounted = stable_fcfe / (stable_cost_of_equity - stable_growth)
-        terminal_value_pv     = terminal_value_undiscounted / (1 + cost_of_equity) ** growth_period
+        stable_growth = RISK_FREE
+        stable_reinv = stable_growth / stable_cost_of_equity
+        stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        terminal_value_undiscounted = stable_fcfe / (
+            stable_cost_of_equity - stable_growth
+        )
+        terminal_value_pv = (
+            terminal_value_undiscounted / (1 + cost_of_equity) ** growth_period
+        )
 
-        equity_value    = fcfe_pv + terminal_value_pv
+        equity_value = fcfe_pv + terminal_value_pv
         intrinsic_value = equity_value / shares_outstanding
-        margin_of_safety    = float(intrinsic_value - price)
-        margin_of_safety_pc = 1 - (price / intrinsic_value) if intrinsic_value != 0 else 0
+        margin_of_safety = float(intrinsic_value - price)
+        margin_of_safety_pc = (
+            1 - (price / intrinsic_value) if intrinsic_value != 0 else 0
+        )
 
         return {
             "model": "FCFE",
@@ -928,7 +967,9 @@ def _value_bank_stock_detail(ticker: str, growth_period: int, industry: str) -> 
         return None
 
 
-def _value_stock_detail_fcff(ticker: str, growth_period: int, industry: str) -> dict | None:
+def _value_stock_detail_fcff(
+    ticker: str, growth_period: int, industry: str
+) -> dict | None:
     """FCFF detail dict for non-financial firms (used for Excel output)."""
     try:
         rd_years = hg_dcflib.get_rAndD_years(industry) + 1
@@ -994,7 +1035,7 @@ def _value_stock_detail_fcff(ticker: str, growth_period: int, industry: str) -> 
         # Stable phase
         stable_cost_of_equity = RISK_FREE + (stable_beta * EQ_PREM)
         stable_cost_of_capital = calc_discount_rate(
-            inc_stmnt, bv_debt, adjusted_bv_equity, stable_beta, RISK_FREE, EQ_PREM
+            inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM
         )
         stable_growth = RISK_FREE
         stable_reinv_rate = (
@@ -1111,40 +1152,59 @@ def _value_stock_detail_fcff(ticker: str, growth_period: int, industry: str) -> 
 # ---------------------------------------------------------------------------
 
 
-def _generate_xlsx_bank(ws, d, gp, label, val_dollar, val_pct, section_header,
-                        BLUE_FILL, YELLOW_FILL, GREEN_FILL):
+def _generate_xlsx_bank(
+    ws,
+    d,
+    gp,
+    label,
+    val_dollar,
+    val_pct,
+    section_header,
+    BLUE_FILL,
+    YELLOW_FILL,
+    GREEN_FILL,
+):
     """Populate the worksheet for a bank / financial firm (FCFE model)."""
     from openpyxl.styles import Font
 
     r = 1
-    ws.cell(row=r, column=1,
-            value=f"{d['ent_name']} ({d['ticker']}) — FCFE Valuation").font = Font(bold=True, size=13)
+    ws.cell(
+        row=r, column=1, value=f"{d['ent_name']} ({d['ticker']}) — FCFE Valuation"
+    ).font = Font(bold=True, size=13)
     r += 1
-    ws.cell(row=r, column=1,
-            value=f"Bank / Financial Firm  |  {d['valuation_date']}  |  Industry: {d['industry']}")
+    ws.cell(
+        row=r,
+        column=1,
+        value=f"Bank / Financial Firm  |  {d['valuation_date']}  |  Industry: {d['industry']}",
+    )
     r += 2
 
     # ---- Inputs --------------------------------------------------------
     section_header(r, 1, "Inputs")
     r += 1
-    ni_label = (f"Net Income (normalized, {d['ni_years']}yr avg)"
-                if d.get("ni_years", 1) > 1 else "Net Income (TTM)")
+    ni_label = (
+        f"Net Income (normalized, {d['ni_years']}yr avg)"
+        if d.get("ni_years", 1) > 1
+        else "Net Income (TTM)"
+    )
     inputs = [
-        (ni_label,                          d["net_income"],        "dollar"),
+        (ni_label, d["net_income"], "dollar"),
     ]
     if d.get("ni_years", 1) > 1:
-        inputs.append(("  Reported Net Income (TTM)", d["reported_net_income"], "dollar"))
+        inputs.append(
+            ("  Reported Net Income (TTM)", d["reported_net_income"], "dollar")
+        )
     inputs += [
-        ("Book Value of Equity (current)",  d["bv_equity"],         "dollar"),
-        ("Book Value of Equity (prior yr)", d["bv_equity_prior"],   "dollar"),
-        ("Change in Book Equity",           d["equity_change"],     "dollar"),
-        ("Return on Equity (ROE)",          d["roe"],               "pct"),
-        ("Equity Retention Ratio",          d["retention_ratio"],   "pct"),
-        ("Payout Ratio (FCFE / Net Income)",d["payout_ratio"],      "pct"),
-        ("Risk-free Rate",                  d["risk_free"],         "pct"),
-        ("Equity Risk Premium",             d["eq_prem"],           "pct"),
-        ("Beta",                            d["beta"],              "num"),
-        ("Cost of Equity",                  d["cost_of_equity"],    "pct"),
+        ("Book Value of Equity (current)", d["bv_equity"], "dollar"),
+        ("Book Value of Equity (prior yr)", d["bv_equity_prior"], "dollar"),
+        ("Change in Book Equity", d["equity_change"], "dollar"),
+        ("Return on Equity (ROE)", d["roe"], "pct"),
+        ("Equity Retention Ratio", d["retention_ratio"], "pct"),
+        ("Payout Ratio (FCFE / Net Income)", d["payout_ratio"], "pct"),
+        ("Risk-free Rate", d["risk_free"], "pct"),
+        ("Equity Risk Premium", d["eq_prem"], "pct"),
+        ("Beta", d["beta"], "num"),
+        ("Cost of Equity", d["cost_of_equity"], "pct"),
     ]
     for lbl, v, fmt in inputs:
         label(r, 1, lbl)
@@ -1163,13 +1223,13 @@ def _generate_xlsx_bank(ws, d, gp, label, val_dollar, val_pct, section_header,
     # ---- Parameters: High Growth vs Stable ----------------------------
     section_header(r, 1, "Parameters")
     label(r, 2, "High Growth", bold=True)
-    label(r, 3, "Stable",      bold=True)
+    label(r, 3, "Stable", bold=True)
     r += 1
     params = [
-        ("Growth Rate",           d["growth_rate"],           "pct",  d["stable_growth"]),
-        ("Payout Ratio",          d["payout_ratio"],          "pct",  1 - d["stable_reinv"]),
-        ("Beta",                  d["beta"],                  "num",  d["stable_beta"]),
-        ("Cost of Equity",        d["cost_of_equity"],        "pct",  d["stable_cost_of_equity"]),
+        ("Growth Rate", d["growth_rate"], "pct", d["stable_growth"]),
+        ("Payout Ratio", d["payout_ratio"], "pct", 1 - d["stable_reinv"]),
+        ("Beta", d["beta"], "num", d["stable_beta"]),
+        ("Cost of Equity", d["cost_of_equity"], "pct", d["stable_cost_of_equity"]),
     ]
     for lbl, hg, fmt, st in params:
         label(r, 1, lbl)
@@ -1189,17 +1249,24 @@ def _generate_xlsx_bank(ws, d, gp, label, val_dollar, val_pct, section_header,
     # ---- Year-by-year FCFE table --------------------------------------
     section_header(r, 1, f"Projected FCFE  (growth period = {gp} years)")
     for i in range(gp):
-        ws.cell(row=r, column=2 + i, value=f"Year {i+1}").font = Font(bold=True)
+        ws.cell(row=r, column=2 + i, value=f"Year {i + 1}").font = Font(bold=True)
     r += 1
 
     table = [
-        ("Expected Growth Rate",   [d["growth_rate"]] * gp,                                         "pct"),
-        ("Net Income",             d["ni_n"],                                                         "dollar"),
-        ("FCFE (= NI × payout)",   d["fcfe_n"],                                                      "dollar"),
-        ("Cost of Equity",         [d["cost_of_equity"]] * gp,                                       "pct"),
-        ("Cumulated CoE",          [(1 + d["cost_of_equity"]) ** (y + 1) for y in range(gp)],        "num"),
-        ("Present Value of FCFE",  [d["fcfe_n"][y] / (1 + d["cost_of_equity"]) ** (y + 1)
-                                    for y in range(gp)],                                              "dollar"),
+        ("Expected Growth Rate", [d["growth_rate"]] * gp, "pct"),
+        ("Net Income", d["ni_n"], "dollar"),
+        ("FCFE (= NI × payout)", d["fcfe_n"], "dollar"),
+        ("Cost of Equity", [d["cost_of_equity"]] * gp, "pct"),
+        (
+            "Cumulated CoE",
+            [(1 + d["cost_of_equity"]) ** (y + 1) for y in range(gp)],
+            "num",
+        ),
+        (
+            "Present Value of FCFE",
+            [d["fcfe_n"][y] / (1 + d["cost_of_equity"]) ** (y + 1) for y in range(gp)],
+            "dollar",
+        ),
     ]
     for lbl, values, fmt in table:
         label(r, 1, lbl)
@@ -1219,12 +1286,12 @@ def _generate_xlsx_bank(ws, d, gp, label, val_dollar, val_pct, section_header,
     section_header(r, 1, "Stable Phase")
     r += 1
     stable = [
-        ("Growth Rate in Stable Phase",      d["stable_growth"],               "pct"),
-        ("Reinvestment Rate in Stable Phase", d["stable_reinv"],                "pct"),
-        ("FCFE in Stable Phase",             d["stable_fcfe"],                 "dollar"),
-        ("Cost of Equity in Stable Phase",   d["stable_cost_of_equity"],       "pct"),
-        ("Terminal Value (undiscounted)",    d["terminal_value_undiscounted"],  "dollar"),
-        ("PV of Terminal Value",             d["terminal_value_pv"],           "dollar"),
+        ("Growth Rate in Stable Phase", d["stable_growth"], "pct"),
+        ("Reinvestment Rate in Stable Phase", d["stable_reinv"], "pct"),
+        ("FCFE in Stable Phase", d["stable_fcfe"], "dollar"),
+        ("Cost of Equity in Stable Phase", d["stable_cost_of_equity"], "pct"),
+        ("Terminal Value (undiscounted)", d["terminal_value_undiscounted"], "dollar"),
+        ("PV of Terminal Value", d["terminal_value_pv"], "dollar"),
     ]
     for lbl, v, fmt in stable:
         label(r, 1, lbl)
@@ -1240,19 +1307,28 @@ def _generate_xlsx_bank(ws, d, gp, label, val_dollar, val_pct, section_header,
     section_header(r, 1, "Valuation")
     r += 1
     valuation = [
-        ("PV of FCFE in High Growth Phase",  d["fcfe_pv"],           "dollar"),
-        ("PV of Terminal Value",             d["terminal_value_pv"], "dollar"),
-        ("Equity Value",                     d["equity_value"],      "dollar"),
-        ("÷ Shares Outstanding",             d["shares_outstanding"],"num"),
-        ("Value of Equity per Share",        d["intrinsic_value"],   "dollar"),
-        ("Stock Price",                      d["price"],             "dollar"),
-        ("Margin of Safety ($)",             d["margin_of_safety"],  "dollar"),
-        ("Margin of Safety (%)",             d["margin_of_safety_pc"],"pct"),
+        ("PV of FCFE in High Growth Phase", d["fcfe_pv"], "dollar"),
+        ("PV of Terminal Value", d["terminal_value_pv"], "dollar"),
+        ("Equity Value", d["equity_value"], "dollar"),
+        ("÷ Shares Outstanding", d["shares_outstanding"], "num"),
+        ("Value of Equity per Share", d["intrinsic_value"], "dollar"),
+        ("Stock Price", d["price"], "dollar"),
+        ("Margin of Safety ($)", d["margin_of_safety"], "dollar"),
+        ("Margin of Safety (%)", d["margin_of_safety_pc"], "pct"),
     ]
     for lbl, v, fmt in valuation:
         label(r, 1, lbl)
-        fill = GREEN_FILL if lbl in ("Value of Equity per Share", "Stock Price",
-                                     "Margin of Safety ($)", "Margin of Safety (%)") else None
+        fill = (
+            GREEN_FILL
+            if lbl
+            in (
+                "Value of Equity per Share",
+                "Stock Price",
+                "Margin of Safety ($)",
+                "Margin of Safety (%)",
+            )
+            else None
+        )
         if fmt == "dollar":
             val_dollar(r, 2, v, fill)
         elif fmt == "pct":
@@ -1320,8 +1396,18 @@ def generate_xlsx(d: dict, output_path: str) -> None:
         ws.column_dimensions[get_column_letter(col)].width = 12
 
     if d.get("model") == "FCFE":
-        _generate_xlsx_bank(ws, d, gp, label, val_dollar, val_pct, section_header,
-                            BLUE_FILL, YELLOW_FILL, GREEN_FILL)
+        _generate_xlsx_bank(
+            ws,
+            d,
+            gp,
+            label,
+            val_dollar,
+            val_pct,
+            section_header,
+            BLUE_FILL,
+            YELLOW_FILL,
+            GREEN_FILL,
+        )
         wb.save(output_path)
         print(f"Saved: {output_path}")
         return
@@ -1594,9 +1680,12 @@ def generate_xlsx(d: dict, output_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def generate_summary_xlsx(valuations: list, output_path: str, index_label: str = "S&P 500") -> None:
+def generate_summary_xlsx(
+    valuations: list, output_path: str, index_label: str = "S&P 500"
+) -> None:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
@@ -1612,20 +1701,30 @@ def generate_summary_xlsx(valuations: list, output_path: str, index_label: str =
 
     # Metadata rows
     today = date.today().strftime("%B %d, %Y")
-    ws.cell(row=1, column=1, value=f"{index_label} FCFF Valuation — {today}").font = Font(bold=True, size=13)
-    ws.cell(row=2, column=1,
-            value=f"Risk-free rate: {RISK_FREE*100:.2f}%  |  ERP: {EQ_PREM*100:.2f}%  |  "
-                  f"Growth period: {GROWTH_PERIOD} yrs  |  Stocks valued: {len(valuations)}"
-            ).font = Font(italic=True, color="666666")
+    ws.cell(
+        row=1, column=1, value=f"{index_label} FCFF Valuation — {today}"
+    ).font = Font(bold=True, size=13)
+    ws.cell(
+        row=2,
+        column=1,
+        value=f"Risk-free rate: {RISK_FREE * 100:.2f}%  |  ERP: {EQ_PREM * 100:.2f}%  |  "
+        f"Growth period: {GROWTH_PERIOD} yrs  |  Stocks valued: {len(valuations)}",
+    ).font = Font(italic=True, color="666666")
 
     # Header row
     headers = [
-        "Ticker", "Company", "Industry",
-        "Price", "Intrinsic Value",
-        "MoS ($)", "MoS (%)",
-        "Growth Rate", "Cost of Capital",
+        "Ticker",
+        "Company",
+        "Industry",
+        "Price",
+        "Intrinsic Value",
+        "MoS ($)",
+        "MoS (%)",
+        "Growth Rate",
+        "Cost of Capital",
         "Excess Return\n(ROIC-WACC)",
-        "Unlevered Beta", "Market Cap ($B)",
+        "Unlevered Beta",
+        "Market Cap ($B)",
     ]
     HDR_ROW = 4
     for col, hdr in enumerate(headers, 1):
@@ -1661,11 +1760,18 @@ def generate_summary_xlsx(valuations: list, output_path: str, index_label: str =
             v.market_cap / 1e9,
         ]
         num_fmts = [
-            None, None, None,
-            '"$"#,##0.00', '"$"#,##0.00',
-            '"$"#,##0.00', '0.0%',
-            '0.0%', '0.0%', '0.0%',
-            '0.000', '#,##0.00',
+            None,
+            None,
+            None,
+            '"$"#,##0.00',
+            '"$"#,##0.00',
+            '"$"#,##0.00',
+            "0.0%",
+            "0.0%",
+            "0.0%",
+            "0.0%",
+            "0.000",
+            "#,##0.00",
         ]
         for col, (val, fmt) in enumerate(zip(row_data, num_fmts), 1):
             c = ws.cell(row=row_idx, column=col, value=val)
@@ -1681,11 +1787,74 @@ def generate_summary_xlsx(valuations: list, output_path: str, index_label: str =
     # Column widths
     col_widths = [8, 28, 20, 10, 14, 10, 10, 12, 14, 16, 13, 14]
     for col, w in enumerate(col_widths, 1):
-        from openpyxl.utils import get_column_letter
         ws.column_dimensions[get_column_letter(col)].width = w
 
     # Freeze header
     ws.freeze_panes = ws.cell(row=HDR_ROW + 1, column=1)
+
+    # ----------------------------------------------------------------
+    # Tab 2 — Value Creators with positive MoS, sorted by Excess Return desc
+    # ----------------------------------------------------------------
+    creators = sorted(
+        [v for v in valuations if v.wealth_pc > 0 and v.margin_of_safety > 0],
+        key=lambda v: v.wealth_pc,
+        reverse=True,
+    )
+
+    vc = wb.create_sheet(title="Value Creators")
+
+    vc.cell(
+        row=1,
+        column=1,
+        value=f"{index_label} — Value Creators & Undervalued Stocks — {today}",
+    ).font = Font(bold=True, size=13)
+    vc.cell(
+        row=2,
+        column=1,
+        value=f"{len(creators)} of {len(valuations)} stocks (ROIC > WACC or MoS > $0) — sorted by Excess Return (ROIC − WACC) descending",
+    ).font = Font(italic=True, color="666666")
+
+    for col, hdr in enumerate(headers, 1):
+        c = vc.cell(row=HDR_ROW, column=col, value=hdr)
+        c.font = HEADER_FONT
+        c.fill = DARK_FILL
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+        c.border = BORDER
+
+    vc.row_dimensions[HDR_ROW].height = 30
+
+    for row_idx, v in enumerate(creators, HDR_ROW + 1):
+        row_fill = (
+            GREEN_FILL
+            if v.margin_of_safety >= 1
+            else (YELLOW_FILL if v.margin_of_safety >= 0 else RED_FILL)
+        )
+        row_data = [
+            v.ticker,
+            v.ent_name,
+            v.industry,
+            v.price,
+            v.share_value,
+            v.margin_of_safety,
+            v.margin_of_safety_pc,
+            v.growth_rate,
+            v.cost_of_capital,
+            v.wealth_pc,
+            v.beta,
+            v.market_cap / 1e9,
+        ]
+        for col, (val, fmt) in enumerate(zip(row_data, num_fmts), 1):
+            c = vc.cell(row=row_idx, column=col, value=val)
+            c.fill = row_fill
+            c.border = BORDER
+            if fmt:
+                c.number_format = fmt
+            c.alignment = Alignment(horizontal="left" if col <= 3 else "right")
+
+    for col, w in enumerate(col_widths, 1):
+        vc.column_dimensions[get_column_letter(col)].width = w
+
+    vc.freeze_panes = vc.cell(row=HDR_ROW + 1, column=1)
 
     wb.save(output_path)
     print(f"Saved: {output_path}")
@@ -1741,7 +1910,7 @@ def main():
     # ---- Single-stock path: Excel output --------------------------------
     if single_stock:
         output_file = (
-            f"/Users/jhess/Development/Alpha2/data/"
+            f"/Users/jhess/Development/Alpha2/data/outputs/"
             f"value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx"
         )
         detail = value_stock_detail(ticker, growth_period)
@@ -1769,8 +1938,10 @@ def main():
         logger.warning("Database unavailable; skipping DB writes.")
 
     valuations = []
+    total = len(tickers)
+    bar_width = 40
+    start_time = time.time()
     for idx, ticker in enumerate(tickers, 1):
-        print(f"  [{idx}/{len(tickers)}] {ticker}", flush=True)
         result = value_stock(ticker, growth_period)
         if result:
             valuations.append(result)
@@ -1780,13 +1951,24 @@ def main():
                 except Exception as e:
                     logger.warning(f"DB insert failed for {ticker}: {e}")
 
+        filled = int(bar_width * idx / total)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        elapsed = int(time.time() - start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        print(f"\r  {idx}/{total} [{bar}] {h:02d}:{m:02d}:{s:02d}", end="", flush=True)
+
+    print()  # newline after progress bar
+
     if db_conn:
         db_conn.close()
 
     valuations.sort(key=lambda v: v.margin_of_safety, reverse=True)
 
-    _index_display = {"sp500": "S&P 500", "r2000": "Russell 2000"}.get(index_label, index_label)
-    output_file = f"/Users/jhess/Development/Alpha2/data/value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx"
+    _index_display = {"sp500": "S&P 500", "r2000": "Russell 2000"}.get(
+        index_label, index_label
+    )
+    output_file = f"/Users/jhess/Development/Alpha2/data/outputs/value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx"
     generate_summary_xlsx(valuations, output_file, _index_display)
     print(f"Done. {len(valuations)}/{len(tickers)} stocks valued successfully.")
 

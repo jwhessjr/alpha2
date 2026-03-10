@@ -451,7 +451,7 @@ _US_EXCHANGES = {
 def get_industry(company):
     indName = pd.read_excel(
         "/Users/jhess/Development/Alpha2/data/indname.xlsx",
-        sheet_name="Global by Industry",
+        sheet_name="US by Industry",
     )
 
     industry = None
