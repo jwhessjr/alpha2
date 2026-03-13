@@ -6,6 +6,7 @@ Worth hides in the mist.
 S&P 500 / Russell 2000 batch valuation using FCFF DCF model.
 Outputs results to value_<index>_YYYYMMDD.xlsx, sorted by margin of safety.
 
+
 NOTE: Alpha Vantage free tier allows ~25 API requests/day (5/min).
       Each stock requires ~4-5 calls; use --limit N to cap the number of stocks.
       Usage: python av_fcff_2.py [--limit N] [--growth N]
@@ -33,7 +34,16 @@ stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.WARNING)
 stream_handler.setFormatter(formatter)
 
-file_handler = logging.FileHandler("data/value.log")
+# Resolve log directory relative to the executable (PyInstaller) or source file,
+# and create it automatically if it does not exist.
+if getattr(sys, "frozen", False):
+    _log_base = os.path.dirname(sys.executable)
+else:
+    _log_base = os.path.dirname(os.path.abspath(__file__))
+_log_dir = os.path.join(_log_base, "data")
+os.makedirs(_log_dir, exist_ok=True)
+
+file_handler = logging.FileHandler(os.path.join(_log_dir, "value.log"))
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(formatter)
 
@@ -73,6 +83,7 @@ class Stock_Value:
     valuation_date: str
     ent_name: str
     industry: str
+    cik: str
     beta: float
     market_cap: float
     price: float
@@ -87,6 +98,7 @@ class Stock_Value:
     share_value: float
     margin_of_safety: float
     margin_of_safety_pc: float
+    target_price: float
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +439,7 @@ def create_table(conn):
               valuation_date TEXT NOT NULL,
               ent_name TEXT NOT NULL,
               industry TEXT NOT NULL,
+              cik TEXT NOT NULL DEFAULT '',
               beta REAL NOT NULL,
               market_cap REAL NOT NULL,
               price REAL NOT NULL,
@@ -441,6 +454,7 @@ def create_table(conn):
               share_value REAL NOT NULL,
               margin_of_safety REAL NOT NULL,
               margin_of_safety_pc REAL NOT NULL,
+              target_price REAL NOT NULL DEFAULT 0,
               PRIMARY KEY (ticker)
               );"""
     try:
@@ -472,6 +486,17 @@ def create_table(conn):
             conn.execute(schema_sql)
             conn.commit()
             logger.info("Table created successfully")
+        # Add columns to existing tables that pre-date these fields
+        for col_def in (
+            "target_price REAL NOT NULL DEFAULT 0",
+            "cik TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE valuation ADD COLUMN {col_def}")
+                conn.commit()
+                logger.info(f"Added column {col_def.split()[0]} to existing table")
+            except sqlite3.OperationalError:
+                pass  # column already exists
     except sqlite3.OperationalError as e:
         logger.warning(f"Failed to create tables: {e}")
 
@@ -480,16 +505,17 @@ def insert_valuation(conn, val):
     c = conn.cursor()
     c.execute(
         """INSERT OR REPLACE INTO valuation
-           (ticker, valuation_date, ent_name, industry, beta, market_cap, price,
+           (ticker, valuation_date, ent_name, industry, cik, beta, market_cap, price,
             shares_outstanding, risk_free_rate, eq_premium, growth_rate,
             cost_of_capital, wealth_pc, fcff_value, terminal_value, share_value,
-            margin_of_safety, margin_of_safety_pc)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            margin_of_safety, margin_of_safety_pc, target_price)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             val.ticker,
             val.valuation_date,
             val.ent_name,
             val.industry,
+            val.cik,
             val.beta,
             val.market_cap,
             val.price,
@@ -504,6 +530,7 @@ def insert_valuation(conn, val):
             val.share_value,
             val.margin_of_safety,
             val.margin_of_safety_pc,
+            val.target_price,
         ),
     )
     conn.commit()
@@ -580,6 +607,7 @@ def value_bank_stock(ticker: str, growth_period: int):
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        cik = hg_dcflib.get_cik(ticker)
 
         reported_net_income = inc_stmnt["netIncome"][0]
         bv_equity_curr = bal_sht["total_stockholders_equity"][0]
@@ -646,6 +674,7 @@ def value_bank_stock(ticker: str, growth_period: int):
             1 - (price / intrinsic_value) if intrinsic_value != 0 else 0.0
         )
         wealth_pc = roe - cost_of_equity
+        target_price = intrinsic_value * (1 + cost_of_equity)
 
         logger.info(f"Intrinsic value = {intrinsic_value:.2f}  Price = {price:.2f}")
 
@@ -654,6 +683,7 @@ def value_bank_stock(ticker: str, growth_period: int):
             valuation_date=valuation_date,
             ent_name=ent_name,
             industry=industry,
+            cik=cik,
             beta=unlevered_beta,
             market_cap=market_cap,
             price=price,
@@ -668,6 +698,7 @@ def value_bank_stock(ticker: str, growth_period: int):
             share_value=intrinsic_value,
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
+            target_price=target_price,
         )
 
     except Exception as e:
@@ -719,6 +750,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        cik = hg_dcflib.get_cik(ticker)
 
         stable_beta = calc_stable_beta(unlevered_beta)
         eff_tax_rate = calc_tax_rate(inc_stmnt)
@@ -792,6 +824,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         logger.info(f"Safety Margin: {safety_margin:,.2f}")
         safety_margin_pc = 1 - (price / intrinsic_value)
         wealth_pc = return_on_capital - discount_rate
+        target_price = intrinsic_value * (1 + discount_rate)
 
         if return_on_capital > discount_rate:
             logger.info("Wealth Creator")
@@ -803,6 +836,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             valuation_date=valuation_date,
             ent_name=ent_name,
             industry=industry,
+            cik=cik,
             beta=unlevered_beta,
             market_cap=market_cap,
             price=price,
@@ -817,6 +851,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             share_value=intrinsic_value,
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
+            target_price=target_price,
         )
 
     except Exception as e:
@@ -863,6 +898,7 @@ def _value_bank_stock_detail(
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        cik = hg_dcflib.get_cik(ticker)
 
         reported_net_income = inc_stmnt["netIncome"][0]
         bv_equity_curr = bal_sht["total_stockholders_equity"][0]
@@ -883,7 +919,7 @@ def _value_bank_stock_detail(
             reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
         )
         retention_ratio = 1.0 - payout_ratio
-        growth_rate = roe * retention_ratio
+        growth_rate = min(roe * retention_ratio, 0.30)
 
         cost_of_equity = RISK_FREE + (unlevered_beta * EQ_PREM)
 
@@ -921,6 +957,7 @@ def _value_bank_stock_detail(
             "ticker": ticker,
             "ent_name": ent_name,
             "industry": industry,
+            "cik": cik,
             "valuation_date": str(date.today()),
             # --- Inputs ---
             "net_income": net_income,
@@ -959,6 +996,7 @@ def _value_bank_stock_detail(
             "intrinsic_value": intrinsic_value,
             "margin_of_safety": margin_of_safety,
             "margin_of_safety_pc": margin_of_safety_pc,
+            "target_price": intrinsic_value * (1 + cost_of_equity),
         }
 
     except Exception as e:
@@ -984,6 +1022,7 @@ def _value_stock_detail_fcff(
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        cik = hg_dcflib.get_cik(ticker)
 
         stable_beta = calc_stable_beta(unlevered_beta)
         eff_tax_rate = calc_tax_rate(inc_stmnt)
@@ -1085,6 +1124,7 @@ def _value_stock_detail_fcff(
             "ticker": ticker,
             "ent_name": ent_name,
             "industry": industry,
+            "cik": cik,
             "valuation_date": str(date.today()),
             # --- Inputs ---
             "normalized_ebit": inc_stmnt["ebit"][0],
@@ -1139,6 +1179,7 @@ def _value_stock_detail_fcff(
             "enterprise_value": enterprise_value,
             "margin_of_safety": margin_of_safety,
             "margin_of_safety_pc": margin_of_safety_pc,
+            "target_price": intrinsic_value * (1 + discount_rate),
         }
 
     except Exception as e:
@@ -1177,6 +1218,16 @@ def _generate_xlsx_bank(
         column=1,
         value=f"Bank / Financial Firm  |  {d['valuation_date']}  |  Industry: {d['industry']}",
     )
+    r += 1
+    cik_val = d.get("cik", "")
+    cik_cell = ws.cell(
+        row=r,
+        column=1,
+        value=f"SEC EDGAR CIK: {cik_val}" if cik_val else "SEC EDGAR CIK: —",
+    )
+    cik_cell.font = Font(color="0563C1", underline="single")
+    if cik_val:
+        cik_cell.hyperlink = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_val}&type=10-K&dateb=&owner=include&count=10"
     r += 2
 
     # ---- Inputs --------------------------------------------------------
@@ -1312,6 +1363,7 @@ def _generate_xlsx_bank(
         ("Equity Value", d["equity_value"], "dollar"),
         ("÷ Shares Outstanding", d["shares_outstanding"], "num"),
         ("Value of Equity per Share", d["intrinsic_value"], "dollar"),
+        ("Target Price (1-yr)", d["target_price"], "dollar"),
         ("Stock Price", d["price"], "dollar"),
         ("Margin of Safety ($)", d["margin_of_safety"], "dollar"),
         ("Margin of Safety (%)", d["margin_of_safety_pc"], "pct"),
@@ -1323,6 +1375,7 @@ def _generate_xlsx_bank(
             if lbl
             in (
                 "Value of Equity per Share",
+                "Target Price (1-yr)",
                 "Stock Price",
                 "Margin of Safety ($)",
                 "Margin of Safety (%)",
@@ -1425,6 +1478,16 @@ def generate_xlsx(d: dict, output_path: str) -> None:
         column=1,
         value=f"FCFF Valuation  |  {d['valuation_date']}  |  Industry: {d['industry']}",
     )
+    r += 1
+    cik_val = d.get("cik", "")
+    cik_cell = ws.cell(
+        row=r,
+        column=1,
+        value=f"SEC EDGAR CIK: {cik_val}" if cik_val else "SEC EDGAR CIK: —",
+    )
+    cik_cell.font = Font(color="0563C1", underline="single")
+    if cik_val:
+        cik_cell.hyperlink = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik_val}&type=10-K&dateb=&owner=include&count=10"
     r += 2
 
     # ====================================================================
@@ -1643,6 +1706,7 @@ def generate_xlsx(d: dict, output_path: str) -> None:
         ("Market Value of Equity", d["enterprise_value"], "dollar"),
         ("÷ Shares Outstanding (000s)", d["shares_outstanding"], "num"),
         ("Value of Equity per Share", d["intrinsic_value"], "dollar"),
+        ("Target Price (1-yr)", d["target_price"], "dollar"),
         ("Stock Price", d["price"], "dollar"),
         ("Margin of Safety ($)", d["margin_of_safety"], "dollar"),
         ("Margin of Safety (%)", d["margin_of_safety_pc"], "pct"),
@@ -1654,6 +1718,7 @@ def generate_xlsx(d: dict, output_path: str) -> None:
             if lbl
             in (
                 "Value of Equity per Share",
+                "Target Price (1-yr)",
                 "Stock Price",
                 "Margin of Safety ($)",
                 "Margin of Safety (%)",
@@ -1714,10 +1779,12 @@ def generate_summary_xlsx(
     # Header row
     headers = [
         "Ticker",
+        "CIK",
         "Company",
         "Industry",
         "Price",
         "Intrinsic Value",
+        "Target Price\n(1-yr)",
         "MoS ($)",
         "MoS (%)",
         "Growth Rate",
@@ -1747,10 +1814,12 @@ def generate_summary_xlsx(
 
         row_data = [
             v.ticker,
+            v.cik,
             v.ent_name,
             v.industry,
             v.price,
             v.share_value,
+            v.target_price,
             v.margin_of_safety,
             v.margin_of_safety_pc,
             v.growth_rate,
@@ -1763,6 +1832,8 @@ def generate_summary_xlsx(
             None,
             None,
             None,
+            None,
+            '"$"#,##0.00',
             '"$"#,##0.00',
             '"$"#,##0.00',
             '"$"#,##0.00',
@@ -1779,13 +1850,13 @@ def generate_summary_xlsx(
             c.border = BORDER
             if fmt:
                 c.number_format = fmt
-            if col <= 3:
+            if col <= 4:
                 c.alignment = Alignment(horizontal="left")
             else:
                 c.alignment = Alignment(horizontal="right")
 
     # Column widths
-    col_widths = [8, 28, 20, 10, 14, 10, 10, 12, 14, 16, 13, 14]
+    col_widths = [8, 12, 28, 20, 10, 14, 14, 10, 10, 12, 14, 16, 13, 14]
     for col, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = w
 
@@ -1831,10 +1902,12 @@ def generate_summary_xlsx(
         )
         row_data = [
             v.ticker,
+            v.cik,
             v.ent_name,
             v.industry,
             v.price,
             v.share_value,
+            v.target_price,
             v.margin_of_safety,
             v.margin_of_safety_pc,
             v.growth_rate,
@@ -1849,7 +1922,7 @@ def generate_summary_xlsx(
             c.border = BORDER
             if fmt:
                 c.number_format = fmt
-            c.alignment = Alignment(horizontal="left" if col <= 3 else "right")
+            c.alignment = Alignment(horizontal="left" if col <= 4 else "right")
 
     for col, w in enumerate(col_widths, 1):
         vc.column_dimensions[get_column_letter(col)].width = w
@@ -1909,9 +1982,9 @@ def main():
 
     # ---- Single-stock path: Excel output --------------------------------
     if single_stock:
-        output_file = (
-            f"/Users/jhess/Development/Alpha2/data/outputs/"
-            f"value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx"
+        output_file = os.path.join(
+            _log_dir,
+            f"value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx",
         )
         detail = value_stock_detail(ticker, growth_period)
         if detail:
@@ -1968,7 +2041,10 @@ def main():
     _index_display = {"sp500": "S&P 500", "r2000": "Russell 2000"}.get(
         index_label, index_label
     )
-    output_file = f"/Users/jhess/Development/Alpha2/data/outputs/value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx"
+    output_file = os.path.join(
+        _log_dir,
+        f"value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx",
+    )
     generate_summary_xlsx(valuations, output_file, _index_display)
     print(f"Done. {len(valuations)}/{len(tickers)} stocks valued successfully.")
 

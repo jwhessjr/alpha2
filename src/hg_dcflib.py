@@ -3,6 +3,8 @@ This library is a collection of functions used in the Hess Group DCF model.
 
 """
 
+import os
+import sys
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -20,8 +22,17 @@ stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.WARNING)  # only show INFO and above on console
 stream_handler.setFormatter(formatter)
 
+# Resolve log directory relative to the executable (PyInstaller) or source file,
+# and create it automatically if it does not exist.
+if getattr(sys, "frozen", False):
+    _log_base = os.path.dirname(sys.executable)
+else:
+    _log_base = os.path.dirname(os.path.abspath(__file__))
+_log_dir = os.path.join(_log_base, "data")
+os.makedirs(_log_dir, exist_ok=True)
+
 # Create a FileHandler for the log file
-file_handler = logging.FileHandler("data/value.log")
+file_handler = logging.FileHandler(os.path.join(_log_dir, "value.log"))
 file_handler.setLevel(logging.DEBUG)  # log all messages to the file
 file_handler.setFormatter(formatter)
 
@@ -47,6 +58,42 @@ def get_jsonparsed_data(url):
     response = requests.get(url)
     response.raise_for_status()
     return response.json()
+
+
+# ---------------------------------------------------------------------------
+# SEC EDGAR CIK lookup  (single HTTP fetch, then cached for the run)
+# ---------------------------------------------------------------------------
+
+_cik_map: dict[str, str] = {}  # ticker.upper() → zero-padded CIK string
+_cik_map_loaded = False
+
+
+def _load_cik_map() -> None:
+    """Download the full SEC EDGAR ticker→CIK mapping (once per process)."""
+    global _cik_map, _cik_map_loaded
+    if _cik_map_loaded:
+        return
+    try:
+        url = "https://www.sec.gov/files/company_tickers.json"
+        headers = {"User-Agent": "hg-dcf-model/1.0 research@example.com"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        for entry in data.values():
+            ticker = str(entry.get("ticker", "")).upper()
+            cik_str = str(entry.get("cik_str", "")).zfill(10)
+            if ticker:
+                _cik_map[ticker] = cik_str
+        logger.info(f"Loaded {len(_cik_map)} CIK entries from SEC EDGAR")
+    except Exception as e:
+        logger.warning(f"Could not load SEC CIK map: {e}")
+    _cik_map_loaded = True
+
+
+def get_cik(ticker: str) -> str:
+    """Return the zero-padded 10-digit CIK for *ticker*, or '' if not found."""
+    _load_cik_map()
+    return _cik_map.get(ticker.upper(), "")
 
 
 # Function to get the income statement and extract the required fields
