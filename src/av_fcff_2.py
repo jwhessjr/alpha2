@@ -865,6 +865,41 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
 # ---------------------------------------------------------------------------
 
 
+def _stock_value_from_detail(d: dict) -> Stock_Value:
+    """Build a Stock_Value dataclass from a value_stock_detail dict for DB insertion."""
+    if d["model"] == "FCFE":
+        cost_of_capital = d["cost_of_equity"]
+        wealth_pc       = d["roe"] - d["cost_of_equity"]
+        fcff_value      = d["fcfe_pv"]
+    else:
+        cost_of_capital = d["discount_rate"]
+        wealth_pc       = d["return_on_capital"] - d["discount_rate"]
+        fcff_value      = d["fcff_pv"]
+
+    return Stock_Value(
+        ticker            = d["ticker"],
+        valuation_date    = d["valuation_date"],
+        ent_name          = d["ent_name"],
+        industry          = d["industry"],
+        cik               = d.get("cik", ""),
+        beta              = d["beta"],
+        market_cap        = d["market_cap"],
+        price             = d["price"],
+        shares_outstanding= d["shares_outstanding"],
+        risk_free_rate    = d["risk_free"],
+        eq_premium        = d["eq_prem"],
+        growth_rate       = d["growth_rate"],
+        cost_of_capital   = cost_of_capital,
+        wealth_pc         = wealth_pc,
+        fcff_value        = fcff_value,
+        terminal_value    = d["terminal_value_pv"],
+        share_value       = d["intrinsic_value"],
+        margin_of_safety  = d["margin_of_safety"],
+        margin_of_safety_pc = d["margin_of_safety_pc"],
+        target_price      = d["target_price"],
+    )
+
+
 def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
     """
     Route to the correct detail valuation for the Excel report:
@@ -1980,7 +2015,7 @@ def main():
         else:
             print("Please enter 1, 2, or 3.")
 
-    # ---- Single-stock path: Excel output --------------------------------
+    # ---- Single-stock path: Excel output + DB update --------------------
     if single_stock:
         output_file = os.path.join(
             _log_dir,
@@ -1989,6 +2024,15 @@ def main():
         detail = value_stock_detail(ticker, growth_period)
         if detail:
             generate_xlsx(detail, output_file)
+            try:
+                db_conn = sqlite3.connect("/Volumes/Financial_Data/valuation.db", timeout=30)
+                db_conn.execute("PRAGMA journal_mode=WAL")
+                create_table(db_conn)
+                insert_valuation(db_conn, _stock_value_from_detail(detail))
+                db_conn.close()
+                print(f"Valuation for {ticker} saved to database.")
+            except Exception as e:
+                logger.warning(f"DB write failed for {ticker}: {e}")
         else:
             print(f"Valuation failed for {ticker}.")
         return
