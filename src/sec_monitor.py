@@ -33,14 +33,14 @@ from openpyxl.utils import get_column_letter
 # Config
 # ---------------------------------------------------------------------------
 
-DB_PATH      = "/Volumes/Financial_Data/valuation.db"
-OUTPUT_DIR   = "/Users/jhess/HessGrp/data"
-EDGAR_UA     = "AlphaResearch research@example.com"   # SEC requires name + email
-FORMS        = ("10-K", "10-Q")
-SLEEP_BETWEEN_REQUESTS = 0.20   # 5 req/s
+DB_PATH = "/Volumes/Financial_Data/valuation.db"
+OUTPUT_DIR = "/Users/jhess/HessGrp/data"
+EDGAR_UA = "AlphaResearch research@example.com"  # SEC requires name + email
+FORMS = ("10-K", "10-Q")
+SLEEP_BETWEEN_REQUESTS = 0.20  # 5 req/s
 
 EDGAR_SUBMISSIONS = "https://data.sec.gov/submissions/CIK{cik}.json"
-EDGAR_FILING_URL  = (
+EDGAR_FILING_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar"
     "?action=getcompany&CIK={cik}&type={form}&dateb=&owner=include&count=5"
 )
@@ -89,8 +89,14 @@ def get_known_filing(conn: sqlite3.Connection, cik: str, form_type: str) -> dict
     return None
 
 
-def upsert_filing(conn: sqlite3.Connection, cik: str, ticker: str,
-                  form_type: str, filing_date: str, accession: str) -> None:
+def upsert_filing(
+    conn: sqlite3.Connection,
+    cik: str,
+    ticker: str,
+    form_type: str,
+    filing_date: str,
+    accession: str,
+) -> None:
     conn.execute(
         """INSERT INTO filing_tracker (cik, ticker, form_type, last_filing_date, accession_number, checked_at)
            VALUES (?, ?, ?, ?, ?, ?)
@@ -125,9 +131,9 @@ def fetch_recent_filings(cik: str) -> dict[str, dict] | None:
 
     data = resp.json()
     recent = data.get("filings", {}).get("recent", {})
-    forms       = recent.get("form", [])
-    dates       = recent.get("filingDate", [])
-    accessions  = recent.get("accessionNumber", [])
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    accessions = recent.get("accessionNumber", [])
 
     result: dict[str, dict] = {}
     for form, d, acc in zip(forms, dates, accessions):
@@ -143,21 +149,24 @@ def fetch_recent_filings(cik: str) -> dict[str, dict] | None:
 # Core check logic
 # ---------------------------------------------------------------------------
 
+
 def check_all(conn: sqlite3.Connection, init_mode: bool = False) -> list[dict]:
     """
     Check every stock.  Returns a list of new-filing dicts.
     In init_mode we seed the tracker without flagging anything as new.
     """
     stocks = get_tracked_stocks(conn)
-    total  = len(stocks)
+    total = len(stocks)
     new_filings: list[dict] = []
 
-    print(f"\nChecking {total} stocks against SEC EDGAR ({'seeding' if init_mode else 'monitoring'} mode) ...\n")
+    print(
+        f"\nChecking {total} stocks against SEC EDGAR ({'seeding' if init_mode else 'monitoring'} mode) ...\n"
+    )
 
     for idx, stock in enumerate(stocks, 1):
         ticker = stock["ticker"]
-        cik    = stock["cik"]
-        name   = stock["name"]
+        cik = stock["cik"]
+        name = stock["name"]
 
         print(f"\r  {idx}/{total}  {ticker:<8}", end="", flush=True)
 
@@ -172,19 +181,23 @@ def check_all(conn: sqlite3.Connection, init_mode: bool = False) -> list[dict]:
             is_new = (known is None) or (filing["date"] > known["date"])
 
             if is_new and not init_mode:
-                new_filings.append({
-                    "ticker":     ticker,
-                    "name":       name,
-                    "cik":        cik,
-                    "form_type":  form_type,
-                    "date":       filing["date"],
-                    "accession":  filing["accession"],
-                    "prev_date":  known["date"] if known else "—",
-                    "url": EDGAR_FILING_URL.format(cik=cik, form=form_type),
-                })
+                new_filings.append(
+                    {
+                        "ticker": ticker,
+                        "name": name,
+                        "cik": cik,
+                        "form_type": form_type,
+                        "date": filing["date"],
+                        "accession": filing["accession"],
+                        "prev_date": known["date"] if known else "—",
+                        "url": EDGAR_FILING_URL.format(cik=cik, form=form_type),
+                    }
+                )
 
             # Always update tracker to latest known filing
-            upsert_filing(conn, cik, ticker, form_type, filing["date"], filing["accession"])
+            upsert_filing(
+                conn, cik, ticker, form_type, filing["date"], filing["accession"]
+            )
 
         conn.commit()
 
@@ -196,14 +209,15 @@ def check_all(conn: sqlite3.Connection, init_mode: bool = False) -> list[dict]:
 # Console report
 # ---------------------------------------------------------------------------
 
+
 def print_report(new_filings: list[dict]) -> None:
     if not new_filings:
         print("\nNo new 10-K or 10-Q filings detected.\n")
         return
 
-    print(f"\n{'='*72}")
+    print(f"\n{'=' * 72}")
     print(f"  NEW FILINGS DETECTED: {len(new_filings)}")
-    print(f"{'='*72}\n")
+    print(f"{'=' * 72}\n")
 
     # Group by form type
     for form in FORMS:
@@ -212,7 +226,9 @@ def print_report(new_filings: list[dict]) -> None:
             continue
         print(f"  {form}  ({len(group)} new)\n")
         for f in sorted(group, key=lambda x: x["date"], reverse=True):
-            print(f"    {f['ticker']:<8}  {f['name'][:40]:<40}  {f['date']}  (prev: {f['prev_date']})")
+            print(
+                f"    {f['ticker']:<8}  {f['name'][:40]:<40}  {f['date']}  (prev: {f['prev_date']})"
+            )
             print(f"             {f['url']}")
         print()
 
@@ -220,6 +236,7 @@ def print_report(new_filings: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 # xlsx report
 # ---------------------------------------------------------------------------
+
 
 def write_xlsx(new_filings: list[dict]) -> str:
     today_str = date.today().strftime("%Y%m%d")
@@ -229,26 +246,43 @@ def write_xlsx(new_filings: list[dict]) -> str:
     ws = wb.active
     ws.title = "New Filings"
 
-    THIN   = Side(style="thin")
+    THIN = Side(style="thin")
     BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
     HEADER_FONT = Font(bold=True, color="FFFFFF")
-    DARK_FILL   = PatternFill("solid", fgColor="1F4E79")
-    GREEN_FILL  = PatternFill("solid", fgColor="D4EDDA")
+    DARK_FILL = PatternFill("solid", fgColor="1F4E79")
+    GREEN_FILL = PatternFill("solid", fgColor="D4EDDA")
 
     # Title
-    ws.cell(row=1, column=1, value=f"SEC EDGAR New Filings — {date.today().strftime('%B %d, %Y')}").font = Font(bold=True, size=13)
-    ws.cell(row=2, column=1, value=f"{len(new_filings)} new 10-K/10-Q filings detected").font = Font(italic=True, color="666666")
+    ws.cell(
+        row=1,
+        column=1,
+        value=f"SEC EDGAR New Filings — {date.today().strftime('%B %d, %Y')}",
+    ).font = Font(bold=True, size=13)
+    ws.cell(
+        row=2, column=1, value=f"{len(new_filings)} new 10-K/10-Q filings detected"
+    ).font = Font(italic=True, color="666666")
 
-    headers = ["Ticker", "Company", "CIK", "Form", "Filed", "Prior Filing", "EDGAR Link"]
+    headers = [
+        "Ticker",
+        "Company",
+        "CIK",
+        "Form",
+        "Filed",
+        "Prior Filing",
+        "EDGAR Link",
+    ]
     HDR_ROW = 4
     for col, hdr in enumerate(headers, 1):
         c = ws.cell(row=HDR_ROW, column=col, value=hdr)
-        c.font      = HEADER_FONT
-        c.fill      = DARK_FILL
+        c.font = HEADER_FONT
+        c.fill = DARK_FILL
         c.alignment = Alignment(horizontal="center")
-        c.border    = BORDER
+        c.border = BORDER
 
-    for row_idx, f in enumerate(sorted(new_filings, key=lambda x: (x["form_type"], x["date"]), reverse=True), HDR_ROW + 1):
+    for row_idx, f in enumerate(
+        sorted(new_filings, key=lambda x: (x["form_type"], x["date"]), reverse=True),
+        HDR_ROW + 1,
+    ):
         row_vals = [
             f["ticker"],
             f["name"],
@@ -260,12 +294,12 @@ def write_xlsx(new_filings: list[dict]) -> str:
         ]
         for col, val in enumerate(row_vals, 1):
             c = ws.cell(row=row_idx, column=col, value=val)
-            c.fill   = GREEN_FILL
+            c.fill = GREEN_FILL
             c.border = BORDER
-            if col == 7:   # hyperlink the URL column
+            if col == 7:  # hyperlink the URL column
                 c.hyperlink = val
-                c.value     = "View on EDGAR"
-                c.font      = Font(color="0563C1", underline="single")
+                c.value = "View on EDGAR"
+                c.font = Font(color="0563C1", underline="single")
             elif col <= 2:
                 c.alignment = Alignment(horizontal="left")
             else:
@@ -284,10 +318,11 @@ def write_xlsx(new_filings: list[dict]) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    args       = sys.argv[1:]
-    init_mode  = "--init"   in args
-    xlsx_mode  = "--report" in args or "--xlsx" in args
+    args = sys.argv[1:]
+    init_mode = "--init" in args
+    xlsx_mode = "--report" in args or "--xlsx" in args
 
     conn = open_db()
 
