@@ -12,9 +12,20 @@ NOTE: Alpha Vantage free tier allows ~25 API requests/day (5/min).
       Usage: python av_fcff_2.py [--limit N] [--growth N]
 """
 
+import argparse
 from dataclasses import dataclass
 from datetime import date
 import sqlite3
+import sys as _sys
+from pathlib import Path as _Path
+# This file is intentionally kept identical to
+# /Users/jhess/Development/Alpha2/src/av_fcff_2.py (see docs/known_errors.md,
+# 2026-07-14 — that copy is actively used by stock_analysis.py, not orphaned).
+# hg_dcflib.py has its own separate, manually-synced copy in each location
+# (per CLAUDE.md), so we APPEND ~/HessGrp/lib/ rather than inserting at the
+# front — this makes it a fallback for logging_setup.py (which only exists
+# in HessGrp/lib), without shadowing a same-directory hg_dcflib.py copy.
+_sys.path.append(str(_Path.home() / "HessGrp" / "lib"))
 import hg_dcflib
 import logging
 import os
@@ -25,30 +36,16 @@ import io
 import pandas as pd
 import requests
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+from logging_setup import make_logger, LONG_FMT
 
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-stream_handler = logging.StreamHandler()
-stream_handler.setLevel(logging.WARNING)
-stream_handler.setFormatter(formatter)
-
-# Resolve log directory relative to the executable (PyInstaller) or source file,
-# and create it automatically if it does not exist.
 if getattr(sys, "frozen", False):
-    _log_base = os.path.dirname(sys.executable)
+    _log_dir = os.path.join(os.path.dirname(sys.executable), "data")
 else:
-    _log_base = os.path.dirname(os.path.abspath(__file__))
-_log_dir = os.path.join(_log_base, "data")
+    _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(_log_dir, exist_ok=True)
 
-file_handler = logging.FileHandler(os.path.join(_log_dir, "value.log"))
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(formatter)
-
-logger.addHandler(stream_handler)
-logger.addHandler(file_handler)
+logger = make_logger(__name__, os.path.join(_log_dir, "value.log"),
+                     stream_level=logging.WARNING, fmt=LONG_FMT)
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +65,17 @@ if not FRED_KEY:
 
 MARGINAL_TAX_RATE = 0.26
 GROWTH_PERIOD = 5  # high-growth years; override with --growth N
-EQ_PREM = hg_dcflib.get_erp()
-RISK_FREE = hg_dcflib.get_risk_free(FRED_KEY)
+
+# DB path — override via $VALUATION_DB env var or --db argument
+DEFAULT_DB = os.environ.get("VALUATION_DB", "/Volumes/Financial_Data/valuation.db")
+
+# Deferred to main() so a slow/failed network call at startup doesn't block
+# argument parsing or prevent a scheduled job from reporting a clean error.
+# Values below are used as fallbacks if the live fetch fails.
+EQ_PREM: float = 0.0472    # Damodaran Jan 2026 US ERP fallback
+RISK_FREE: float = 0.0425  # approximate 10-yr Treasury fallback
+STABLE_GROWTH: float = 0.030  # long-run US nominal GDP growth rate (Damodaran ceiling: <= risk-free)
+EQUITY_OVERRIDE: float | None = None  # set via --equity-override; bypasses AV balance sheet equity pull
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +105,10 @@ class Stock_Value:
     margin_of_safety: float
     margin_of_safety_pc: float
     target_price: float
+    earnings_yield: float = 0.0
+    dividend_yield: float = 0.0
+    notes: str = ""
+    analyst_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -107,37 +117,154 @@ class Stock_Value:
 
 
 def get_sp500_tickers() -> list:
-    """Fetch current S&P 500 constituents from Wikipedia."""
+    """
+    Return the current S&P 500 constituent list.
+
+    Reads from data/sp500_tickers.csv if available (produced by ticker_lists).
+    Falls back to a live Wikipedia fetch if the file is not found.
+    """
+    csv_path = os.path.join(_log_dir, "sp500_tickers.csv")
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
+        logger.info(f"Loaded {len(tickers)} S&P 500 tickers from {csv_path}")
+        return tickers
+
+    # ── Fallback: live fetch from Wikipedia ────────────────────────────────
+    logger.warning("sp500_tickers.csv not found — fetching live from Wikipedia")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
-    resp = requests.get(url, headers=headers)
+    resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     tables = pd.read_html(io.StringIO(resp.text), header=0)
     df = tables[0]
     tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-    logger.info(f"Fetched {len(tickers)} S&P 500 tickers")
+    logger.info(f"Fetched {len(tickers)} S&P 500 tickers from Wikipedia")
     return tickers
 
 
 def get_russell2000_tickers() -> list:
-    """Fetch current Russell 2000 constituents from the iShares IWM ETF holdings CSV."""
-    url = (
-        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
-        "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+    """
+    Return the current Russell 2000 constituent list.
+
+    Priority:
+      1. data/russell2000_tickers.csv (produced by ticker_lists.py — most accurate)
+      2. Live iShares IWM CSV (requires no-auth access — may be blocked)
+      3. valuation.db full ticker universe (fallback when iShares is unavailable)
+    """
+    csv_path = os.path.join(_log_dir, "russell2000_tickers.csv")
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
+        logger.info(f"Loaded {len(tickers)} Russell 2000 tickers from {csv_path}")
+        return tickers
+
+    # ── Fallback 1: live fetch from iShares ───────────────────────────────
+    logger.warning("russell2000_tickers.csv not found — trying live iShares fetch")
+    try:
+        url = (
+            "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+            "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.ishares.com/",
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        if resp.text.lstrip().startswith("<"):
+            raise ValueError("iShares returned HTML instead of CSV — direct download is blocked")
+        lines = resp.text.splitlines()
+        header_idx = next(
+            (i for i, line in enumerate(lines) if "Ticker" in line and "Name" in line),
+            None,
+        )
+        if header_idx is None:
+            raise ValueError("Could not locate Ticker header row in iShares CSV")
+        df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+        tickers = (
+            df["Ticker"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.replace(".", "-", regex=False)
+            .pipe(lambda s: s[s.str.match(r"^[A-Z]{1,5}(-[A-Z]+)?$")])
+            .tolist()
+        )
+        logger.info(f"Fetched {len(tickers)} Russell 2000 tickers from iShares")
+        return tickers
+    except Exception as e:
+        logger.warning(f"iShares live fetch failed ({e}) — falling back to valuation.db universe")
+
+    # ── Fallback 2: use all tickers already in valuation.db ───────────────
+    db_path = os.environ.get("VALUATION_DB", DEFAULT_DB)
+    if not os.path.exists(db_path):
+        raise RuntimeError(
+            f"russell2000_tickers.csv missing, iShares blocked, and valuation.db not found at {db_path}. "
+            "Run ticker_lists.py to generate the CSV file."
+        )
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT DISTINCT ticker FROM valuation ORDER BY ticker").fetchall()
+    conn.close()
+    tickers = [r[0] for r in rows]
+    logger.warning(
+        f"Using {len(tickers)} tickers from valuation.db as Russell 2000 proxy. "
+        "Run ticker_lists.py to refresh russell2000_tickers.csv for an accurate constituent list."
     )
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    # iShares CSV has several metadata rows before the column headers.
-    # Find the header row by looking for a line that contains "Ticker".
-    lines = resp.text.splitlines()
-    header_idx = next(i for i, line in enumerate(lines) if line.startswith("Ticker"))
-    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), header=0)
-    df = df[df["Asset Class"] == "Equity"]
-    tickers = (
-        df["Ticker"].dropna().str.strip().str.replace(".", "-", regex=False).tolist()
+    print(
+        f"\n  NOTE: iShares CSV unavailable. Running against {len(tickers)} tickers already in "
+        "valuation.db.\n  For a fresh Russell 2000 list, run: python3 ticker_lists.py\n"
     )
-    logger.info(f"Fetched {len(tickers)} Russell 2000 tickers")
+    return tickers
+
+
+# ---------------------------------------------------------------------------
+# Filings-driven ticker list
+# ---------------------------------------------------------------------------
+
+
+def get_tickers_from_filings(path: str) -> list[str]:
+    """
+    Return a de-duplicated, order-preserved list of tickers from a filings file.
+
+    Supported formats (detected by extension):
+      .xlsx  — legacy sec_monitor output (header on row 4, "Ticker" column)
+      .json  — sec_daily_index output: {"tickers": ["AAPL", "JBL", ...]}
+               or a plain JSON array: ["AAPL", "JBL", ...]
+      .txt   — one ticker per line, blank lines and # comments ignored
+    """
+    import json as _json
+
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".xlsx":
+        df = pd.read_excel(path, header=3)   # row 4 (0-indexed row 3) is the header
+        tickers = df["Ticker"].dropna().str.strip().str.upper().unique().tolist()
+
+    elif ext == ".json":
+        with open(path, "r") as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            raw = data.get("tickers", [])
+        elif isinstance(data, list):
+            raw = data
+        else:
+            raise ValueError(f"Unrecognised JSON structure in {path}")
+        tickers = list(dict.fromkeys(t.strip().upper() for t in raw if t.strip()))
+
+    elif ext == ".txt":
+        with open(path, "r") as f:
+            lines = f.readlines()
+        tickers = list(dict.fromkeys(
+            line.strip().upper()
+            for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        ))
+
+    else:
+        raise ValueError(f"Unsupported filings file format: {ext}  (expected .xlsx, .json, or .txt)")
+
+    logger.info(f"Loaded {len(tickers)} tickers from filings file: {path}")
     return tickers
 
 
@@ -182,6 +309,50 @@ _FINANCIAL_KEYWORDS = {
 
 _INSURANCE_KEYWORDS = {"insurance", "reinsurance", "surety", "title insurance"}
 
+_REIT_KEYWORDS = {"reit", "real estate investment trust"}
+_REIT_INDUSTRY_PREFIXES = ("retail (reit", "r.e.i.t.")
+
+# Growth rate floors by REIT sub-type (AV industry string keyword → rate).
+# Reflects contractual lease escalators and structural growth independent of
+# retained earnings. None = mortgage REIT; flag for manual review.
+_REIT_SUBTYPE_GROWTH: dict[str, float | None] = {
+    "specialty":   0.020,  # broad bucket (data centers, self-storage, etc.) — conservative default
+    "industrial":  0.010,
+    "residential": 0.010,
+    "healthcare":  0.015,
+    "diversified": 0.005,
+    "hotel":       0.000,
+    "retail":      0.000,  # conservative; net lease overrides below
+    "office":      0.000,
+    "mortgage":    None,   # not property income — AFFO DDM not applicable
+}
+
+# Ticker-level overrides for known sub-types where the industry keyword is too coarse.
+# Tower REITs and data centers: CPI escalators + colocation growth → 3%.
+# Net lease REITs: contractual annual escalators (1–2%) → 1.5%.
+_REIT_TICKER_GROWTH_OVERRIDE: dict[str, float] = {
+    "SBAC": 0.030, "AMT": 0.030, "CCI": 0.030,          # tower
+    "EQIX": 0.030, "DLR": 0.030, "CONE": 0.030,          # data center
+    "O":    0.015, "NNN": 0.015, "STOR": 0.015,           # net lease
+    "ELS":  0.020, "SUI": 0.020,                           # manufactured housing
+    "WY":   0.015, "PCH": 0.015,                           # timber (biological growth proxy)
+}
+
+
+def reit_subtype_growth(ticker: str, industry: str) -> float | None:
+    """Return DDM growth rate floor for a REIT based on sub-type.
+
+    Returns None for mortgage REITs (AFFO DDM not applicable — flag for manual review).
+    Ticker-level override takes precedence over industry keyword match.
+    """
+    if ticker in _REIT_TICKER_GROWTH_OVERRIDE:
+        return _REIT_TICKER_GROWTH_OVERRIDE[ticker]
+    low = industry.lower()
+    for keyword, rate in _REIT_SUBTYPE_GROWTH.items():
+        if keyword in low:
+            return rate
+    return 0.010  # unknown sub-type — conservative fallback
+
 
 def is_financial_firm(industry: str) -> bool:
     """Return True if the industry is a financial firm requiring FCFE valuation."""
@@ -193,6 +364,16 @@ def is_insurance_firm(industry: str) -> bool:
     """Return True for insurance companies that need normalized NI."""
     low = industry.lower()
     return any(kw in low for kw in _INSURANCE_KEYWORDS)
+
+
+def is_reit(industry: str) -> bool:
+    """Return True for REITs (pass-through entities requiring AFFO DDM).
+    Excludes real estate services/development/brokerage firms — those use FCFF."""
+    low = industry.lower()
+    return (
+        any(kw in low for kw in _REIT_KEYWORDS)
+        or any(low.startswith(p) for p in _REIT_INDUSTRY_PREFIXES)
+    )
 
 
 def _normalized_net_income(net_income_list: list) -> tuple[float, int]:
@@ -233,6 +414,8 @@ def calc_capital_expenditures(cash_flw):
 
 
 def calc_chng_wc(bal_sht):
+    if len(bal_sht["total_current_assets"]) < 2:
+        raise ValueError("Insufficient balance sheet history (need 2 years) to compute working capital change")
     curr_yr_nc_wc = (
         bal_sht["total_current_assets"][0] - bal_sht["cash_and_equivalents"][0]
     ) - (bal_sht["total_current_liabilities"][0] - bal_sht["short_term_debt"][0])
@@ -243,6 +426,17 @@ def calc_chng_wc(bal_sht):
 
 
 def capitalizerAndD(ticker, rd_years, api_key):
+    rd_years = int(rd_years)
+    if rd_years <= 1:
+        # No R&D amortization for this industry — skip API call and return zeroed schedule
+        return {
+            "rAndDExpense": [0.0],
+            "unamortized_percent": [0.0],
+            "unamort_amount": [0.0],
+            "RD_Asset_Value": 0.0,
+            "Current_Year_Amortization": 0.0,
+        }
+
     rdTable = hg_dcflib.get_rAndD(ticker, rd_years, api_key)
     rd_dict, years_to_process = rdTable
     logger.info(f"rdTable = {rdTable}")
@@ -313,9 +507,12 @@ def calc_adj_ebiat(ebiat, amort_schedule):
 
 
 def calc_adj_bv_equity(bal_sht, amort_schedule):
-    adjusted_bv_equity = (
-        bal_sht["total_stockholders_equity"][0] + amort_schedule["RD_Asset_Value"]
-    )
+    if EQUITY_OVERRIDE is not None:
+        base_equity = EQUITY_OVERRIDE
+        logger.info(f"equity override active: using {base_equity:,.0f} instead of AV balance sheet")
+    else:
+        base_equity = bal_sht["total_stockholders_equity"][0]
+    adjusted_bv_equity = base_equity + amort_schedule["RD_Asset_Value"]
     logger.info(f"adjusted BV Equity = {adjusted_bv_equity:,.2f}")
     return adjusted_bv_equity
 
@@ -355,8 +552,19 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
+def calc_levered_beta(unlevered_beta, bv_debt, market_cap_equity, tax_rate):
+    de_ratio = bv_debt / market_cap_equity if market_cap_equity > 0 else 0.0
+    levered_beta = unlevered_beta * (1 + (1 - tax_rate) * de_ratio)
+    logger.info(f"Levered beta = {levered_beta:,.4f} (unlevered {unlevered_beta:,.4f}, D/E {de_ratio:,.4f})")
+    return levered_beta
+
+
 def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, eq_prem):
-    cost_of_equity = risk_free + (beta * eq_prem)
+    # Re-lever the industry (unlevered) beta to this company's own capital
+    # structure before computing cost of equity — see docs/known_errors.md
+    # (2026-07-14: previously used the raw unlevered beta directly in CAPM).
+    levered_beta = calc_levered_beta(beta, bv_debt, market_cap_equity, MARGINAL_TAX_RATE)
+    cost_of_equity = risk_free + (levered_beta * eq_prem)
     logger.info(f"COE = {cost_of_equity:,.4f}")
 
     try:
@@ -408,10 +616,10 @@ def calc_fcff_value(fcff_table, discount_rate, growth_period):
 
 
 def calc_terminal_value(
-    fcff_last, stable_cost_of_capital, growth_cost_of_capital, risk_free, growth_period
+    fcff_last, stable_cost_of_capital, growth_cost_of_capital, stable_growth, growth_period
 ):
-    terminal_value = (fcff_last * (1 + risk_free)) / (
-        stable_cost_of_capital - risk_free
+    terminal_value = (fcff_last * (1 + stable_growth)) / (
+        stable_cost_of_capital - stable_growth
     )
     terminal_value_pv = terminal_value / ((1 + growth_cost_of_capital) ** growth_period)
     logger.info(f"Terminal Value = {terminal_value_pv:,.2f}")
@@ -455,6 +663,10 @@ def create_table(conn):
               margin_of_safety REAL NOT NULL,
               margin_of_safety_pc REAL NOT NULL,
               target_price REAL NOT NULL DEFAULT 0,
+              earnings_yield REAL NOT NULL DEFAULT 0,
+              dividend_yield REAL NOT NULL DEFAULT 0,
+              notes TEXT NOT NULL DEFAULT '',
+              analyst_count INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY (ticker)
               );"""
     try:
@@ -465,23 +677,44 @@ def create_table(conn):
         ).fetchone()
         if row and "PRIMARY KEY (ticker, valuation_date)" in row[0]:
             logger.info("Migrating valuation table to single-ticker primary key ...")
-            conn.execute("ALTER TABLE valuation RENAME TO valuation_old")
-            conn.execute(schema_sql)
-            # Keep only the most recent row per ticker
-            conn.execute("""
-                INSERT INTO valuation
-                SELECT ticker, valuation_date, ent_name, industry, beta, market_cap,
-                       price, shares_outstanding, risk_free_rate, eq_premium, growth_rate,
-                       cost_of_capital, wealth_pc, fcff_value, terminal_value, share_value,
-                       margin_of_safety, margin_of_safety_pc
-                FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY valuation_date DESC) rn
-                    FROM valuation_old
-                ) WHERE rn = 1
-            """)
-            conn.execute("DROP TABLE valuation_old")
-            conn.commit()
-            logger.info("Migration complete.")
+            # DDL (ALTER/CREATE/DROP) bypasses Python's automatic transaction
+            # management, so we disable it temporarily and use explicit SQL
+            # BEGIN/COMMIT/ROLLBACK to guarantee atomicity.
+            orig_isolation = conn.isolation_level
+            conn.isolation_level = None
+            try:
+                conn.execute("BEGIN EXCLUSIVE")
+                conn.execute("ALTER TABLE valuation RENAME TO valuation_old")
+                conn.execute(schema_sql)
+                # Explicit destination column list — cik and target_price are
+                # new columns not present in the old table; they receive their
+                # DEFAULT values ('', 0) automatically.
+                conn.execute("""
+                    INSERT INTO valuation (
+                        ticker, valuation_date, ent_name, industry, beta, market_cap,
+                        price, shares_outstanding, risk_free_rate, eq_premium, growth_rate,
+                        cost_of_capital, wealth_pc, fcff_value, terminal_value, share_value,
+                        margin_of_safety, margin_of_safety_pc)
+                    SELECT ticker, valuation_date, ent_name, industry, beta, market_cap,
+                           price, shares_outstanding, risk_free_rate, eq_premium, growth_rate,
+                           cost_of_capital, wealth_pc, fcff_value, terminal_value, share_value,
+                           margin_of_safety, margin_of_safety_pc
+                    FROM (
+                        SELECT *, ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY valuation_date DESC) rn
+                        FROM valuation_old
+                    ) WHERE rn = 1
+                """)
+                conn.execute("DROP TABLE valuation_old")
+                conn.execute("COMMIT")
+                logger.info("Migration complete.")
+            except Exception as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Migration failed and was rolled back: {exc}") from exc
+            finally:
+                conn.isolation_level = orig_isolation
         else:
             conn.execute(schema_sql)
             conn.commit()
@@ -490,6 +723,10 @@ def create_table(conn):
         for col_def in (
             "target_price REAL NOT NULL DEFAULT 0",
             "cik TEXT NOT NULL DEFAULT ''",
+            "earnings_yield REAL NOT NULL DEFAULT 0",
+            "dividend_yield REAL NOT NULL DEFAULT 0",
+            "notes TEXT NOT NULL DEFAULT ''",
+            "analyst_count INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 conn.execute(f"ALTER TABLE valuation ADD COLUMN {col_def}")
@@ -508,8 +745,9 @@ def insert_valuation(conn, val):
         (ticker, valuation_date, ent_name, industry, cik, beta, market_cap, price,
             shares_outstanding, risk_free_rate, eq_premium, growth_rate,
             cost_of_capital, wealth_pc, fcff_value, terminal_value, share_value,
-            margin_of_safety, margin_of_safety_pc, target_price)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            margin_of_safety, margin_of_safety_pc, target_price, earnings_yield,
+            dividend_yield, notes, analyst_count)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             val.ticker,
             val.valuation_date,
@@ -531,9 +769,55 @@ def insert_valuation(conn, val):
             val.margin_of_safety,
             val.margin_of_safety_pc,
             val.target_price,
+            val.earnings_yield,
+            val.dividend_yield,
+            val.notes,
+            val.analyst_count,
         ),
     )
     conn.commit()
+
+
+def _rescore_tickers(db_path: str, tickers: list) -> None:
+    """Re-score composite_scores for the given tickers immediately after valuation.
+
+    Keeps composite scores in sync with valuations on a per-ticker basis so
+    a full composite_score.py run is only needed after a bulk refresh.
+    Errors are logged and swallowed — a scoring failure never aborts a valuation.
+    """
+    if not tickers:
+        return
+    try:
+        from composite_score import (
+            score_row, upsert, ensure_table as ensure_score_table,
+        )
+    except ImportError:
+        logger.warning("composite_score not importable; skipping auto-rescore")
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        ensure_score_table(conn)
+        moat_map = {r["ticker"]: dict(r)
+                    for r in conn.execute("SELECT * FROM moat_scores").fetchall()}
+        fd_map   = {r["ticker"]: dict(r)
+                    for r in conn.execute("SELECT * FROM financial_data").fetchall()}
+        for ticker in tickers:
+            vrow = conn.execute(
+                "SELECT * FROM valuation WHERE ticker=?", (ticker,)
+            ).fetchone()
+            if not vrow:
+                continue
+            r = score_row(dict(vrow), moat_map.get(ticker, {}), fd_map.get(ticker, {}))
+            upsert(conn, r)
+            logger.info(
+                f"Composite score updated: {ticker} → {r['total_score']} ({r['designation']})"
+            )
+        conn.close()
+        label = tickers[0] if len(tickers) == 1 else f"{len(tickers)} tickers"
+        print(f"  Composite score(s) updated: {label}")
+    except Exception as e:
+        logger.warning(f"Composite score auto-update failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -607,9 +891,13 @@ def value_bank_stock(ticker: str, growth_period: int):
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        dividend_yield = ent_quote[4]
+        analyst_count = int(ent_quote[5])
         cik = hg_dcflib.get_cik(ticker)
 
         reported_net_income = inc_stmnt["netIncome"][0]
+        if len(bal_sht["total_stockholders_equity"]) < 2:
+            raise ValueError("Insufficient balance sheet history (need 2 years) for bank FCFE model")
         bv_equity_curr = bal_sht["total_stockholders_equity"][0]
         bv_equity_prior = bal_sht["total_stockholders_equity"][1]
 
@@ -638,7 +926,9 @@ def value_bank_stock(ticker: str, growth_period: int):
         )
 
         # --- Cost of equity (no WACC — debt is operational for banks) ---
-        cost_of_equity = RISK_FREE + (unlevered_beta * EQ_PREM)
+        bv_debt = calc_bv_debt(bal_sht)
+        levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
         logger.info(f"Cost of Equity = {cost_of_equity:.4f}")
 
         # --- Project FCFE ---
@@ -659,8 +949,9 @@ def value_bank_stock(ticker: str, growth_period: int):
         # --- Stable phase ---
         # In stable phase ROE converges to cost of equity (competitive equilibrium)
         stable_beta = calc_stable_beta(unlevered_beta)
-        stable_cost_of_equity = RISK_FREE + (stable_beta * EQ_PREM)
-        stable_growth = RISK_FREE
+        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
+        stable_growth = STABLE_GROWTH
         stable_reinv = stable_growth / stable_cost_of_equity  # stable ROE = stable CoE
         stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value = stable_fcfe / (stable_cost_of_equity - stable_growth)
@@ -684,7 +975,7 @@ def value_bank_stock(ticker: str, growth_period: int):
             ent_name=ent_name,
             industry=industry,
             cik=cik,
-            beta=unlevered_beta,
+            beta=levered_beta,
             market_cap=market_cap,
             price=price,
             shares_outstanding=shares_outstanding,
@@ -699,6 +990,9 @@ def value_bank_stock(ticker: str, growth_period: int):
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
             target_price=target_price,
+            earnings_yield=0.0,  # FCFE model — EBIT/EV not applicable for banks
+            dividend_yield=dividend_yield,
+            analyst_count=analyst_count,
         )
 
     except Exception as e:
@@ -715,6 +1009,7 @@ def value_bank_stock(ticker: str, growth_period: int):
 def value_stock(ticker: str, growth_period: int):
     """
     Route to the correct valuation model based on industry:
+      - REITs → skipped (FCFF/FCFE not applicable; FFO/AFFO model pending Phase 2)
       - Financial firms (banks, insurance, etc.) → FCFE equity DCF
       - All others → FCFF firm DCF
     """
@@ -723,6 +1018,9 @@ def value_stock(ticker: str, growth_period: int):
     except Exception as e:
         logger.warning(f"Skipping {ticker}: {e}")
         return None
+
+    if is_reit(industry):
+        return value_reit_stock(ticker, growth_period)
 
     if is_financial_firm(industry):
         return value_bank_stock(ticker, growth_period)
@@ -750,6 +1048,8 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        dividend_yield = ent_quote[4]
+        analyst_count = int(ent_quote[5])
         cik = hg_dcflib.get_cik(ticker)
 
         stable_beta = calc_stable_beta(unlevered_beta)
@@ -776,6 +1076,23 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
 
+        if adjusted_bv_equity < 0:
+            logger.warning(f"{ticker}: negative book equity ({adjusted_bv_equity:,.0f}) — DCF not applicable")
+            return Stock_Value(
+                ticker=ticker, valuation_date=valuation_date, ent_name=ent_name,
+                industry=industry, cik=cik,
+                beta=calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE),
+                market_cap=market_cap,
+                price=price, shares_outstanding=shares_outstanding,
+                risk_free_rate=RISK_FREE, eq_premium=EQ_PREM,
+                growth_rate=0.0, cost_of_capital=0.0, wealth_pc=0.0,
+                fcff_value=0.0, terminal_value=0.0, share_value=0.0,
+                margin_of_safety=0.0, margin_of_safety_pc=0.0, target_price=0.0,
+                earnings_yield=0.0, dividend_yield=dividend_yield,
+                notes="DCF not applicable — negative book equity",
+                analyst_count=analyst_count,
+            )
+
         # Sanity check: if |EBIT| dwarfs the market cap by more than 10×,
         # the quarterly working-capital data is almost certainly corrupted.
         if market_cap > 0 and abs(adjusted_ebit) > 10 * market_cap:
@@ -784,6 +1101,10 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
                 f"({market_cap:,.0f}) — likely bad WC data, skipping."
             )
 
+        if adjusted_ebiat == 0:
+            raise ValueError(
+                f"Adjusted EBIAT is zero for {ticker} — cannot compute reinvestment rate."
+            )
         reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
         logger.info(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
@@ -792,6 +1113,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         )
         growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
 
+        levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         discount_rate = calc_discount_rate(
             inc_stmnt, bv_debt, market_cap, unlevered_beta, RISK_FREE, EQ_PREM
         )
@@ -809,7 +1131,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             fcff_table[-1],
             terminal_cost_of_capital,
             discount_rate,
-            RISK_FREE,
+            STABLE_GROWTH,
             growth_period,
         )
         intrinsic_value = calc_intrinsic_value(
@@ -822,9 +1144,12 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
 
         safety_margin = float(intrinsic_value - price)
         logger.info(f"Safety Margin: {safety_margin:,.2f}")
-        safety_margin_pc = 1 - (price / intrinsic_value)
+        safety_margin_pc = (1 - (price / intrinsic_value)) if intrinsic_value != 0 else 0.0
         wealth_pc = return_on_capital - discount_rate
         target_price = intrinsic_value * (1 + discount_rate)
+        _cash = bal_sht["cash_and_equivalents"][0]
+        _ev = market_cap + bv_debt - _cash
+        earnings_yield = adjusted_ebit / _ev if _ev > 0 else 0.0
 
         if return_on_capital > discount_rate:
             logger.info("Wealth Creator")
@@ -837,7 +1162,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             ent_name=ent_name,
             industry=industry,
             cik=cik,
-            beta=unlevered_beta,
+            beta=levered_beta,
             market_cap=market_cap,
             price=price,
             shares_outstanding=shares_outstanding,
@@ -852,6 +1177,148 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
             target_price=target_price,
+            earnings_yield=earnings_yield,
+            dividend_yield=dividend_yield,
+            analyst_count=analyst_count,
+        )
+
+    except Exception as e:
+        logger.warning(f"Skipping {ticker}: {e}")
+        logger.debug(traceback.format_exc())
+        return None
+
+
+# ---------------------------------------------------------------------------
+# REIT valuation  (AFFO-based DDM)
+# ---------------------------------------------------------------------------
+
+def value_reit_stock(ticker: str, growth_period: int):
+    """
+    AFFO-based dividend discount model for REITs.
+
+    Why not FCFF/FCFE:
+    - REITs distribute 90%+ of income → retention ≈ 0 → FCFF growth = 0
+    - Near-zero corporate tax distorts FCFF
+    - Growth driven by acquisitions, not retained earnings
+
+    Model:
+    - AFFO = Net Income + D&A − CapEx  (AV CapEx = recurring, not acquisitions)
+    - Payout = dividends_paid / AFFO
+    - Growth = ROE × retention, capped at 15%
+    - Discount at Cost of Equity (no WACC — REIT leverage is structural)
+    """
+    logger.info(f"Valuing {ticker} as REIT (AFFO DDM)")
+    try:
+        industry = hg_dcflib.get_industry(ticker)
+
+        subtype_floor = reit_subtype_growth(ticker, industry)
+        if subtype_floor is None:
+            logger.warning(
+                f"Skipping {ticker}: Mortgage REIT — AFFO DDM not applicable; manual review required"
+            )
+            return None
+
+        unlevered_beta = hg_dcflib.get_beta(industry)
+
+        inc_stmnt = income_statement(ticker, MY_API_KEY)
+        bal_sht   = balance_sheet(ticker, MY_API_KEY)
+        cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
+        ent_quote = enterprise_quote(ticker, MY_API_KEY)
+
+        valuation_date    = str(date.today())
+        price             = ent_quote[0]
+        shares_outstanding = ent_quote[1]
+        market_cap        = ent_quote[2]
+        ent_name          = ent_quote[3]
+        dividend_yield    = ent_quote[4]
+        analyst_count     = int(ent_quote[5])
+        cik               = hg_dcflib.get_cik(ticker)
+
+        net_income     = inc_stmnt["netIncome"][0]
+        da             = cash_flw["depreciation"][0] if cash_flw["depreciation"] else 0.0
+        capex          = abs(cash_flw["capex"][0])           if cash_flw["capex"]          else 0.0
+        dividends_paid = abs(cash_flw["dividends_paid"][0])  if cash_flw["dividends_paid"] else 0.0
+        bv_equity      = bal_sht["total_stockholders_equity"][0]
+
+        ffo  = net_income + da
+        affo = max(ffo - capex, ffo * 0.80)  # floor at 80% of FFO to absorb edge cases
+
+        payout_ratio   = min(dividends_paid / affo, 1.0) if affo > 0 else 0.85
+        retention_ratio = 1.0 - payout_ratio
+
+        roe             = net_income / bv_equity if bv_equity > 0 else 0.0
+        retained_growth = min(roe * retention_ratio, 0.15)
+        # Use the higher of the retention-based rate and the sub-type floor.
+        # The floor captures contractual lease escalators and structural growth
+        # that exists independent of retained earnings (e.g. CPI escalators on
+        # tower leases, 5G colocation, biological timber growth).
+        growth_rate = max(retained_growth, subtype_floor)
+        logger.info(
+            f"AFFO={affo:,.0f}  payout={payout_ratio:.3f}  ROE={roe:.4f}  "
+            f"retained_g={retained_growth:.4f}  subtype_floor={subtype_floor:.4f}  "
+            f"g={growth_rate:.4f}"
+        )
+
+        bv_debt = calc_bv_debt(bal_sht)
+        levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
+
+        affo_n, div_n = [], []
+        for year in range(growth_period):
+            a = affo * (1 + growth_rate) ** (year + 1)
+            affo_n.append(a)
+            div_n.append(a * payout_ratio)
+
+        div_pv = sum(div_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period))
+
+        stable_beta             = calc_stable_beta(unlevered_beta)
+        stable_levered_beta     = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_cost_of_equity   = RISK_FREE + (stable_levered_beta * EQ_PREM)
+        stable_growth           = STABLE_GROWTH
+        stable_reinv            = stable_growth / stable_cost_of_equity
+        stable_div              = div_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        terminal_value          = stable_div / (stable_cost_of_equity - stable_growth)
+        terminal_value_pv       = terminal_value / (1 + cost_of_equity) ** growth_period
+
+        equity_value    = div_pv + terminal_value_pv
+        intrinsic_value = equity_value / shares_outstanding
+        if intrinsic_value <= 0:
+            logger.warning(
+                f"Skipping {ticker}: AFFO model produced non-positive IV "
+                f"({intrinsic_value:.2f}) — negative AFFO or growth ≥ CoE"
+            )
+            return None
+        safety_margin   = float(intrinsic_value - price)
+        safety_margin_pc = (1 - price / intrinsic_value) if intrinsic_value != 0 else 0.0
+        wealth_pc       = roe - cost_of_equity
+        target_price    = intrinsic_value * (1 + cost_of_equity)
+
+        logger.info(f"Intrinsic value = {intrinsic_value:.2f}  Price = {price:.2f}")
+
+        return Stock_Value(
+            ticker=ticker,
+            valuation_date=valuation_date,
+            ent_name=ent_name,
+            industry=industry,
+            cik=cik,
+            beta=levered_beta,
+            market_cap=market_cap,
+            price=price,
+            shares_outstanding=shares_outstanding,
+            risk_free_rate=RISK_FREE,
+            eq_premium=EQ_PREM,
+            growth_rate=growth_rate,
+            cost_of_capital=cost_of_equity,
+            wealth_pc=wealth_pc,
+            fcff_value=div_pv,
+            terminal_value=terminal_value_pv,
+            share_value=intrinsic_value,
+            margin_of_safety=safety_margin,
+            margin_of_safety_pc=safety_margin_pc,
+            target_price=target_price,
+            earnings_yield=0.0,
+            dividend_yield=dividend_yield,
+            analyst_count=analyst_count,
         )
 
     except Exception as e:
@@ -871,6 +1338,10 @@ def _stock_value_from_detail(d: dict) -> Stock_Value:
         cost_of_capital = d["cost_of_equity"]
         wealth_pc = d["roe"] - d["cost_of_equity"]
         fcff_value = d["fcfe_pv"]
+    elif d["model"] == "AFFO":
+        cost_of_capital = d["cost_of_equity"]
+        wealth_pc = d["roe"] - d["cost_of_equity"]
+        fcff_value = d["div_pv"]
     else:
         cost_of_capital = d["discount_rate"]
         wealth_pc = d["return_on_capital"] - d["discount_rate"]
@@ -897,12 +1368,15 @@ def _stock_value_from_detail(d: dict) -> Stock_Value:
         margin_of_safety=d["margin_of_safety"],
         margin_of_safety_pc=d["margin_of_safety_pc"],
         target_price=d["target_price"],
+        earnings_yield=d.get("earnings_yield", 0.0),
+        analyst_count=d.get("analyst_count", 0),
     )
 
 
 def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
     """
     Route to the correct detail valuation for the Excel report:
+      - REITs          → skipped (FFO/AFFO model pending Phase 2)
       - Financial firms → FCFE bank detail
       - All others      → FCFF detail
     """
@@ -911,6 +1385,9 @@ def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
     except Exception as e:
         logger.warning(f"Skipping {ticker}: {e}")
         return None
+
+    if is_reit(industry):
+        return _value_reit_stock_detail(ticker, growth_period, industry)
 
     if is_financial_firm(industry):
         return _value_bank_stock_detail(ticker, growth_period, industry)
@@ -933,6 +1410,7 @@ def _value_bank_stock_detail(
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        analyst_count = int(ent_quote[5])
         cik = hg_dcflib.get_cik(ticker)
 
         reported_net_income = inc_stmnt["netIncome"][0]
@@ -956,7 +1434,9 @@ def _value_bank_stock_detail(
         retention_ratio = 1.0 - payout_ratio
         growth_rate = min(roe * retention_ratio, 0.30)
 
-        cost_of_equity = RISK_FREE + (unlevered_beta * EQ_PREM)
+        bv_debt = calc_bv_debt(bal_sht)
+        levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
 
         ni_n, fcfe_n = [], []
         for year in range(growth_period):
@@ -969,8 +1449,9 @@ def _value_bank_stock_detail(
         )
 
         stable_beta = calc_stable_beta(unlevered_beta)
-        stable_cost_of_equity = RISK_FREE + (stable_beta * EQ_PREM)
-        stable_growth = RISK_FREE
+        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
+        stable_growth = STABLE_GROWTH
         stable_reinv = stable_growth / stable_cost_of_equity
         stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value_undiscounted = stable_fcfe / (
@@ -1007,7 +1488,7 @@ def _value_bank_stock_detail(
             # --- Growth phase ---
             "growth_period": growth_period,
             "growth_rate": growth_rate,
-            "beta": unlevered_beta,
+            "beta": levered_beta,
             "stable_beta": stable_beta,
             "risk_free": RISK_FREE,
             "eq_prem": EQ_PREM,
@@ -1024,6 +1505,124 @@ def _value_bank_stock_detail(
             "terminal_value_pv": terminal_value_pv,
             # --- Valuation ---
             "fcfe_pv": fcfe_pv,
+            "equity_value": equity_value,
+            "price": price,
+            "shares_outstanding": shares_outstanding,
+            "market_cap": market_cap,
+            "intrinsic_value": intrinsic_value,
+            "margin_of_safety": margin_of_safety,
+            "margin_of_safety_pc": margin_of_safety_pc,
+            "target_price": intrinsic_value * (1 + cost_of_equity),
+        }
+
+    except Exception as e:
+        logger.warning(f"Skipping {ticker}: {e}")
+        logger.debug(traceback.format_exc())
+        return None
+
+
+def _value_reit_stock_detail(
+    ticker: str, growth_period: int, industry: str
+) -> dict | None:
+    """AFFO DDM detail dict for REITs (used for Excel output)."""
+    try:
+        unlevered_beta = hg_dcflib.get_beta(industry)
+
+        inc_stmnt = income_statement(ticker, MY_API_KEY)
+        bal_sht   = balance_sheet(ticker, MY_API_KEY)
+        cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
+        ent_quote = enterprise_quote(ticker, MY_API_KEY)
+
+        price              = ent_quote[0]
+        shares_outstanding = ent_quote[1]
+        market_cap         = ent_quote[2]
+        ent_name           = ent_quote[3]
+        cik                = hg_dcflib.get_cik(ticker)
+
+        net_income     = inc_stmnt["netIncome"][0]
+        da             = cash_flw["depreciation"][0] if cash_flw["depreciation"] else 0.0
+        capex          = abs(cash_flw["capex"][0])           if cash_flw["capex"]          else 0.0
+        dividends_paid = abs(cash_flw["dividends_paid"][0])  if cash_flw["dividends_paid"] else 0.0
+        bv_equity      = bal_sht["total_stockholders_equity"][0]
+
+        ffo  = net_income + da
+        affo = max(ffo - capex, ffo * 0.80)
+
+        payout_ratio    = min(dividends_paid / affo, 1.0) if affo > 0 else 0.85
+        retention_ratio = 1.0 - payout_ratio
+        roe             = net_income / bv_equity if bv_equity > 0 else 0.0
+        retained_growth = min(roe * retention_ratio, 0.15)
+        subtype_floor   = reit_subtype_growth(ticker, industry)
+        if subtype_floor is None:
+            logger.warning(f"Skipping {ticker}: Mortgage REIT — AFFO DDM not applicable")
+            return None
+        growth_rate     = max(retained_growth, subtype_floor)
+        bv_debt         = calc_bv_debt(bal_sht)
+        levered_beta    = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        cost_of_equity  = RISK_FREE + (levered_beta * EQ_PREM)
+
+        affo_n, div_n = [], []
+        for year in range(growth_period):
+            a = affo * (1 + growth_rate) ** (year + 1)
+            affo_n.append(a)
+            div_n.append(a * payout_ratio)
+
+        div_pv = sum(div_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period))
+
+        stable_beta           = calc_stable_beta(unlevered_beta)
+        stable_levered_beta   = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
+        stable_growth         = STABLE_GROWTH
+        stable_reinv          = stable_growth / stable_cost_of_equity
+        stable_div            = div_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        terminal_value_undiscounted = stable_div / (stable_cost_of_equity - stable_growth)
+        terminal_value_pv     = terminal_value_undiscounted / (1 + cost_of_equity) ** growth_period
+
+        equity_value     = div_pv + terminal_value_pv
+        intrinsic_value  = equity_value / shares_outstanding
+        margin_of_safety = float(intrinsic_value - price)
+        margin_of_safety_pc = (1 - price / intrinsic_value) if intrinsic_value != 0 else 0.0
+
+        return {
+            "model": "AFFO",
+            "ticker": ticker,
+            "ent_name": ent_name,
+            "industry": industry,
+            "cik": cik,
+            "valuation_date": str(date.today()),
+            # --- Inputs ---
+            "net_income": net_income,
+            "da": da,
+            "capex": capex,
+            "dividends_paid": dividends_paid,
+            "ffo": ffo,
+            "affo": affo,
+            "bv_equity": bv_equity,
+            "roe": roe,
+            "payout_ratio": payout_ratio,
+            "retention_ratio": retention_ratio,
+            "retained_growth": retained_growth,
+            "subtype_floor": subtype_floor,
+            # --- Growth phase ---
+            "growth_period": growth_period,
+            "growth_rate": growth_rate,
+            "beta": levered_beta,
+            "stable_beta": stable_beta,
+            "risk_free": RISK_FREE,
+            "eq_prem": EQ_PREM,
+            "cost_of_equity": cost_of_equity,
+            # --- Year-by-year projections ---
+            "affo_n": affo_n,
+            "div_n": div_n,
+            # --- Stable phase ---
+            "stable_growth": stable_growth,
+            "stable_reinv": stable_reinv,
+            "stable_div": stable_div,
+            "stable_cost_of_equity": stable_cost_of_equity,
+            "terminal_value_undiscounted": terminal_value_undiscounted,
+            "terminal_value_pv": terminal_value_pv,
+            # --- Valuation ---
+            "div_pv": div_pv,
             "equity_value": equity_value,
             "price": price,
             "shares_outstanding": shares_outstanding,
@@ -1079,12 +1678,22 @@ def _value_stock_detail_fcff(
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
 
+        if adjusted_bv_equity < 0:
+            raise ValueError(
+                f"Negative book equity ({adjusted_bv_equity:,.0f}) — "
+                "DCF not applicable for companies with negative equity"
+            )
+
         if market_cap > 0 and abs(adjusted_ebit) > 10 * market_cap:
             raise ValueError(
                 f"Adjusted EBIT ({adjusted_ebit:,.0f}) is > 10× market cap "
                 f"({market_cap:,.0f}) — likely bad WC data, skipping."
             )
 
+        if adjusted_ebiat == 0:
+            raise ValueError(
+                f"Adjusted EBIAT is zero for {ticker} — cannot compute reinvestment rate."
+            )
         reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
         return_on_capital = calc_return_on_capital(
             adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
@@ -1092,7 +1701,8 @@ def _value_stock_detail_fcff(
         growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
 
         # Compute discount rate components inline to capture intermediates
-        cost_of_equity = RISK_FREE + (unlevered_beta * EQ_PREM)
+        levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
         try:
             int_cover = inc_stmnt["ebit"][0] / inc_stmnt["interest_expense"][0]
         except ZeroDivisionError:
@@ -1107,11 +1717,12 @@ def _value_stock_detail_fcff(
         )
 
         # Stable phase
-        stable_cost_of_equity = RISK_FREE + (stable_beta * EQ_PREM)
+        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_cost_of_capital = calc_discount_rate(
             inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM
         )
-        stable_growth = RISK_FREE
+        stable_growth = STABLE_GROWTH
         stable_reinv_rate = (
             stable_growth / return_on_capital if return_on_capital != 0 else 0
         )
@@ -1154,6 +1765,44 @@ def _value_stock_detail_fcff(
         revenue = inc_stmnt["totalRevenue"][0]
         wc_pct_revenue = curr_nc_wc / revenue if revenue != 0 else 0
 
+        # Normalized valuation: if a single outlier quarter drove TTM EBIT negative,
+        # rerun the model using TTM EBIT with that quarter excluded.  The result is
+        # labeled "normalized" and shown alongside the GAAP figure in reports.
+        ebit_anomaly = inc_stmnt.get("ebit_anomaly")
+        norm_intrinsic_value = None
+        norm_adjusted_ebit = None
+        norm_return_on_capital = None
+        norm_growth_rate = None
+        if ebit_anomaly and adjusted_ebit < 0:
+            norm_ttm_ebit_raw = ebit_anomaly["normalized_ttm_ebit"]
+            norm_ebiat_raw = norm_ttm_ebit_raw * (1 - eff_tax_rate)
+            norm_adjusted_ebiat = calc_adj_ebiat(norm_ebiat_raw, amort_schedule)
+            if norm_adjusted_ebiat > 0:
+                norm_adjusted_ebit = (
+                    norm_adjusted_ebiat / (1 - eff_tax_rate) if eff_tax_rate < 1
+                    else norm_adjusted_ebiat
+                )
+                norm_reinv_rate = min(
+                    max(firm_reinvestment / norm_adjusted_ebiat, 0.0), 1.0
+                )
+                norm_return_on_capital = calc_return_on_capital(
+                    norm_adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
+                )
+                norm_growth_rate = min(
+                    calc_growth_rate(norm_reinv_rate, norm_return_on_capital), 0.30
+                )
+                norm_fcff_table = calc_expected_fcff(
+                    norm_adjusted_ebit, eff_tax_rate, norm_growth_rate,
+                    norm_reinv_rate, growth_period
+                )
+                norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, growth_period)
+                norm_stable_fcff = norm_fcff_table[-1] * (1 + stable_growth)
+                norm_tv_pv = (
+                    norm_stable_fcff / (stable_cost_of_capital - stable_growth)
+                ) / (1 + discount_rate) ** growth_period
+                norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
+                norm_intrinsic_value = norm_ev / shares_outstanding
+
         return {
             "model": "FCFF",
             "ticker": ticker,
@@ -1179,7 +1828,7 @@ def _value_stock_detail_fcff(
             "growth_rate": growth_rate,
             "reinvestment_rate": reinvestment_rate,
             "return_on_capital": return_on_capital,
-            "beta": unlevered_beta,
+            "beta": levered_beta,
             "stable_beta": stable_beta,
             "risk_free": RISK_FREE,
             "eq_prem": EQ_PREM,
@@ -1215,6 +1864,13 @@ def _value_stock_detail_fcff(
             "margin_of_safety": margin_of_safety,
             "margin_of_safety_pc": margin_of_safety_pc,
             "target_price": intrinsic_value * (1 + discount_rate),
+            "earnings_yield": adjusted_ebit / (market_cap + bv_debt - cash) if (market_cap + bv_debt - cash) > 0 else 0.0,
+            # Anomaly detection — single outlier quarter driving negative TTM EBIT
+            "ebit_anomaly": ebit_anomaly,
+            "norm_intrinsic_value": norm_intrinsic_value,
+            "norm_adjusted_ebit": norm_adjusted_ebit,
+            "norm_return_on_capital": norm_return_on_capital,
+            "norm_growth_rate": norm_growth_rate,
         }
 
     except Exception as e:
@@ -1429,6 +2085,150 @@ def _generate_xlsx_bank(
         r += 1
 
 
+def _generate_xlsx_reit(
+    ws, d, gp, label, val_dollar, val_pct, section_header,
+    BLUE_FILL, YELLOW_FILL, GREEN_FILL,
+):
+    """Populate the worksheet for a REIT (AFFO DDM model)."""
+    from openpyxl.styles import Font
+
+    r = 1
+    ws.cell(row=r, column=1,
+            value=f"{d['ent_name']} ({d['ticker']}) — AFFO Valuation").font = Font(bold=True, size=13)
+    r += 1
+    ws.cell(row=r, column=1,
+            value=f"REIT / AFFO DDM  |  {d['valuation_date']}  |  Industry: {d['industry']}")
+    r += 1
+    cik_val = d.get("cik", "")
+    cik_cell = ws.cell(row=r, column=1,
+                       value=f"SEC EDGAR CIK: {cik_val}" if cik_val else "SEC EDGAR CIK: —")
+    cik_cell.font = Font(color="0563C1", underline="single")
+    if cik_val:
+        cik_cell.hyperlink = (
+            f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
+            f"&CIK={cik_val}&type=10-K&dateb=&owner=include&count=10"
+        )
+    r += 2
+
+    # ---- Inputs --------------------------------------------------------
+    section_header(r, 1, "Inputs")
+    r += 1
+    inputs = [
+        ("Net Income (GAAP TTM)",            d["net_income"],      "dollar"),
+        ("Depreciation & Amortization",      d["da"],              "dollar"),
+        ("Recurring CapEx",                  d["capex"],           "dollar"),
+        ("FFO  (Net Income + D&A)",          d["ffo"],             "dollar"),
+        ("AFFO  (FFO − CapEx)",              d["affo"],            "dollar"),
+        ("Dividends Paid",                   d["dividends_paid"],  "dollar"),
+        ("Book Value of Equity",             d["bv_equity"],       "dollar"),
+        ("Return on Equity (ROE)",           d["roe"],             "pct"),
+        ("Payout Ratio (Dividends / AFFO)",  d["payout_ratio"],    "pct"),
+        ("Equity Retention Ratio",           d["retention_ratio"], "pct"),
+        ("Risk-free Rate",                   d["risk_free"],       "pct"),
+        ("Equity Risk Premium",              d["eq_prem"],         "pct"),
+        ("Beta",                             d["beta"],            "num"),
+        ("Cost of Equity",                   d["cost_of_equity"],  "pct"),
+    ]
+    for lbl, v, fmt in inputs:
+        label(r, 1, lbl)
+        if fmt == "dollar":
+            val_dollar(r, 2, v, BLUE_FILL)
+        elif fmt == "pct":
+            val_pct(r, 2, v, BLUE_FILL)
+        else:
+            c = ws.cell(row=r, column=2, value=v)
+            c.number_format = "0.00"
+            c.fill = BLUE_FILL
+        r += 1
+
+    r += 1
+
+    # ---- Parameters: High Growth vs Stable ----------------------------
+    section_header(r, 1, "Parameters")
+    label(r, 2, "High Growth", bold=True)
+    label(r, 3, "Stable", bold=True)
+    r += 1
+    params = [
+        ("Growth Rate",    d["growth_rate"],  "pct", d["stable_growth"]),
+        ("Payout Ratio",   d["payout_ratio"], "pct", 1 - d["stable_reinv"]),
+        ("Beta",           d["beta"],         "num", d["stable_beta"]),
+        ("Cost of Equity", d["cost_of_equity"], "pct", d["stable_cost_of_equity"]),
+    ]
+    for lbl, hg, fmt, st in params:
+        label(r, 1, lbl)
+        if fmt == "pct":
+            val_pct(r, 2, hg, YELLOW_FILL)
+            val_pct(r, 3, st, YELLOW_FILL)
+        else:
+            c = ws.cell(row=r, column=2, value=hg); c.number_format = "0.00"; c.fill = YELLOW_FILL
+            c2 = ws.cell(row=r, column=3, value=st); c2.number_format = "0.00"; c2.fill = YELLOW_FILL
+        r += 1
+
+    r += 1
+
+    # ---- Year-by-year AFFO projections --------------------------------
+    section_header(r, 1, f"Projected Dividends  (growth period = {gp} years)")
+    for col in range(1, gp + 1):
+        label(r, col + 2, f"Year {col}", bold=True)
+    r += 1
+
+    rows_proj = [
+        ("AFFO",            d["affo_n"]),
+        ("Dividends",       d["div_n"]),
+    ]
+    for row_lbl, vals in rows_proj:
+        label(r, 1, row_lbl)
+        for col, v in enumerate(vals, 1):
+            val_dollar(r, col + 2, v, None)
+        r += 1
+
+    # PV of dividends row
+    label(r, 1, "PV of Dividends (sum)")
+    val_dollar(r, 2, d["div_pv"], GREEN_FILL)
+    r += 2
+
+    # ---- Stable phase -------------------------------------------------
+    section_header(r, 1, "Stable Phase")
+    r += 1
+    stable_rows = [
+        ("Growth Rate in Stable Phase",          d["stable_growth"],                "pct"),
+        ("Reinvestment Rate in Stable Phase",     d["stable_reinv"],                 "pct"),
+        ("Cost of Equity in Stable Phase",        d["stable_cost_of_equity"],        "pct"),
+        ("Stable Dividend",                       d["stable_div"],                   "dollar"),
+        ("Terminal Value (undiscounted)",          d["terminal_value_undiscounted"],  "dollar"),
+        ("PV of Terminal Value",                  d["terminal_value_pv"],            "dollar"),
+    ]
+    for lbl, v, fmt in stable_rows:
+        label(r, 1, lbl)
+        if fmt == "dollar":
+            val_dollar(r, 2, v, BLUE_FILL)
+        else:
+            val_pct(r, 2, v, BLUE_FILL)
+        r += 1
+
+    r += 1
+
+    # ---- Valuation summary --------------------------------------------
+    section_header(r, 1, "Valuation Summary")
+    r += 1
+    val_rows = [
+        ("PV of Dividends (growth period)",  d["div_pv"],            "dollar"),
+        ("PV of Terminal Value",             d["terminal_value_pv"], "dollar"),
+        ("Equity Value",                     d["equity_value"],      "dollar"),
+        ("Intrinsic Value / Share",          d["intrinsic_value"],   "dollar"),
+        ("Current Price",                    d["price"],             "dollar"),
+        ("Margin of Safety ($)",             d["margin_of_safety"],  "dollar"),
+        ("Margin of Safety (%)",             d["margin_of_safety_pc"], "pct"),
+    ]
+    for lbl, v, fmt in val_rows:
+        label(r, 1, lbl)
+        if fmt == "dollar":
+            val_dollar(r, 2, v, GREEN_FILL)
+        else:
+            val_pct(r, 2, v, GREEN_FILL)
+        r += 1
+
+
 def generate_xlsx(d: dict, output_path: str) -> None:
     """Write a Damodaran-style FCFF valuation worksheet for a single stock."""
     from openpyxl import Workbook
@@ -1482,6 +2282,15 @@ def generate_xlsx(d: dict, output_path: str) -> None:
     ws.column_dimensions["C"].width = 14
     for col in range(4, 4 + gp):
         ws.column_dimensions[get_column_letter(col)].width = 12
+
+    if d.get("model") == "AFFO":
+        _generate_xlsx_reit(
+            ws, d, gp, label, val_dollar, val_pct, section_header,
+            BLUE_FILL, YELLOW_FILL, GREEN_FILL,
+        )
+        wb.save(output_path)
+        print(f"Saved: {output_path}")
+        return
 
     if d.get("model") == "FCFE":
         _generate_xlsx_bank(
@@ -1808,6 +2617,7 @@ def generate_summary_xlsx(
         row=2,
         column=1,
         value=f"Risk-free rate: {RISK_FREE * 100:.2f}%  |  ERP: {EQ_PREM * 100:.2f}%  |  "
+        f"Stable growth: {STABLE_GROWTH * 100:.1f}%  |  "
         f"Growth period: {GROWTH_PERIOD} yrs  |  Stocks valued: {len(valuations)}",
     ).font = Font(italic=True, color="666666")
 
@@ -1973,47 +2783,133 @@ def generate_summary_xlsx(
 # ---------------------------------------------------------------------------
 
 
+def refresh_market_data():
+    """
+    Fetch live ERP and risk-free rate, falling back to the module-level
+    constants on any failure. Deferred from module level so a slow/failed
+    network call doesn't block argument parsing or import. Callers that
+    import this module as a library (e.g. stock_analysis.py) must call
+    this explicitly — it does not run automatically except via main().
+    """
+    global EQ_PREM, RISK_FREE
+    try:
+        _erp = hg_dcflib.get_erp()
+        if _erp is None:
+            logger.warning(f"ERP returned None; using fallback {EQ_PREM:.4f}")
+        else:
+            EQ_PREM = _erp
+            logger.info(f"ERP: {EQ_PREM:.4f}")
+    except Exception as e:
+        logger.warning(f"ERP fetch failed ({e}); using fallback {EQ_PREM:.4f}")
+    try:
+        _rf = hg_dcflib.get_risk_free(FRED_KEY)
+        if _rf is None:
+            logger.warning(f"Risk-free rate returned None; using fallback {RISK_FREE:.4f}")
+        else:
+            RISK_FREE = _rf
+            logger.info(f"Risk-free: {RISK_FREE:.4f}")
+    except Exception as e:
+        logger.warning(f"Risk-free rate fetch failed ({e}); using fallback {RISK_FREE:.4f}")
+
+
 def main():
-    # Parse simple CLI args: --limit N  --growth N
-    args = sys.argv[1:]
-    limit = None
-    growth_period = GROWTH_PERIOD
+    parser = argparse.ArgumentParser(
+        description="HessGrp FCFF/FCFE valuation engine.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python av_fcff_2.py --ticker AAPL\n"
+            "  python av_fcff_2.py --index sp500 --limit 50\n"
+            "  python av_fcff_2.py --filings ~/HessGrp/data/pending_valuations_2026-04-22.json\n"
+            "  python av_fcff_2.py              # interactive menu"
+        ),
+    )
+    parser.add_argument("--ticker",   metavar="SYM", action="append",
+                        help="Value one or more stocks (repeat for multiple: --ticker AAPL --ticker JBL). Excel output + DB update.")
+    parser.add_argument("--index",    choices=["sp500", "r2000"],
+                        help="Batch valuation across S&P 500 or Russell 2000")
+    parser.add_argument("--filings",  metavar="FILE",
+                        help="Tickers from sec_daily_index JSON/xlsx/txt output")
+    parser.add_argument("--limit",    type=int, default=None, metavar="N",
+                        help="Cap batch to first N tickers")
+    parser.add_argument("--growth",   type=int, default=GROWTH_PERIOD, metavar="N",
+                        help=f"High-growth period in years (default {GROWTH_PERIOD})")
+    parser.add_argument("--db",       default=DEFAULT_DB, metavar="PATH",
+                        help="Path to valuation.db (default: $VALUATION_DB or /Volumes/Financial_Data/valuation.db)")
+    parser.add_argument("--equity-override", type=float, default=None, metavar="DOLLARS",
+                        help="Override shareholders' equity (in dollars) for all tickers in this run. "
+                             "Use when AV balance sheet data is known to be incorrect (e.g., PPG Q1 2026). "
+                             "Example: --equity-override 8104000000")
+    args = parser.parse_args()
 
-    i = 0
-    while i < len(args):
-        if args[i] == "--limit" and i + 1 < len(args):
-            limit = int(args[i + 1])
-            i += 2
-        elif args[i] == "--growth" and i + 1 < len(args):
-            growth_period = int(args[i + 1])
-            i += 2
-        else:
-            i += 1
+    growth_period = args.growth
 
-    tickers = []
+    global EQUITY_OVERRIDE
+    if args.equity_override is not None:
+        EQUITY_OVERRIDE = args.equity_override
+        print(f"  equity override active: ${EQUITY_OVERRIDE:,.0f}")
+    db_path       = args.db
+
+    # ---- Fetch market reference data (deferred from module level) --------
+    print("Fetching market reference data (ERP, risk-free rate)...")
+    refresh_market_data()
+    print(f"  ERP: {EQ_PREM:.4f}   Risk-free: {RISK_FREE:.4f}")
+
+    # ---- Determine run mode ---------------------------------------------
+    tickers      = []
     single_stock = False
+    ticker       = None
 
-    print("\nSelect index to value:")
-    print("  1. S&P 500")
-    print("  2. Russell 2000")
-    print("  3. Single stock")
-    while True:
-        choice = input("Choice [1/2/3]: ").strip()
-        if choice == "1":
-            tickers = get_sp500_tickers()
-            index_label = "sp500"
-            break
-        elif choice == "2":
-            tickers = get_russell2000_tickers()
-            index_label = "r2000"
-            break
-        elif choice == "3":
-            ticker = input("Enter ticker symbol: ").strip().upper()
-            index_label = ticker
+    if args.ticker:
+        ticker_list = [t.strip().upper() for t in args.ticker]
+        if len(ticker_list) == 1:
+            ticker       = ticker_list[0]
+            index_label  = ticker
             single_stock = True
-            break
         else:
-            print("Please enter 1, 2, or 3.")
+            tickers     = ticker_list
+            index_label = "+".join(ticker_list[:3]) + ("..." if len(ticker_list) > 3 else "")
+            print(f"\nTicker-list mode: valuing {len(tickers)} stocks")
+
+    elif args.filings:
+        if not os.path.exists(args.filings):
+            print(f"Error: filings file not found: {args.filings}", file=sys.stderr)
+            sys.exit(1)
+        tickers     = get_tickers_from_filings(args.filings)
+        index_label = "filings"
+        print(f"\nFilings mode: valuing {len(tickers)} stocks from {args.filings}")
+
+    elif args.index:
+        if args.index == "sp500":
+            tickers     = get_sp500_tickers()
+            index_label = "sp500"
+        else:
+            tickers     = get_russell2000_tickers()
+            index_label = "r2000"
+
+    else:
+        # Interactive fallback — used when launched from hess_menu
+        print("\nSelect index to value:")
+        print("  1. S&P 500")
+        print("  2. Russell 2000")
+        print("  3. Single stock")
+        while True:
+            choice = input("Choice [1/2/3]: ").strip()
+            if choice == "1":
+                tickers     = get_sp500_tickers()
+                index_label = "sp500"
+                break
+            elif choice == "2":
+                tickers     = get_russell2000_tickers()
+                index_label = "r2000"
+                break
+            elif choice == "3":
+                ticker       = input("Enter ticker symbol: ").strip().upper()
+                index_label  = ticker
+                single_stock = True
+                break
+            else:
+                print("Please enter 1, 2, or 3.")
 
     # ---- Single-stock path: Excel output + DB update --------------------
     if single_stock:
@@ -2025,23 +2921,26 @@ def main():
         if detail:
             generate_xlsx(detail, output_file)
             try:
-                db_conn = sqlite3.connect(
-                    "/Volumes/Financial_Data/valuation.db", timeout=30
-                )
+                db_conn = sqlite3.connect(db_path, timeout=30)
                 db_conn.execute("PRAGMA journal_mode=WAL")
                 create_table(db_conn)
                 insert_valuation(db_conn, _stock_value_from_detail(detail))
                 db_conn.close()
                 print(f"Valuation for {ticker} saved to database.")
+                _rescore_tickers(db_path, [ticker])
             except Exception as e:
                 logger.warning(f"DB write failed for {ticker}: {e}")
         else:
+            try:
+                industry = hg_dcflib.get_industry(ticker)
+            except Exception:
+                industry = ""
             print(f"Valuation failed for {ticker}.")
         return
 
-    # ---- Batch path: HTML output ----------------------------------------
-    if limit:
-        tickers = tickers[:limit]
+    # ---- Batch path: Excel output ---------------------------------------
+    if args.limit:
+        tickers = tickers[:args.limit]
 
     print(
         f"Valuing {len(tickers)} {index_label.upper()} stocks (growth period = {growth_period} years) ..."
@@ -2049,7 +2948,7 @@ def main():
 
     # Optionally write to DB
     try:
-        db_conn = sqlite3.connect("/Volumes/Financial_Data/valuation.db", timeout=30)
+        db_conn = sqlite3.connect(db_path, timeout=30)
         db_conn.execute("PRAGMA journal_mode=WAL")
         create_table(db_conn)
     except Exception:
@@ -2057,6 +2956,7 @@ def main():
         logger.warning("Database unavailable; skipping DB writes.")
 
     valuations = []
+    valued_tickers = []
     total = len(tickers)
     bar_width = 40
     start_time = time.time()
@@ -2064,6 +2964,7 @@ def main():
         result = value_stock(ticker, growth_period)
         if result:
             valuations.append(result)
+            valued_tickers.append(result.ticker)
             if db_conn:
                 try:
                     insert_valuation(db_conn, result)
@@ -2081,6 +2982,8 @@ def main():
 
     if db_conn:
         db_conn.close()
+
+    _rescore_tickers(db_path, valued_tickers)
 
     valuations.sort(key=lambda v: v.margin_of_safety, reverse=True)
 
