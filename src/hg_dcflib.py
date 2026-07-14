@@ -5,12 +5,136 @@ This library is a collection of functions used in the Hess Group DCF model.
 
 import os
 import sys
+import datetime
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import re
 import time
 import logging
+from pathlib import Path
+
+# Reference data directory — shared Damodaran tables used by all valuation functions.
+# Eliminates per-call Excel reads; each DataFrame is loaded once per process.
+# When frozen (compiled binary in ~/HessGrp/), data lives next to the executable.
+# When running from source, data lives in the dev tree.
+if getattr(sys, "frozen", False):
+    _DATA_DIR = Path(os.path.dirname(sys.executable)) / "data"
+else:
+    _DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent / "data"
+
+_indname_df: pd.DataFrame | None = None
+_betas_df: pd.DataFrame | None = None
+_default_spread_df: pd.DataFrame | None = None
+_rd_amort_df: pd.DataFrame | None = None
+
+# Damodaran annual data files — downloaded once per calendar year and cached locally.
+# Filenames follow the pattern <name>_YYYY<ext> (e.g. indname_2025.xlsx, betas_2025.xls).
+_DAMODARAN_SOURCES = {
+    "indname": {
+        "url": "https://pages.stern.nyu.edu/~adamodar/pc/datasets/indname.xlsx",
+        "ext": ".xlsx",
+    },
+    "betas": {
+        "url": "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls",
+        "ext": ".xls",
+    },
+}
+
+_DAMODARAN_HEADERS = {"User-Agent": "hg-dcf-model/1.0 jhess2@gmail.com"}
+
+
+def _get_damodaran_file(name: str) -> Path:
+    """Return path to a cached Damodaran reference file, downloading a fresh
+    copy for the current year if one does not already exist.  Falls back to
+    the most recent cached year file, then to the legacy bare filename."""
+    info = _DAMODARAN_SOURCES[name]
+    ext = info["ext"]
+    year = datetime.date.today().year
+    year_file = _DATA_DIR / f"{name}_{year}{ext}"
+
+    if not year_file.exists():
+        try:
+            resp = requests.get(info["url"], headers=_DAMODARAN_HEADERS, timeout=30)
+            resp.raise_for_status()
+            _DATA_DIR.mkdir(parents=True, exist_ok=True)
+            year_file.write_bytes(resp.content)
+            logging.getLogger(__name__).info(
+                f"Downloaded {name} {year} data ({len(resp.content):,} bytes) → {year_file.name}"
+            )
+            return year_file
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                f"Could not download {name} from Damodaran ({exc}); looking for cached copy"
+            )
+
+    if year_file.exists():
+        return year_file
+
+    # Most recent year-stamped file (either extension)
+    candidates = sorted(
+        p for p in _DATA_DIR.glob(f"{name}_[0-9][0-9][0-9][0-9]*") if p.suffix in (".xls", ".xlsx")
+    )
+    if candidates:
+        fallback = candidates[-1]
+        logging.getLogger(__name__).warning(
+            f"Using cached {fallback.name} for {name} (current-year download failed)"
+        )
+        return fallback
+
+    # Legacy bare filename
+    for legacy_ext in (".xlsx", ".xls"):
+        legacy = _DATA_DIR / f"{name}{legacy_ext}"
+        if legacy.exists():
+            logging.getLogger(__name__).warning(f"Using legacy {legacy.name} for {name}")
+            return legacy
+
+    raise FileNotFoundError(
+        f"No {name} data file found in {_DATA_DIR}. "
+        f"Check network access to {info['url']}"
+    )
+
+
+def _get_indname() -> pd.DataFrame:
+    global _indname_df
+    if _indname_df is None:
+        path = _get_damodaran_file("indname")
+        # Sheet was "US by Industry" in older files; current file uses "By industry"
+        xl = pd.ExcelFile(path)
+        sheet = next(
+            (s for s in xl.sheet_names if "industry" in s.lower() and "by" in s.lower()),
+            xl.sheet_names[0],
+        )
+        _indname_df = xl.parse(sheet)
+    return _indname_df
+
+
+def _get_betas() -> pd.DataFrame:
+    global _betas_df
+    if _betas_df is None:
+        path = _get_damodaran_file("betas")
+        _betas_df = pd.read_excel(
+            path,
+            sheet_name="Industry Averages",
+            skiprows=9,
+        )
+    return _betas_df
+
+
+def _get_default_spread() -> pd.DataFrame:
+    global _default_spread_df
+    if _default_spread_df is None:
+        _default_spread_df = pd.read_excel(_DATA_DIR / "defaultSpread.xlsx")
+    return _default_spread_df
+
+
+def _get_rd_amort() -> pd.DataFrame:
+    global _rd_amort_df
+    if _rd_amort_df is None:
+        _rd_amort_df = pd.read_excel(
+            _DATA_DIR / "RD_Amortization.xlsx", sheet_name="Amort Years"
+        )
+    return _rd_amort_df
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Set the overall logger level
@@ -40,7 +164,43 @@ file_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 logger.addHandler(file_handler)
 
-DELAY = 1.0 / 5  # 0.2 seconds between calls
+DELAY = 0.90  # 0.90 s between calls — ~67 calls/min, safely under AV's 75/min limit
+
+
+def _av_get(url: str) -> dict:
+    """
+    Fetch a single Alpha Vantage URL with:
+      - 15-second timeout (avoids indefinite hangs)
+      - Up to 3 attempts on network timeouts (5-second pause between retries)
+      - Detection of AV's in-band rate-limit / error responses
+        ('Note', 'Information', 'Error Message' keys in the JSON body)
+
+    Raises RuntimeError for rate-limit hits, access errors, and exhausted
+    retries so callers can handle them consistently.
+    """
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if "Note" in data:
+                raise RuntimeError(f"AV rate-limit: {data['Note']}")
+            if "Information" in data:
+                raise RuntimeError(f"AV access/info: {data['Information']}")
+            if "Error Message" in data:
+                raise RuntimeError(f"AV error: {data['Error Message']}")
+            return data
+        except RuntimeError:
+            raise  # Rate-limit / API errors: propagate immediately, don't retry
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts:
+                logger.warning(
+                    f"Timeout on attempt {attempt}/{max_attempts}, retrying in 5 s..."
+                )
+                time.sleep(5)
+            else:
+                raise RuntimeError(f"Timed out after {max_attempts} attempts: {url}")
 
 
 def safe_float(val):
@@ -55,9 +215,7 @@ def safe_float(val):
 
 def get_jsonparsed_data(url):
     time.sleep(DELAY)
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
+    return _av_get(url)
 
 
 # ---------------------------------------------------------------------------
@@ -99,19 +257,43 @@ def get_cik(ticker: str) -> str:
 # Function to get the income statement and extract the required fields
 
 
+def _q_ebit(q: dict) -> float:
+    """
+    Return operating income (EBIT proxy) for one quarterly report row.
+
+    AV's 'ebit' field = incomeBeforeTax + interestExpense, which inflates EBIT
+    for companies with large non-operating income (investment gains, interest
+    income on large cash piles). 'operatingIncome' is the correct field for FCFF.
+
+    Fall back to 'ebit' when:
+      - operatingIncome is absent or zero, OR
+      - operatingIncome and ebit have opposite signs (AV data error indicator —
+        e.g., AV NHC Q1 2026: operatingIncome = -$104M, ebit = +$45M, SEC = +$32M)
+    """
+    ebit_val = safe_float(q.get("ebit", 0) or 0)
+    oi = q.get("operatingIncome")
+    if oi not in (None, "None", ""):
+        val = safe_float(oi)
+        if val is not None and val != 0.0:
+            # If signs differ, one of them is wrong — trust ebit as the lesser evil
+            if ebit_val != 0 and (val > 0) != (ebit_val > 0):
+                return ebit_val
+            return val
+    return ebit_val
+
+
 def get_inc_stmnt(company: str, apiKey: str) -> dict:
-    time.sleep(DELAY)
     """Return annualized ebit, tax expense and interest expense
        from the quarterly reports of a ticker.
 
     The API returns up to 20 recent quarters; we aggregate them into at most five years.
     """
+    time.sleep(DELAY)
     url = (
         f"https://www.alphavantage.co/query?"
         f"function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
     )
-    resp = requests.get(url)
-    data = resp.json()
+    data = _av_get(url)
 
     # The API returns the most recent quarter first.
     quarterly_reports = data.get("quarterlyReports", [])
@@ -128,7 +310,7 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         if len(quarter_block) < 4:
             break  # incomplete year at the end of the list
 
-        ebit = sum(safe_float(q["ebit"]) for q in quarter_block)
+        ebit = sum(_q_ebit(q) for q in quarter_block)
         incomeBeforeTax = sum(safe_float(q["incomeBeforeTax"]) for q in quarter_block)
         tax_exp = sum(safe_float(q["incomeTaxExpense"]) for q in quarter_block)
         int_exp = sum(safe_float(q["interestExpense"]) for q in quarter_block)
@@ -155,6 +337,30 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
         "totalRevenue": [y["totalRevenue"] for y in yearly_data],
         "netIncome": [y["netIncome"] for y in yearly_data],
     }
+
+    # Detect single-quarter outlier driving a negative TTM EBIT.
+    # If removing the worst quarter flips TTM positive, flag it so callers can
+    # compute a normalized valuation alongside the GAAP result.
+    ebit_anomaly = None
+    if yearly_data and quarterly_reports:
+        ttm_quarters = quarterly_reports[:4]
+        q_ebits = [
+            (q.get("fiscalDateEnding", ""), _q_ebit(q))
+            for q in ttm_quarters
+        ]
+        ttm = sum(e for _, e in q_ebits)
+        if ttm < 0:
+            worst_idx = min(range(len(q_ebits)), key=lambda i: q_ebits[i][1])
+            worst_date, worst_ebit = q_ebits[worst_idx]
+            normalized_ttm = ttm - worst_ebit
+            if normalized_ttm > 0:
+                ebit_anomaly = {
+                    "quarter_date": worst_date,
+                    "quarter_ebit": worst_ebit,
+                    "normalized_ttm_ebit": normalized_ttm,
+                    "quarters": q_ebits,
+                }
+    income_statement["ebit_anomaly"] = ebit_anomaly
 
     return income_statement
 
@@ -237,9 +443,7 @@ def get_bal_sheet(company, apiKey):
         f"https://www.alphavantage.co/query?"
         f"function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
     )
-    resp = requests.get(url)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _av_get(url)
 
     quarterly_reports = data.get("quarterlyReports", [])
     if not quarterly_reports:
@@ -314,8 +518,7 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
         f"https://www.alphavantage.co/query?"
         f"function=CASH_FLOW&symbol={company}&apikey={apiKey}"
     )
-    resp = requests.get(url)
-    data = resp.json()
+    data = _av_get(url)
 
     quarterly_reports = data.get("quarterlyReports", [])
     if not quarterly_reports:
@@ -402,8 +605,7 @@ def get_rAndD(company, rd_years, apiKey):
     url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
 
     rd_table = {}
-    resp = requests.get(url)
-    data = resp.json()
+    data = _av_get(url)
     rdExpense = data.get("quarterlyReports", [])
 
     if not rdExpense:
@@ -457,7 +659,15 @@ def get_quote(company, apiKey):
     sharesOutstanding = safe_float(data["SharesOutstanding"])
     marketCap = safe_float(data["MarketCapitalization"])
     company_name = data["Name"]
-    entQuote = price, sharesOutstanding, marketCap, company_name
+    dividend_yield = safe_float(data.get("DividendYield", 0))
+    analyst_count = int(
+        safe_float(data.get("AnalystRatingStrongBuy", 0))
+        + safe_float(data.get("AnalystRatingBuy", 0))
+        + safe_float(data.get("AnalystRatingHold", 0))
+        + safe_float(data.get("AnalystRatingSell", 0))
+        + safe_float(data.get("AnalystRatingStrongSell", 0))
+    )
+    entQuote = price, sharesOutstanding, marketCap, company_name, dividend_yield, analyst_count
     return entQuote
 
 
@@ -496,10 +706,7 @@ _US_EXCHANGES = {
 
 
 def get_industry(company):
-    indName = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/indname.xlsx",
-        sheet_name="US by Industry",
-    )
+    indName = _get_indname()
 
     industry = None
     for index, row in indName.iterrows():
@@ -529,18 +736,14 @@ def get_industry(company):
 
 
 def get_beta(industry):
-    beta = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/betas.xlsx",
-        sheet_name="Industry Averages",
-        skiprows=9,
-    )
+    beta = _get_betas()
 
+    unleveredBeta = 1.0  # market-average default if industry not found
     for index, row in beta.iterrows():
         try:
             if industry in row["Industry Name"]:
                 unleveredBeta = row["Unlevered beta corrected for cash"]
-            else:
-                continue
+                break
         except TypeError:
             continue
 
@@ -549,12 +752,7 @@ def get_beta(industry):
 
 
 def get_default_spread(intCover):
-    defaultSpread = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/defaultSpread.xlsx"
-    )
-
-    # for col in defaultSpread.columns:
-    #     print(col)
+    defaultSpread = _get_default_spread()
 
     for index in defaultSpread.index:
         if (
@@ -564,27 +762,19 @@ def get_default_spread(intCover):
             return defaultSpread["Spread"][index]
         else:
             continue
-    # print(defa
-    # ultSpread)
-    # print(defaultSpread.index)
 
 
 def get_rAndD_years(industry):
-    amortYears = pd.read_excel(
-        "/Users/jhess/Development/Alpha2/data/RD_Amortization.xlsx",
-        sheet_name="Amort Years",
-    )
+    amortYears = _get_rd_amort()
 
+    rAndD_years = 0  # default: no R&D amortization if industry not found
     for index, row in amortYears.iterrows():
         try:
             if industry == row["Industry"]:
                 rAndD_years = row["Years"]
                 logger.info(f"Years = {rAndD_years}")
-            else:
-                continue
-        except TypeError:
-            continue
-        except AttributeError:
+                break
+        except (TypeError, AttributeError):
             continue
 
     return rAndD_years
