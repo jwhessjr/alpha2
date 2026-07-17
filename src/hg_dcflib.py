@@ -200,6 +200,13 @@ def _av_get(url: str) -> dict:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
             data = resp.json()
+            if not data:
+                # A genuinely successful AV response is never an empty JSON
+                # object for any endpoint we call — this is another shape of
+                # transient rate-limit rejection (confirmed 2026-07-17: 9
+                # tickers hit a downstream KeyError on 'SharesOutstanding'
+                # from get_quote() after OVERVIEW silently returned {}).
+                raise RuntimeError("AV returned an empty response (likely transient rate-limit)")
             if "Note" in data:
                 raise RuntimeError(f"AV rate-limit: {data['Note']}")
             if "Information" in data:
@@ -680,6 +687,11 @@ def get_quote(company, apiKey):
     url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={company}&apikey={apiKey}"
     data = get_jsonparsed_data(url)
     # print(data)
+    if "SharesOutstanding" not in data or "MarketCapitalization" not in data or "Name" not in data:
+        raise RuntimeError(
+            f"AV OVERVIEW response for {company} is missing required fields "
+            f"(SharesOutstanding/MarketCapitalization/Name) — likely no AV coverage for this symbol"
+        )
     sharesOutstanding = safe_float(data["SharesOutstanding"])
     marketCap = safe_float(data["MarketCapitalization"])
     company_name = data["Name"]
@@ -776,6 +788,16 @@ def get_beta(industry):
 
 
 def get_default_spread(intCover):
+    """
+    Look up Damodaran's default-spread bucket for an interest coverage ratio.
+
+    The source table has deliberate tiny gaps between buckets (e.g. LT=7.499999
+    for one row, GT=7.50 for the next) so adjacent ranges never double-match.
+    A ratio landing exactly on one of these round boundaries (7.5, 2.5, 2.0,
+    etc. — not rare; confirmed for CBT/CNK/EL 2026-07-17) falls in the gap and
+    previously returned None with no fallback, crashing calc_discount_rate()
+    downstream ("unsupported operand type(s) for +: 'float' and 'NoneType'").
+    """
     defaultSpread = _get_default_spread()
 
     for index in defaultSpread.index:
@@ -784,8 +806,29 @@ def get_default_spread(intCover):
             and intCover < defaultSpread["LT"][index]
         ):
             return defaultSpread["Spread"][index]
-        else:
-            continue
+
+    # Below the lowest bucket or above the highest — clamp to the extreme rating.
+    min_gt_idx = defaultSpread["GT"].idxmin()
+    max_lt_idx = defaultSpread["LT"].idxmax()
+    if intCover <= defaultSpread["GT"][min_gt_idx]:
+        return defaultSpread["Spread"][min_gt_idx]
+    if intCover >= defaultSpread["LT"][max_lt_idx]:
+        return defaultSpread["Spread"][max_lt_idx]
+
+    # Landed exactly in a gap between two buckets — match inclusively.
+    for index in defaultSpread.index:
+        if (
+            intCover >= defaultSpread["GT"][index]
+            and intCover <= defaultSpread["LT"][index]
+        ):
+            return defaultSpread["Spread"][index]
+
+    # Should be unreachable given the clamping above — never return None.
+    logger.warning(
+        f"get_default_spread: intCover={intCover} matched no bucket even after "
+        f"clamping — using worst-case (D2/D) spread"
+    )
+    return defaultSpread["Spread"][min_gt_idx]
 
 
 def get_rAndD_years(industry):
