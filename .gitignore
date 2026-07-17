@@ -7,7 +7,14 @@ fred_api.txt
 #data files created for testing in the running of the programs
 *.csv
 *.xlsx
+*.xls
 *.db
+
+# Exceptions: irreplaceable Damodaran reference files with no auto-download
+# fallback (see src/hg_dcflib.py _get_default_spread / _get_rd_amort) — track
+# in git since there is no other recovery path if these are ever lost.
+!/reference_data/defaultSpread.xlsx
+!/reference_data/RD_Amortization.xlsx
 
 # pdf files
 *.pdf

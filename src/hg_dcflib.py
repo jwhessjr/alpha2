@@ -17,12 +17,14 @@ from pathlib import Path
 
 # Reference data directory — shared Damodaran tables used by all valuation functions.
 # Eliminates per-call Excel reads; each DataFrame is loaded once per process.
+# Deliberately separate from data/ (generated output, cleaned by Oscar nightly) so
+# reference/source files can never be mistaken for stale duplicates and archived.
 # When frozen (compiled binary in ~/HessGrp/), data lives next to the executable.
 # When running from source, data lives in the dev tree.
 if getattr(sys, "frozen", False):
-    _DATA_DIR = Path(os.path.dirname(sys.executable)) / "data"
+    _DATA_DIR = Path(os.path.dirname(sys.executable)) / "reference_data"
 else:
-    _DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent / "data"
+    _DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent / "reference_data"
 
 _indname_df: pd.DataFrame | None = None
 _betas_df: pd.DataFrame | None = None
