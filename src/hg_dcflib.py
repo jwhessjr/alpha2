@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import time
+import random
 import logging
 from pathlib import Path
 
@@ -164,7 +165,15 @@ file_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 logger.addHandler(file_handler)
 
-DELAY = 0.90  # 0.90 s between calls — ~67 calls/min, safely under AV's 75/min limit
+DELAY = 0.90  # 0.90 s base delay between calls — ~67 calls/min, safely under AV's 75/min limit
+DELAY_JITTER = 0.40  # randomized 0-0.4s added on top of DELAY, so calls don't land on a
+                     # perfectly periodic schedule that can repeatedly brush the same
+                     # offset in AV's rolling 60-second rate-limit window
+_RATE_LIMIT_BACKOFFS = [5, 15]  # seconds to wait before each retry of an AV in-band error
+
+
+def _sleep_with_jitter():
+    time.sleep(DELAY + random.uniform(0, DELAY_JITTER))
 
 
 def _av_get(url: str) -> dict:
@@ -172,11 +181,16 @@ def _av_get(url: str) -> dict:
     Fetch a single Alpha Vantage URL with:
       - 15-second timeout (avoids indefinite hangs)
       - Up to 3 attempts on network timeouts (5-second pause between retries)
-      - Detection of AV's in-band rate-limit / error responses
-        ('Note', 'Information', 'Error Message' keys in the JSON body)
+      - Up to 3 attempts on AV's in-band rate-limit / error responses
+        ('Note', 'Information', 'Error Message' keys in the JSON body), with
+        backoff — AV's own "Error Message" text for these rejections literally
+        says "Please retry", and AV support confirmed premium-tier rejections
+        at our pacing are typically a rolling-60-second-window brush rather
+        than a hard cap, so a short backoff often clears it.
 
-    Raises RuntimeError for rate-limit hits, access errors, and exhausted
-    retries so callers can handle them consistently.
+    Raises RuntimeError only after retries on in-band errors are exhausted,
+    or after network timeouts are exhausted, so callers can handle both
+    consistently.
     """
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
@@ -191,8 +205,16 @@ def _av_get(url: str) -> dict:
             if "Error Message" in data:
                 raise RuntimeError(f"AV error: {data['Error Message']}")
             return data
-        except RuntimeError:
-            raise  # Rate-limit / API errors: propagate immediately, don't retry
+        except RuntimeError as e:
+            if attempt < max_attempts:
+                backoff = _RATE_LIMIT_BACKOFFS[attempt - 1]
+                logger.warning(
+                    f"AV in-band error on attempt {attempt}/{max_attempts} ({e}), "
+                    f"retrying in {backoff}s..."
+                )
+                time.sleep(backoff)
+            else:
+                raise
         except requests.exceptions.Timeout:
             if attempt < max_attempts:
                 logger.warning(
@@ -214,7 +236,7 @@ def safe_float(val):
 
 
 def get_jsonparsed_data(url):
-    time.sleep(DELAY)
+    _sleep_with_jitter()
     return _av_get(url)
 
 
@@ -288,7 +310,7 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 
     The API returns up to 20 recent quarters; we aggregate them into at most five years.
     """
-    time.sleep(DELAY)
+    _sleep_with_jitter()
     url = (
         f"https://www.alphavantage.co/query?"
         f"function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
@@ -438,7 +460,7 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 
 
 def get_bal_sheet(company, apiKey):
-    time.sleep(DELAY)
+    _sleep_with_jitter()
     url = (
         f"https://www.alphavantage.co/query?"
         f"function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
@@ -498,7 +520,7 @@ def get_bal_sheet(company, apiKey):
 
 
 def get_cash_flow(company: str, apiKey: str) -> dict:
-    time.sleep(DELAY)
+    _sleep_with_jitter()
     """
     Return annualized depreciation and cap‑ex from the quarterly cash‑flow data.
 
@@ -590,7 +612,7 @@ def get_erp():
 
 
 def get_rAndD(company, rd_years, apiKey):
-    time.sleep(DELAY)
+    _sleep_with_jitter()
     """
     Fetches R&D expenses for a specified number of years from Alpha Vantage.
 
