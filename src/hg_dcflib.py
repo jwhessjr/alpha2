@@ -787,6 +787,28 @@ def get_beta(industry):
     return unleveredBeta
 
 
+def get_industry_de(industry):
+    """
+    Industry-average D/E ratio from the same "Industry Averages" sheet get_beta()
+    already reads — used to cap (never raise) a company's stable-phase D/E in
+    calc_levered_beta(). See docs/decisions.md "Stable-phase capital structure"
+    for why this only ever caps down, not up.
+    """
+    beta = _get_betas()
+
+    industryDE = 1.0  # market-average-ish default if industry not found
+    for index, row in beta.iterrows():
+        try:
+            if industry in row["Industry Name"]:
+                industryDE = row["D/E Ratio"]
+                break
+        except TypeError:
+            continue
+
+    logger.info(f"Industry D/E {industryDE}")
+    return industryDE
+
+
 def get_default_spread(intCover):
     """
     Look up Damodaran's default-spread bucket for an interest coverage ratio.

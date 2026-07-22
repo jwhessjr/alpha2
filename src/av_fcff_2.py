@@ -552,18 +552,35 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
-def calc_levered_beta(unlevered_beta, bv_debt, market_cap_equity, tax_rate):
+def calc_levered_beta(unlevered_beta, bv_debt, market_cap_equity, tax_rate, de_cap=None):
+    """
+    de_cap (optional): caps the D/E ratio used for re-levering at this value if
+    the company's own D/E exceeds it — never raises D/E if the company's own is
+    already lower. Used only for the stable/terminal-phase beta (pass the
+    industry-average D/E via hg_dcflib.get_industry_de()) so an over-levered
+    company's assumed perpetual leverage is capped toward a typical level,
+    while an already-conservative company's IV is never inflated by assuming
+    more leverage than it actually carries. See docs/decisions.md "Stable-phase
+    capital structure" (decided 2026-07-22) — never pass de_cap for the
+    explicit-period beta, which must always use the company's actual own D/E.
+    """
     de_ratio = bv_debt / market_cap_equity if market_cap_equity > 0 else 0.0
+    if de_cap is not None:
+        de_ratio = min(de_ratio, de_cap)
     levered_beta = unlevered_beta * (1 + (1 - tax_rate) * de_ratio)
     logger.info(f"Levered beta = {levered_beta:,.4f} (unlevered {unlevered_beta:,.4f}, D/E {de_ratio:,.4f})")
     return levered_beta
 
 
-def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, eq_prem):
+def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, eq_prem, de_cap=None):
     # Re-lever the industry (unlevered) beta to this company's own capital
     # structure before computing cost of equity — see docs/known_errors.md
     # (2026-07-14: previously used the raw unlevered beta directly in CAPM).
-    levered_beta = calc_levered_beta(beta, bv_debt, market_cap_equity, MARGINAL_TAX_RATE)
+    # de_cap: pass hg_dcflib.get_industry_de(industry) when computing the
+    # stable/terminal-phase rate (beta = stable_beta) only — never for the
+    # explicit-period call. See docs/decisions.md "Stable-phase capital
+    # structure" (decided 2026-07-22).
+    levered_beta = calc_levered_beta(beta, bv_debt, market_cap_equity, MARGINAL_TAX_RATE, de_cap=de_cap)
     cost_of_equity = risk_free + (levered_beta * eq_prem)
     logger.info(f"COE = {cost_of_equity:,.4f}")
 
@@ -949,7 +966,10 @@ def value_bank_stock(ticker: str, growth_period: int):
         # --- Stable phase ---
         # In stable phase ROE converges to cost of equity (competitive equilibrium)
         stable_beta = calc_stable_beta(unlevered_beta)
-        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_levered_beta = calc_levered_beta(
+            stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE,
+            de_cap=hg_dcflib.get_industry_de(industry),
+        )
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth = STABLE_GROWTH
         stable_reinv = stable_growth / stable_cost_of_equity  # stable ROE = stable CoE
@@ -1125,7 +1145,8 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         fcff_pv = calc_fcff_value(fcff_table, discount_rate, growth_period)
 
         terminal_cost_of_capital = calc_discount_rate(
-            inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM
+            inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM,
+            de_cap=hg_dcflib.get_industry_de(industry),
         )
         terminal_value_pv = calc_terminal_value(
             fcff_table[-1],
@@ -1272,7 +1293,7 @@ def value_reit_stock(ticker: str, growth_period: int):
         div_pv = sum(div_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period))
 
         stable_beta             = calc_stable_beta(unlevered_beta)
-        stable_levered_beta     = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_levered_beta     = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity   = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth           = STABLE_GROWTH
         stable_reinv            = stable_growth / stable_cost_of_equity
@@ -1449,7 +1470,7 @@ def _value_bank_stock_detail(
         )
 
         stable_beta = calc_stable_beta(unlevered_beta)
-        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth = STABLE_GROWTH
         stable_reinv = stable_growth / stable_cost_of_equity
@@ -1570,7 +1591,7 @@ def _value_reit_stock_detail(
         div_pv = sum(div_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period))
 
         stable_beta           = calc_stable_beta(unlevered_beta)
-        stable_levered_beta   = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_levered_beta   = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth         = STABLE_GROWTH
         stable_reinv          = stable_growth / stable_cost_of_equity
@@ -1717,10 +1738,11 @@ def _value_stock_detail_fcff(
         )
 
         # Stable phase
-        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
+        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_cost_of_capital = calc_discount_rate(
-            inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM
+            inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM,
+            de_cap=hg_dcflib.get_industry_de(industry),
         )
         stable_growth = STABLE_GROWTH
         stable_reinv_rate = (
