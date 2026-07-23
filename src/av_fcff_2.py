@@ -285,8 +285,55 @@ def cash_flow_statement(ticker, api_key):
     return hg_dcflib.get_cash_flow(ticker, api_key)
 
 
+# Populated by prefetch_quotes() before a batch run — see that function's
+# docstring and docs/known_errors.md (2026-07-22) for why quote and
+# fundamentals calls are deliberately kept out of the same time window.
+_QUOTE_CACHE: dict = {}
+
+
 def enterprise_quote(ticker, api_key):
+    if ticker in _QUOTE_CACHE:
+        return _QUOTE_CACHE[ticker]
     return hg_dcflib.get_quote(ticker, api_key)
+
+
+def prefetch_quotes(tickers: list, api_key: str) -> None:
+    """
+    Fetch GLOBAL_QUOTE/OVERVIEW (via hg_dcflib.get_quote) for every ticker in
+    one contiguous batch, before any fundamentals calls (INCOME_STATEMENT/
+    BALANCE_SHEET/CASH_FLOW) begin, and cache the results in _QUOTE_CACHE.
+
+    Alpha Vantage support confirmed (2026-07-22) that interleaving GLOBAL_QUOTE
+    (real-time, entitlement-gated) with fundamentals calls for the same symbol
+    within the same short window can trip a per-minute micro-throttle separate
+    from the account's headline RPM cap — even when the overall request rate is
+    far under that cap (our own logs showed ~11-12 req/min, well under the 75/
+    min premium limit, still failing ~37% of tickers). Every one of our 6
+    duplicated valuation paths calls the shared enterprise_quote() wrapper
+    above, so caching there fixes all 6 without touching any of them — see
+    value_bank_stock, _value_stock_fcff, value_reit_stock,
+    _value_bank_stock_detail, _value_reit_stock_detail, _value_stock_detail_fcff.
+
+    Per-ticker failures here are logged and simply left out of the cache —
+    enterprise_quote() falls back to a live call for anything not cached, so a
+    prefetch miss degrades to the old (interleaved) behavior for that one
+    ticker rather than blocking the whole run.
+    """
+    total = len(tickers)
+    bar_width = 40
+    start_time = time.time()
+    for idx, ticker in enumerate(tickers, 1):
+        try:
+            _QUOTE_CACHE[ticker] = hg_dcflib.get_quote(ticker, api_key)
+        except Exception as e:
+            logger.warning(f"Prefetch quote failed for {ticker}: {e}")
+        filled = int(bar_width * idx / total)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        elapsed = int(time.time() - start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        print(f"\r  quotes {idx}/{total} [{bar}] {h:02d}:{m:02d}:{s:02d}", end="", flush=True)
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -2965,6 +3012,12 @@ def main():
         tickers = tickers[:args.limit]
 
     print(
+        f"Prefetching quotes for {len(tickers)} tickers (separate batch — "
+        f"see docs/known_errors.md 2026-07-22 AV support guidance)..."
+    )
+    prefetch_quotes(tickers, MY_API_KEY)
+
+    print(
         f"Valuing {len(tickers)} {index_label.upper()} stocks (growth period = {growth_period} years) ..."
     )
 
@@ -2979,6 +3032,7 @@ def main():
 
     valuations = []
     valued_tickers = []
+    failed_tickers = []
     total = len(tickers)
     bar_width = 40
     start_time = time.time()
@@ -2992,6 +3046,8 @@ def main():
                     insert_valuation(db_conn, result)
                 except Exception as e:
                     logger.warning(f"DB insert failed for {ticker}: {e}")
+        else:
+            failed_tickers.append(ticker)
 
         filled = int(bar_width * idx / total)
         bar = "#" * filled + "-" * (bar_width - filled)
@@ -3001,6 +3057,44 @@ def main():
         print(f"\r  {idx}/{total} [{bar}] {h:02d}:{m:02d}:{s:02d}", end="", flush=True)
 
     print()  # newline after progress bar
+
+    # Second pass: retry tickers that failed on the first pass, after one
+    # deliberate cool-off. AV support confirmed (2026-07-22) that a longer
+    # cool-off clears transient per-minute micro-throttles better than our
+    # existing fast in-place retries (5s/15s) alone — every retry sequence in
+    # the run that prompted this fix exhausted both in-place retries without
+    # ever succeeding. Rather than stretching the in-place backoff to AV's
+    # suggested 60-90s ceiling (which would multiply added runtime across
+    # every failing ticker on the first pass), we pay one 60s cool-off ONCE
+    # here and then reuse the same fast in-place retries for the smaller
+    # failed-only subset — cheaper, and this is also exactly the workflow
+    # TASK-109/114/115 already proved out manually (re-run the stale subset
+    # after time has passed), just automated into a single run.
+    if failed_tickers:
+        print(
+            f"\n{len(failed_tickers)} ticker(s) failed on first pass — "
+            f"retrying after a 60s cool-off..."
+        )
+        time.sleep(60)
+        retry_total = len(failed_tickers)
+        for idx, ticker in enumerate(failed_tickers, 1):
+            result = value_stock(ticker, growth_period)
+            if result:
+                valuations.append(result)
+                valued_tickers.append(result.ticker)
+                if db_conn:
+                    try:
+                        insert_valuation(db_conn, result)
+                    except Exception as e:
+                        logger.warning(f"DB insert failed for {ticker}: {e}")
+            print(f"\r  retry {idx}/{retry_total}", end="", flush=True)
+        print()
+        still_failed = [t for t in failed_tickers if t not in valued_tickers]
+        if still_failed:
+            print(
+                f"{len(still_failed)} ticker(s) still failed after retry pass: "
+                f"{', '.join(still_failed)}"
+            )
 
     if db_conn:
         db_conn.close()
