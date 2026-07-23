@@ -27,6 +27,7 @@ from pathlib import Path as _Path
 # in HessGrp/lib), without shadowing a same-directory hg_dcflib.py copy.
 _sys.path.append(str(_Path.home() / "HessGrp" / "lib"))
 import hg_dcflib
+import json
 import logging
 import os
 import sys
@@ -334,6 +335,40 @@ def prefetch_quotes(tickers: list, api_key: str) -> None:
         m, s = divmod(rem, 60)
         print(f"\r  quotes {idx}/{total} [{bar}] {h:02d}:{m:02d}:{s:02d}", end="", flush=True)
     print()
+
+
+def get_excluded_tickers() -> set:
+    """
+    Load the permanently-excluded ticker set from data/excluded_tickers.json.
+
+    Found 2026-07-23: this file was previously read only by Iggy's SKILL.md
+    orchestration (hess_group/scheduled/iggy-valuation-update/SKILL.md), and
+    only to strip excluded tickers from the *next day's* retry file — never to
+    skip them within the same run. Every batch run was still attempting (and,
+    since the 2026-07-22 second-pass retry queue, re-attempting) every
+    excluded ticker before that filtering ever kicked in. This wires the same
+    file directly into the batch loop so excluded tickers are skipped before
+    the first attempt, not just before tomorrow's retry.
+
+    Resolves the file the same way hg_dcflib.py resolves reference_data/: try
+    the path relative to this script's own location first (so a duplicated
+    copy in Development/Alpha2 would be preferred there), falling back to the
+    fixed ~/HessGrp/data/ path since this file is HessGrp-specific and has no
+    Alpha2 counterpart today. See docs/known_errors.md 2026-07-14 entry for
+    the same fallback pattern used for logging_setup.py/hg_dcflib.py.
+    """
+    candidates = [
+        _Path(os.path.abspath(__file__)).parent.parent / "data" / "excluded_tickers.json",
+        _Path.home() / "HessGrp" / "data" / "excluded_tickers.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                with open(path) as f:
+                    return set(t.upper() for t in json.load(f).get("tickers", []))
+            except Exception as e:
+                logger.warning(f"Could not load excluded_tickers.json at {path}: {e}")
+    return set()
 
 
 # ---------------------------------------------------------------------------
@@ -3010,6 +3045,24 @@ def main():
     # ---- Batch path: Excel output ---------------------------------------
     if args.limit:
         tickers = tickers[:args.limit]
+
+    # Skip permanently-excluded tickers before the first attempt, not just
+    # before tomorrow's Iggy-level retry filtering — see get_excluded_tickers()
+    # docstring and docs/known_errors.md 2026-07-23. Batch modes only: a
+    # deliberate multi-ticker request (e.g. --ticker A --ticker B) still goes
+    # through this filter since it's the same "many tickers, one run" pattern
+    # this exists to protect; true single-stock mode is handled separately
+    # above and is never filtered, so a one-off re-check of an excluded ticker
+    # (exactly how the 2026-07-23 exclusions were themselves verified) still works.
+    excluded = get_excluded_tickers()
+    if excluded:
+        already_excluded = [t for t in tickers if t.upper() in excluded]
+        if already_excluded:
+            print(
+                f"  Skipping {len(already_excluded)} permanently-excluded ticker(s) "
+                f"(see data/excluded_tickers.json): {', '.join(already_excluded)}"
+            )
+            tickers = [t for t in tickers if t.upper() not in excluded]
 
     print(
         f"Prefetching quotes for {len(tickers)} tickers (separate batch — "
