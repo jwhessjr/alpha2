@@ -468,6 +468,28 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 #     return balSht
 
 
+def _q_cash_and_sti(q: dict) -> float:
+    """
+    Cash + short-term investments for one AV BALANCE_SHEET quarterly report.
+
+    AV's own pre-aggregated "cashAndShortTermInvestments" field is not
+    reliably the sum of its two components — confirmed for GOOG (2026-07-31):
+    it returned a value identical to cashAndCashEquivalentsAtCarryingValue
+    alone, silently dropping $186.6B of shortTermInvestments. That left
+    short-term investments trapped inside "non-cash working capital",
+    inflating calc_chng_wc()'s reinvestment estimate by roughly the same
+    amount and pinning the reinvestment rate at its 100% cap. Same class of
+    problem as AV's `ebit` field (see _q_ebit() in av_fcff_2.py) — prefer the
+    granular components over AV's own pre-summed convenience field.
+    """
+    granular = safe_float(q.get("cashAndCashEquivalentsAtCarryingValue")) + safe_float(
+        q.get("shortTermInvestments")
+    )
+    if granular > 0:
+        return granular
+    return safe_float(q.get("cashAndShortTermInvestments"))
+
+
 def get_bal_sheet(company, apiKey):
     _sleep_with_jitter()
     url = (
@@ -503,7 +525,7 @@ def get_bal_sheet(company, apiKey):
             break  # incomplete year, skip
 
         q = block[0]  # most recent quarter of this annual period
-        cash_and_equivalents.append(safe_float(q["cashAndShortTermInvestments"]))
+        cash_and_equivalents.append(_q_cash_and_sti(q))
         total_current_assets.append(safe_float(q["totalCurrentAssets"]))
         total_current_liabilities.append(safe_float(q["totalCurrentLiabilities"]))
         short_term_debt.append(safe_float(q["shortTermDebt"]))
