@@ -714,13 +714,44 @@ def calc_fcff_value(fcff_table, discount_rate, growth_period):
     return fcff_value
 
 
+def calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital):
+    """
+    Stable-phase reinvestment rate: stable_growth / stable_cost_of_capital,
+    i.e. ROIC converges to WACC in stable growth (no permanent excess
+    returns) — the same assumption already used in value_bank_stock()'s and
+    value_reit_stock()'s terminal value. See docs/known_errors.md 2026-07-31.
+    """
+    if stable_cost_of_capital <= 0:
+        return 0.0
+    return min(max(stable_growth / stable_cost_of_capital, 0.0), 1.0)
+
+
 def calc_terminal_value(
-    fcff_last, stable_cost_of_capital, growth_cost_of_capital, stable_growth, growth_period
+    ebit_last, eff_tax_rate, stable_cost_of_capital, growth_cost_of_capital,
+    stable_growth, growth_period
 ):
-    terminal_value = (fcff_last * (1 + stable_growth)) / (
-        stable_cost_of_capital - stable_growth
-    )
+    """
+    Terminal value at the end of the explicit high-growth period, discounted
+    back to present.
+
+    Terminal-year FCFF is recomputed at the stable-phase reinvestment rate
+    (see calc_stable_reinvestment_rate()) rather than carrying forward the
+    explicit period's — typically much higher — reinvestment rate. The
+    previous version grew the last explicit year's FCFF by stable_growth
+    directly, with no adjustment to reinvestment even though growth had just
+    dropped from (say) double digits to 3% — understating terminal FCFF (and
+    hence terminal value, usually 70-90%+ of total DCF value) for any company
+    whose explicit reinvestment rate exceeds what stable growth actually
+    requires, which is true for nearly every profitable growth company. See
+    docs/known_errors.md 2026-07-31.
+    """
+    stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
+    terminal_ebit = ebit_last * (1 + stable_growth)
+    terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
+    fcff_terminal = terminal_ebiat * (1 - stable_reinv_rate)
+    terminal_value = fcff_terminal / (stable_cost_of_capital - stable_growth)
     terminal_value_pv = terminal_value / ((1 + growth_cost_of_capital) ** growth_period)
+    logger.info(f"Stable reinvestment rate = {stable_reinv_rate:,.4f}")
     logger.info(f"Terminal Value = {terminal_value_pv:,.2f}")
     return terminal_value_pv
 
@@ -1230,8 +1261,10 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM,
             de_cap=hg_dcflib.get_industry_de(industry),
         )
+        ebit_last = adjusted_ebit * (1 + growth_rate) ** growth_period
         terminal_value_pv = calc_terminal_value(
-            fcff_table[-1],
+            ebit_last,
+            eff_tax_rate,
             terminal_cost_of_capital,
             discount_rate,
             STABLE_GROWTH,
@@ -1827,9 +1860,7 @@ def _value_stock_detail_fcff(
             de_cap=hg_dcflib.get_industry_de(industry),
         )
         stable_growth = STABLE_GROWTH
-        stable_reinv_rate = (
-            stable_growth / return_on_capital if return_on_capital != 0 else 0
-        )
+        stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
 
         # Year-by-year FCFF projections
         ebit_n, ebiat_n, reinv_n, fcff_n = [], [], [], []
@@ -1846,7 +1877,13 @@ def _value_stock_detail_fcff(
             fcff_n[y] / (1 + discount_rate) ** (y + 1) for y in range(growth_period)
         )
 
-        stable_fcff = fcff_n[-1] * (1 + stable_growth)
+        # Terminal-year FCFF is recomputed at the stable-phase reinvestment
+        # rate rather than carrying forward the explicit period's (typically
+        # much higher) reinvestment rate — see calc_terminal_value() and
+        # docs/known_errors.md 2026-07-31.
+        terminal_ebit = ebit_n[-1] * (1 + stable_growth)
+        terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
+        stable_fcff = terminal_ebiat * (1 - stable_reinv_rate)
         terminal_value_undiscounted = stable_fcff / (
             stable_cost_of_capital - stable_growth
         )
@@ -1900,10 +1937,11 @@ def _value_stock_detail_fcff(
                     norm_reinv_rate, growth_period
                 )
                 norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, growth_period)
-                norm_stable_fcff = norm_fcff_table[-1] * (1 + stable_growth)
-                norm_tv_pv = (
-                    norm_stable_fcff / (stable_cost_of_capital - stable_growth)
-                ) / (1 + discount_rate) ** growth_period
+                norm_ebit_last = norm_adjusted_ebit * (1 + norm_growth_rate) ** growth_period
+                norm_tv_pv = calc_terminal_value(
+                    norm_ebit_last, eff_tax_rate, stable_cost_of_capital,
+                    discount_rate, stable_growth, growth_period,
+                )
                 norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
                 norm_intrinsic_value = norm_ev / shares_outstanding
 
