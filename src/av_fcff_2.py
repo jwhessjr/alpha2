@@ -1292,6 +1292,22 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         else:
             logger.info("Wealth Destroyer")
 
+        # Write the row even when the model produces a non-positive intrinsic
+        # value rather than skipping it — a skip is indistinguishable in
+        # valuation.db from "not yet attempted" or "rate-limited," which both
+        # (a) erases why the ticker has no usable value and (b) causes every
+        # future batch run to re-attempt it from scratch, burning an AV call
+        # every night on a company whose negative EBIT isn't going to
+        # un-happen tomorrow (same self-perpetuating-retry shape as the BK
+        # bug in docs/known_errors.md). Flagging via `notes` instead lets a
+        # query filter these out cheaply while preserving the audit trail —
+        # see docs/known_errors.md 2026-07-31 "Negative FCFF intrinsic values".
+        notes = (
+            "Model produced non-positive intrinsic value — negative/deteriorating "
+            "fundamentals; DCF result may not be economically meaningful"
+            if intrinsic_value <= 0 else ""
+        )
+
         return Stock_Value(
             ticker=ticker,
             valuation_date=valuation_date,
@@ -1316,6 +1332,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             earnings_yield=earnings_yield,
             dividend_yield=dividend_yield,
             analyst_count=analyst_count,
+            notes=notes,
         )
 
     except Exception as e:
@@ -1418,12 +1435,21 @@ def value_reit_stock(ticker: str, growth_period: int):
 
         equity_value    = div_pv + terminal_value_pv
         intrinsic_value = equity_value / shares_outstanding
+        # Write the row even when AFFO/growth-vs-CoE math produces a
+        # non-positive IV rather than skipping — see the matching comment in
+        # _value_stock_fcff() and docs/known_errors.md 2026-07-31 "Negative
+        # FCFF intrinsic values" for why a skip is worse than a flagged row.
+        notes = ""
         if intrinsic_value <= 0:
             logger.warning(
-                f"Skipping {ticker}: AFFO model produced non-positive IV "
+                f"{ticker}: AFFO model produced non-positive IV "
                 f"({intrinsic_value:.2f}) — negative AFFO or growth ≥ CoE"
             )
-            return None
+            notes = (
+                "AFFO model produced non-positive intrinsic value — negative "
+                "AFFO or growth ≥ cost of equity; DCF result may not be "
+                "economically meaningful"
+            )
         safety_margin   = float(intrinsic_value - price)
         safety_margin_pc = (1 - price / intrinsic_value) if intrinsic_value != 0 else 0.0
         wealth_pc       = roe - cost_of_equity
@@ -1455,6 +1481,7 @@ def value_reit_stock(ticker: str, growth_period: int):
             earnings_yield=0.0,
             dividend_yield=dividend_yield,
             analyst_count=analyst_count,
+            notes=notes,
         )
 
     except Exception as e:
