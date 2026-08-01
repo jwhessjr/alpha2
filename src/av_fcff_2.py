@@ -3019,6 +3019,32 @@ def generate_summary_xlsx(
 # ---------------------------------------------------------------------------
 
 
+def _write_market_data_status(erp_status: dict, risk_free_status: dict) -> None:
+    """
+    Record refresh_market_data()'s outcome to data/market_data_fetch_status.json
+    so Iggy's nightly valuation report can surface a fetch failure to Jim (see
+    iggy-valuation-update SKILL.md's "Notes for Addie" section).
+
+    get_erp()/get_risk_free() have no timeout or retry (unlike hg_dcflib's AV
+    fetchers) — a hang or failure here previously only produced a logger.warning
+    line nobody would see until this file existed. Best-effort: a failure to
+    write this status file is logged but never blocks a valuation run.
+    """
+    status_path = _Path(os.path.abspath(__file__)).parent.parent / "data" / "market_data_fetch_status.json"
+    try:
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(status_path, "w") as f:
+            json.dump({
+                "date": date.today().isoformat(),
+                "erp": erp_status,
+                "risk_free": risk_free_status,
+                "eq_prem_used": EQ_PREM,
+                "risk_free_used": RISK_FREE,
+            }, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not write market_data_fetch_status.json: {e}")
+
+
 def refresh_market_data():
     """
     Fetch live ERP and risk-free rate, falling back to the module-level
@@ -3026,26 +3052,37 @@ def refresh_market_data():
     network call doesn't block argument parsing or import. Callers that
     import this module as a library (e.g. stock_analysis.py) must call
     this explicitly — it does not run automatically except via main().
+
+    Always records the outcome via _write_market_data_status(), even on
+    success — see that function's docstring for why.
     """
     global EQ_PREM, RISK_FREE
+    erp_status = {"ok": True, "error": None}
+    risk_free_status = {"ok": True, "error": None}
     try:
         _erp = hg_dcflib.get_erp()
         if _erp is None:
+            erp_status = {"ok": False, "error": "get_erp() returned None (no Implied ERP % parsed)"}
             logger.warning(f"ERP returned None; using fallback {EQ_PREM:.4f}")
         else:
             EQ_PREM = _erp
             logger.info(f"ERP: {EQ_PREM:.4f}")
     except Exception as e:
+        erp_status = {"ok": False, "error": str(e)}
         logger.warning(f"ERP fetch failed ({e}); using fallback {EQ_PREM:.4f}")
     try:
         _rf = hg_dcflib.get_risk_free(FRED_KEY)
         if _rf is None:
+            risk_free_status = {"ok": False, "error": "get_risk_free() returned None (non-200 FRED response)"}
             logger.warning(f"Risk-free rate returned None; using fallback {RISK_FREE:.4f}")
         else:
             RISK_FREE = _rf
             logger.info(f"Risk-free: {RISK_FREE:.4f}")
     except Exception as e:
+        risk_free_status = {"ok": False, "error": str(e)}
         logger.warning(f"Risk-free rate fetch failed ({e}); using fallback {RISK_FREE:.4f}")
+
+    _write_market_data_status(erp_status, risk_free_status)
 
 
 def main():
