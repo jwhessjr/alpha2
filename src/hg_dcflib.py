@@ -610,12 +610,40 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
 # function to retrieve R&D expense so we can capitalize it
 
 
+def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
+    """
+    Shared timeout+retry wrapper for get_erp()/get_risk_free()'s network
+    calls — mirrors _av_get()'s network-retry behavior (15s timeout, up to
+    3 attempts, 5s pause between) but without AV's in-band rate-limit-response
+    handling, which doesn't apply to these two non-AV endpoints (Damodaran's
+    ERP page, FRED's API). Added because both functions previously made a
+    bare, unbounded requests.get() call — a hang here stalls
+    refresh_market_data() (and therefore the whole nightly batch, which calls
+    it once at the very start) indefinitely, with nothing to catch it.
+
+    Raises requests.exceptions.Timeout after retries are exhausted. Does not
+    inspect status codes or body content — callers keep their own post-fetch
+    handling exactly as before.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts:
+                logger.warning(
+                    f"Timeout on attempt {attempt}/{max_attempts} for {url}, retrying in 5s..."
+                )
+                time.sleep(5)
+            else:
+                raise
+
+
 def get_erp():
     # URL of the page
     url = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/home.htm"  # Replace with the correct full URL if deeper than homepage
 
     # Fetch the page
-    response = requests.get(url)
+    response = _get_with_retry(url)
     response.raise_for_status()  # Raises an error if the request failed
 
     # Parse the HTML
@@ -739,7 +767,11 @@ def get_risk_free(FRED_KEY):
         "limit": 1,
     }
     # Fetch data
-    response = requests.get(url, params=params)
+    try:
+        response = _get_with_retry(url, params=params)
+    except requests.exceptions.Timeout:
+        logger.debug(f"Timed out fetching risk-free rate after retries: {url}")
+        return None
 
     if response.status_code != 200:
         logger.debug(f"Error: Received status code {response.status_code}")
