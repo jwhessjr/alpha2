@@ -78,6 +78,16 @@ RISK_FREE: float = 0.0425  # approximate 10-yr Treasury fallback
 STABLE_GROWTH: float = 0.030  # long-run US nominal GDP growth rate (Damodaran ceiling: <= risk-free)
 EQUITY_OVERRIDE: float | None = None  # set via --equity-override; bypasses AV balance sheet equity pull
 
+# Moat-gated stable-phase ROIC blend (decided 2026-08-01, see docs/decisions.md
+# and docs/known_errors.md). weight=0 (moat_rating "None" or no moat_scores
+# row) reproduces pure g/WACC convergence — Damodaran's own conservative
+# default, no persistent excess returns. weight=1 (Wide moat, sustained
+# >= MOAT_CONFIDENCE_YEARS) assumes full ROIC persistence. Narrow/Questionable
+# interpolate. Confidence in a moat rating is throttled by years_above_wacc
+# (scripts/moat_score.py) so one good quarter can't buy a decade of credit.
+MOAT_CONFIDENCE_YEARS = 5
+MOAT_BASE_WEIGHT = {"Wide": 1.0, "Narrow": 0.5, "Questionable": 0.15, "None": 0.0}
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -369,6 +379,38 @@ def get_excluded_tickers() -> set:
             except Exception as e:
                 logger.warning(f"Could not load excluded_tickers.json at {path}: {e}")
     return set()
+
+
+def get_moat_weight(ticker: str, db_path: str | None = None) -> float:
+    """
+    Blend weight toward full stable-phase ROIC persistence, gated on
+    scripts/moat_score.py's moat_rating and years_above_wacc — see
+    MOAT_BASE_WEIGHT/MOAT_CONFIDENCE_YEARS above and docs/decisions.md
+    "Moat-gated stable-phase ROIC assumption" (decided 2026-08-01).
+
+    Missing moat_scores row, missing table, or any read failure all degrade
+    to weight 0.0 — i.e. pure WACC-convergence, the same behavior as before
+    this feature existed. A missing/stale moat score should never make a
+    valuation *more* optimistic than the conservative default.
+    """
+    try:
+        conn = sqlite3.connect(db_path or DEFAULT_DB, timeout=10)
+        row = conn.execute(
+            "SELECT moat_rating, years_above_wacc FROM moat_scores WHERE ticker = ?",
+            (ticker,),
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"{ticker}: could not read moat_scores ({e}) — moat weight 0.0")
+        return 0.0
+
+    if row is None:
+        return 0.0
+
+    moat_rating, years_above_wacc = row
+    base = MOAT_BASE_WEIGHT.get(moat_rating, 0.0)
+    confidence = min(years_above_wacc / MOAT_CONFIDENCE_YEARS, 1.0) if years_above_wacc else 0.0
+    return base * confidence
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +770,7 @@ def calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital):
 
 def calc_terminal_value(
     ebit_last, eff_tax_rate, stable_cost_of_capital, growth_cost_of_capital,
-    stable_growth, growth_period
+    stable_growth, growth_period, moat_weight=0.0, explicit_roic=None
 ):
     """
     Terminal value at the end of the explicit high-growth period, discounted
@@ -744,8 +786,21 @@ def calc_terminal_value(
     whose explicit reinvestment rate exceeds what stable growth actually
     requires, which is true for nearly every profitable growth company. See
     docs/known_errors.md 2026-07-31.
+
+    moat_weight / explicit_roic (optional): blend the stable-phase
+    reinvestment rate toward full ROIC persistence (weight=1) instead of
+    pure WACC-convergence (weight=0, the default — identical to the
+    2026-07-31 behavior). See get_moat_weight() and docs/known_errors.md
+    2026-08-01 "Moat-gated stable-phase ROIC assumption".
     """
-    stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
+    if moat_weight and explicit_roic is not None:
+        assumed_stable_roic = stable_cost_of_capital + moat_weight * (explicit_roic - stable_cost_of_capital)
+        if assumed_stable_roic > 0:
+            stable_reinv_rate = min(max(stable_growth / assumed_stable_roic, 0.0), 1.0)
+        else:
+            stable_reinv_rate = 1.0
+    else:
+        stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
     terminal_ebit = ebit_last * (1 + stable_growth)
     terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
     fcff_terminal = terminal_ebiat * (1 - stable_reinv_rate)
@@ -1262,6 +1317,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             de_cap=hg_dcflib.get_industry_de(industry),
         )
         ebit_last = adjusted_ebit * (1 + growth_rate) ** growth_period
+        moat_weight = get_moat_weight(ticker)
         terminal_value_pv = calc_terminal_value(
             ebit_last,
             eff_tax_rate,
@@ -1269,6 +1325,8 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             discount_rate,
             STABLE_GROWTH,
             growth_period,
+            moat_weight=moat_weight,
+            explicit_roic=return_on_capital,
         )
         intrinsic_value = calc_intrinsic_value(
             fcff_pv,
@@ -1887,7 +1945,15 @@ def _value_stock_detail_fcff(
             de_cap=hg_dcflib.get_industry_de(industry),
         )
         stable_growth = STABLE_GROWTH
-        stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
+        moat_weight = get_moat_weight(ticker)
+        if moat_weight:
+            assumed_stable_roic = stable_cost_of_capital + moat_weight * (return_on_capital - stable_cost_of_capital)
+            stable_reinv_rate = (
+                min(max(stable_growth / assumed_stable_roic, 0.0), 1.0)
+                if assumed_stable_roic > 0 else 1.0
+            )
+        else:
+            stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
 
         # Year-by-year FCFF projections
         ebit_n, ebiat_n, reinv_n, fcff_n = [], [], [], []
@@ -1968,6 +2034,7 @@ def _value_stock_detail_fcff(
                 norm_tv_pv = calc_terminal_value(
                     norm_ebit_last, eff_tax_rate, stable_cost_of_capital,
                     discount_rate, stable_growth, growth_period,
+                    moat_weight=moat_weight, explicit_roic=norm_return_on_capital,
                 )
                 norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
                 norm_intrinsic_value = norm_ev / shares_outstanding
