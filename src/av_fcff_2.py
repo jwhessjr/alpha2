@@ -1140,7 +1140,9 @@ def value_bank_stock(ticker: str, growth_period: int):
         )
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth = STABLE_GROWTH
-        stable_reinv = stable_growth / stable_cost_of_equity  # stable ROE = stable CoE
+        # stable ROE = stable CoE; shared helper guards non-positive denominators
+        # and clamps to [0,1] — see docs/known_errors.md 2026-08-01.
+        stable_reinv = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value = stable_fcfe / (stable_cost_of_equity - stable_growth)
         terminal_value_pv = terminal_value / (1 + cost_of_equity) ** growth_period
@@ -1486,7 +1488,9 @@ def value_reit_stock(ticker: str, growth_period: int):
         stable_levered_beta     = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity   = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth           = STABLE_GROWTH
-        stable_reinv            = stable_growth / stable_cost_of_equity
+        # shared helper guards non-positive denominators and clamps to [0,1] —
+        # see docs/known_errors.md 2026-08-01.
+        stable_reinv            = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_div              = div_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value          = stable_div / (stable_cost_of_equity - stable_growth)
         terminal_value_pv       = terminal_value / (1 + cost_of_equity) ** growth_period
@@ -1673,7 +1677,9 @@ def _value_bank_stock_detail(
         stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth = STABLE_GROWTH
-        stable_reinv = stable_growth / stable_cost_of_equity
+        # shared helper guards non-positive denominators and clamps to [0,1] —
+        # see docs/known_errors.md 2026-08-01.
+        stable_reinv = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value_undiscounted = stable_fcfe / (
             stable_cost_of_equity - stable_growth
@@ -1794,7 +1800,9 @@ def _value_reit_stock_detail(
         stable_levered_beta   = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
         stable_growth         = STABLE_GROWTH
-        stable_reinv          = stable_growth / stable_cost_of_equity
+        # shared helper guards non-positive denominators and clamps to [0,1] —
+        # see docs/known_errors.md 2026-08-01.
+        stable_reinv          = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_div            = div_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
         terminal_value_undiscounted = stable_div / (stable_cost_of_equity - stable_growth)
         terminal_value_pv     = terminal_value_undiscounted / (1 + cost_of_equity) ** growth_period
