@@ -288,8 +288,8 @@ def income_statement(ticker, api_key):
     return hg_dcflib.get_inc_stmnt(ticker, api_key)
 
 
-def balance_sheet(ticker, api_key):
-    return hg_dcflib.get_bal_sheet(ticker, api_key)
+def balance_sheet(ticker, api_key, is_financial_or_reit: bool = False):
+    return hg_dcflib.get_bal_sheet(ticker, api_key, is_financial_or_reit=is_financial_or_reit)
 
 
 def cash_flow_statement(ticker, api_key):
@@ -1067,7 +1067,7 @@ def value_bank_stock(ticker: str, growth_period: int):
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
-        bal_sht = balance_sheet(ticker, MY_API_KEY)
+        bal_sht = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
 
@@ -1434,7 +1434,7 @@ def value_reit_stock(ticker: str, growth_period: int):
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
-        bal_sht   = balance_sheet(ticker, MY_API_KEY)
+        bal_sht   = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
 
@@ -1627,7 +1627,7 @@ def _value_bank_stock_detail(
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
-        bal_sht = balance_sheet(ticker, MY_API_KEY)
+        bal_sht = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
 
@@ -1756,7 +1756,7 @@ def _value_reit_stock_detail(
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
-        bal_sht   = balance_sheet(ticker, MY_API_KEY)
+        bal_sht   = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
 

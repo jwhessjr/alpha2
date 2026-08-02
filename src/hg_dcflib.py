@@ -468,7 +468,31 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
 #     return balSht
 
 
-def _q_cash_and_sti(q: dict) -> float:
+_FINANCIAL_OR_REIT_KEYWORDS = {
+    "bank", "banks", "financial services", "insurance", "reinsurance",
+    "brokerage", "investment banking", "thrift", "savings", "credit",
+    "mortgage", "asset management", "reit", "real estate investment trust",
+}
+_FINANCIAL_OR_REIT_PREFIXES = ("retail (reit", "r.e.i.t.")
+
+
+def is_financial_or_reit_industry(industry: str) -> bool:
+    """
+    True for banks/insurers/brokerages/REITs and similar — mirrors
+    av_fcff_2.py's is_financial_firm()/is_reit() keyword sets (kept as a
+    separate, small, duplicated classifier here rather than importing the
+    3000+-line av_fcff_2.py from this lower-level library — see
+    docs/known_errors.md 2026-08-02 for why this classification matters for
+    _q_cash_and_sti()).
+    """
+    low = industry.lower()
+    return (
+        any(kw in low for kw in _FINANCIAL_OR_REIT_KEYWORDS)
+        or any(low.startswith(p) for p in _FINANCIAL_OR_REIT_PREFIXES)
+    )
+
+
+def _q_cash_and_sti(q: dict, is_financial_or_reit: bool = False) -> float:
     """
     Cash + short-term investments for one AV BALANCE_SHEET quarterly report.
 
@@ -481,7 +505,19 @@ def _q_cash_and_sti(q: dict) -> float:
     amount and pinning the reinvestment rate at its 100% cap. Same class of
     problem as AV's `ebit` field (see _q_ebit() in av_fcff_2.py) — prefer the
     granular components over AV's own pre-summed convenience field.
+
+    2026-08-02: a 63-ticker empirical audit (docs/known_errors.md) found this
+    "prefer the granular sum" behavior is correct for non-financial companies
+    but wrong for financial firms/REITs — for those, AV's granular
+    "shortTermInvestments" field is frequently either drawn from a
+    non-current-qualified SEC concept representing the company's entire
+    investment portfolio (not truly short-term — common for banks/insurers
+    with unclassified balance sheets), or untraceable to any real SEC figure
+    at all (~28% of a fresh financial/REIT sample, vs. 0% for non-financials).
+    Pass is_financial_or_reit=True to trust AV's pre-tagged field instead.
     """
+    if is_financial_or_reit:
+        return safe_float(q.get("cashAndShortTermInvestments"))
     granular = safe_float(q.get("cashAndCashEquivalentsAtCarryingValue")) + safe_float(
         q.get("shortTermInvestments")
     )
@@ -490,7 +526,7 @@ def _q_cash_and_sti(q: dict) -> float:
     return safe_float(q.get("cashAndShortTermInvestments"))
 
 
-def get_bal_sheet(company, apiKey):
+def get_bal_sheet(company, apiKey, is_financial_or_reit: bool = False):
     _sleep_with_jitter()
     url = (
         f"https://www.alphavantage.co/query?"
@@ -525,7 +561,7 @@ def get_bal_sheet(company, apiKey):
             break  # incomplete year, skip
 
         q = block[0]  # most recent quarter of this annual period
-        cash_and_equivalents.append(_q_cash_and_sti(q))
+        cash_and_equivalents.append(_q_cash_and_sti(q, is_financial_or_reit))
         total_current_assets.append(safe_float(q["totalCurrentAssets"]))
         total_current_liabilities.append(safe_float(q["totalCurrentLiabilities"]))
         short_term_debt.append(safe_float(q["shortTermDebt"]))
