@@ -1931,7 +1931,14 @@ def _value_stock_detail_fcff(
         def_spread = hg_dcflib.get_default_spread(int_cover)
         cost_of_debt_pretax = RISK_FREE + def_spread
         cost_of_debt_aftertax = cost_of_debt_pretax * (1 - MARGINAL_TAX_RATE)
-        percent_debt = bv_debt / (adjusted_bv_equity + bv_debt)
+        # WACC weights use market value of equity, book value of debt (Damodaran's
+        # prescribed methodology — market debt is rarely observable, market equity
+        # is trivial: price x shares). Previously weighted by book equity here,
+        # diverging from calc_discount_rate() (used by the batch path, and by this
+        # same function's own stable-phase rate two lines below) — see
+        # docs/known_errors.md 2026-08-01.
+        total_capital = market_cap + bv_debt
+        percent_debt = bv_debt / total_capital if total_capital > 0 else 0.5
         percent_equity = 1 - percent_debt
         discount_rate = (cost_of_debt_aftertax * percent_debt) + (
             cost_of_equity * percent_equity
