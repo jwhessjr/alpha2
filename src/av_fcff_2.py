@@ -804,6 +804,16 @@ def calc_terminal_value(
     terminal_ebit = ebit_last * (1 + stable_growth)
     terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
     fcff_terminal = terminal_ebiat * (1 - stable_reinv_rate)
+    # Gordon Growth requires cost of capital > growth rate — otherwise this
+    # denominator is zero or negative and terminal value is undefined. Not a
+    # theoretical concern: a real, unguarded ZeroDivisionError hit CLMB, OSW,
+    # RCKY during the 2026-07-31 Russell 2000 triage. See docs/known_errors.md.
+    if stable_cost_of_capital <= stable_growth:
+        raise ValueError(
+            f"Stable-phase cost of capital ({stable_cost_of_capital:.4f}) is at or "
+            f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
+            f"is undefined (requires cost of capital > growth)."
+        )
     terminal_value = fcff_terminal / (stable_cost_of_capital - stable_growth)
     terminal_value_pv = terminal_value / ((1 + growth_cost_of_capital) ** growth_period)
     logger.info(f"Stable reinvestment rate = {stable_reinv_rate:,.4f}")
@@ -1144,6 +1154,14 @@ def value_bank_stock(ticker: str, growth_period: int):
         # and clamps to [0,1] — see docs/known_errors.md 2026-08-01.
         stable_reinv = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        # Gordon Growth requires cost of equity > growth rate — see
+        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
+        if stable_cost_of_equity <= stable_growth:
+            raise ValueError(
+                f"Stable-phase cost of equity ({stable_cost_of_equity:.4f}) is at or "
+                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
+                f"is undefined (requires cost of equity > growth)."
+            )
         terminal_value = stable_fcfe / (stable_cost_of_equity - stable_growth)
         terminal_value_pv = terminal_value / (1 + cost_of_equity) ** growth_period
 
@@ -1492,6 +1510,14 @@ def value_reit_stock(ticker: str, growth_period: int):
         # see docs/known_errors.md 2026-08-01.
         stable_reinv            = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_div              = div_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        # Gordon Growth requires cost of equity > growth rate — see
+        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
+        if stable_cost_of_equity <= stable_growth:
+            raise ValueError(
+                f"Stable-phase cost of equity ({stable_cost_of_equity:.4f}) is at or "
+                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
+                f"is undefined (requires cost of equity > growth)."
+            )
         terminal_value          = stable_div / (stable_cost_of_equity - stable_growth)
         terminal_value_pv       = terminal_value / (1 + cost_of_equity) ** growth_period
 
@@ -1681,6 +1707,14 @@ def _value_bank_stock_detail(
         # see docs/known_errors.md 2026-08-01.
         stable_reinv = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        # Gordon Growth requires cost of equity > growth rate — see
+        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
+        if stable_cost_of_equity <= stable_growth:
+            raise ValueError(
+                f"Stable-phase cost of equity ({stable_cost_of_equity:.4f}) is at or "
+                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
+                f"is undefined (requires cost of equity > growth)."
+            )
         terminal_value_undiscounted = stable_fcfe / (
             stable_cost_of_equity - stable_growth
         )
@@ -1804,6 +1838,14 @@ def _value_reit_stock_detail(
         # see docs/known_errors.md 2026-08-01.
         stable_reinv          = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
         stable_div            = div_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
+        # Gordon Growth requires cost of equity > growth rate — see
+        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
+        if stable_cost_of_equity <= stable_growth:
+            raise ValueError(
+                f"Stable-phase cost of equity ({stable_cost_of_equity:.4f}) is at or "
+                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
+                f"is undefined (requires cost of equity > growth)."
+            )
         terminal_value_undiscounted = stable_div / (stable_cost_of_equity - stable_growth)
         terminal_value_pv     = terminal_value_undiscounted / (1 + cost_of_equity) ** growth_period
 
@@ -1992,6 +2034,14 @@ def _value_stock_detail_fcff(
         terminal_ebit = ebit_n[-1] * (1 + stable_growth)
         terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
         stable_fcff = terminal_ebiat * (1 - stable_reinv_rate)
+        # Gordon Growth requires cost of capital > growth rate — see
+        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
+        if stable_cost_of_capital <= stable_growth:
+            raise ValueError(
+                f"Stable-phase cost of capital ({stable_cost_of_capital:.4f}) is at or "
+                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
+                f"is undefined (requires cost of capital > growth)."
+            )
         terminal_value_undiscounted = stable_fcff / (
             stable_cost_of_capital - stable_growth
         )
