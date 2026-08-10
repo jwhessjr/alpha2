@@ -88,6 +88,18 @@ EQUITY_OVERRIDE: float | None = None  # set via --equity-override; bypasses AV b
 MOAT_CONFIDENCE_YEARS = 5
 MOAT_BASE_WEIGHT = {"Wide": 1.0, "Narrow": 0.5, "Questionable": 0.15, "None": 0.0}
 
+# Capital-light-compounder ROIC gate (decided 2026-08-10, see docs/decisions.md
+# and docs/known_errors.md). calc_return_on_capital()'s denominator (equity +
+# debt - cash) goes negative for cash-rich, heavy-buyback companies (AZO,
+# EXPE, etc.), producing a spurious sign-flipped ROIC. Rather than exclude the
+# whole category, a company with positive earnings but non-positive invested
+# capital must clear all three gates below to be treated as a wealth creator;
+# failing any of them degrades to the same flagged-skip treatment as negative
+# book equity. See calc_gated_return_on_capital().
+WEALTH_GATE_MIN_YEARS = 3               # years of positive EBIT required
+WEALTH_GATE_MIN_INTEREST_COVERAGE = 4.0  # EBIT / interest expense
+WEALTH_GATE_MIN_YEARS_ABOVE_WACC = 3     # corroborating moat_scores track record
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -413,6 +425,35 @@ def get_moat_weight(ticker: str, db_path: str | None = None) -> float:
     return base * confidence
 
 
+def get_moat_corroboration(ticker: str, db_path: str | None = None) -> tuple[str | None, int | None, float | None]:
+    """
+    Fetch (moat_rating, years_above_wacc, avg_roic) from moat_scores — the raw
+    fields behind get_moat_weight(), used by calc_gated_return_on_capital()'s
+    Gate 3 (see docs/decisions.md "Capital-light compounder ROIC gate").
+    moat_score.py's own avg_roic already skips non-positive-invested-capital
+    years (scripts/moat_score.py: score_roic()), so it's reused directly
+    rather than inventing a second capital-efficiency heuristic here.
+
+    Same failure contract as get_moat_weight(): missing row, missing table,
+    or any read failure all degrade to (None, None, None) — never more
+    optimistic than "gate fails" on a data gap.
+    """
+    try:
+        conn = sqlite3.connect(db_path or DEFAULT_DB, timeout=10)
+        row = conn.execute(
+            "SELECT moat_rating, years_above_wacc, avg_roic FROM moat_scores WHERE ticker = ?",
+            (ticker,),
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"{ticker}: could not read moat_scores ({e}) — no gate corroboration")
+        return None, None, None
+
+    if row is None:
+        return None, None, None
+    return row[0], row[1], row[2]
+
+
 # ---------------------------------------------------------------------------
 # Industry classification helpers
 # ---------------------------------------------------------------------------
@@ -668,6 +709,111 @@ def calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht)
     )
     logger.info(f"ROIC = {return_on_capital:,.4f}")
     return return_on_capital
+
+
+def calc_gated_return_on_capital(
+    ticker: str,
+    adjusted_ebiat: float,
+    adjusted_bv_equity: float,
+    bv_debt: float,
+    bal_sht: dict,
+    inc_stmnt: dict,
+    db_path: str | None = None,
+) -> tuple[float | None, str]:
+    """
+    Guarded wrapper around calc_return_on_capital() — see docs/decisions.md
+    "Capital-light compounder ROIC gate" (decided 2026-08-10) and
+    docs/known_errors.md for the full writeup.
+
+    calc_return_on_capital()'s denominator (equity + debt - cash) goes
+    negative for cash-rich, heavy-buyback companies (confirmed live: AZO,
+    EXPE, CCSI, PRDO, INOD, and others), producing a spurious, sign-flipped
+    ROIC that misclassifies genuinely profitable businesses as wealth
+    destroyers and collapses the moat-gated terminal value to zero.
+
+    Returns (return_on_capital, notes):
+    - invested_capital > 0: unchanged passthrough to calc_return_on_capital(),
+      notes="" — zero behavior change for the normal case.
+    - adjusted_ebiat <= 0 (regardless of invested capital): (None, reason) —
+      a real operating loss is a real signal; never overridden by this gate.
+    - adjusted_ebiat > 0 and invested_capital <= 0 (the ambiguous case): must
+      clear all three gates to be treated as a wealth creator —
+        1. Durability: positive EBIT in each of the last WEALTH_GATE_MIN_YEARS
+           years (inc_stmnt["ebit"] already carries up to 5 years, no new
+           fetch).
+        2. Interest coverage >= WEALTH_GATE_MIN_INTEREST_COVERAGE (mirrors
+           the existing int_cover pattern used for get_default_spread()).
+        3. Corroboration from moat_score.py's own ROIC series, which already
+           skips non-positive-invested-capital years: a Wide/Narrow moat
+           rating with >= WEALTH_GATE_MIN_YEARS_ABOVE_WACC years above WACC.
+      All three pass: returns moat_score.py's avg_roic (reusing its
+      already-guarded computation rather than inventing a second heuristic).
+      Any gate fails: (None, reason naming the failed gate(s)).
+
+    Callers must treat a None result the same as the existing negative-book-
+    equity case: write a flagged, zeroed Stock_Value with notes=<reason>
+    instead of continuing the DCF. docs/decisions.md's existing "downstream
+    consumers filter on non-empty notes" rule already makes that row
+    correctly invisible to replacer.py's candidate queries and skips
+    portfolio_monitor.py's elimination check — no consumer-side changes
+    needed.
+    """
+    cash = bal_sht["cash_and_equivalents"][0]
+    invested_capital = adjusted_bv_equity + bv_debt - cash
+
+    if invested_capital > 0:
+        return calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht), ""
+
+    if adjusted_ebiat <= 0:
+        return None, (
+            "ROIC undefined -- negative/zero invested capital "
+            f"({invested_capital:,.0f}) and non-positive earnings "
+            f"(EBIAT {adjusted_ebiat:,.0f})"
+        )
+
+    # Ambiguous case: positive earnings, non-positive invested capital.
+    ebit_hist = inc_stmnt.get("ebit", [])
+    durable = (
+        len(ebit_hist) >= WEALTH_GATE_MIN_YEARS
+        and all(e > 0 for e in ebit_hist[:WEALTH_GATE_MIN_YEARS])
+    )
+
+    try:
+        coverage = inc_stmnt["ebit"][0] / inc_stmnt["interest_expense"][0]
+    except ZeroDivisionError:
+        coverage = float("inf")  # no debt burden -- can't fail a coverage test
+    covered = coverage >= WEALTH_GATE_MIN_INTEREST_COVERAGE
+
+    moat_rating, years_above_wacc, moat_avg_roic = get_moat_corroboration(ticker, db_path)
+    corroborated = (
+        moat_rating in ("Wide", "Narrow")
+        and years_above_wacc is not None
+        and years_above_wacc >= WEALTH_GATE_MIN_YEARS_ABOVE_WACC
+        and moat_avg_roic is not None
+    )
+
+    if durable and covered and corroborated:
+        logger.info(
+            f"{ticker}: capital-light compounder -- standard ROIC undefined "
+            f"(invested capital {invested_capital:,.0f}), cleared via "
+            f"{WEALTH_GATE_MIN_YEARS}yr EBIT durability, {coverage:.1f}x "
+            f"interest coverage, and moat_score.py's {moat_rating} rating "
+            f"({years_above_wacc}yr above WACC) -- using moat_score's own "
+            f"avg_roic ({moat_avg_roic:.1%}) in place of the undefined ratio"
+        )
+        return moat_avg_roic, ""
+
+    reasons = []
+    if not durable:
+        reasons.append(f"< {WEALTH_GATE_MIN_YEARS}yr positive EBIT history")
+    if not covered:
+        reasons.append(f"interest coverage {coverage:.1f}x < {WEALTH_GATE_MIN_INTEREST_COVERAGE}x")
+    if not corroborated:
+        reasons.append("no corroborating Wide/Narrow moat rating with sufficient track record")
+    return None, (
+        f"ROIC undefined -- negative invested capital ({invested_capital:,.0f}), "
+        "failed gate: " + "; ".join(reasons)
+    )
 
 
 def calc_growth_rate(reinvestment_rate, return_on_capital):
@@ -1316,9 +1462,25 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
         logger.info(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
-        return_on_capital = calc_return_on_capital(
-            adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
+        return_on_capital, roc_notes = calc_gated_return_on_capital(
+            ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt
         )
+        if return_on_capital is None:
+            logger.warning(f"{ticker}: {roc_notes}")
+            return Stock_Value(
+                ticker=ticker, valuation_date=valuation_date, ent_name=ent_name,
+                industry=industry, cik=cik,
+                beta=calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE),
+                market_cap=market_cap,
+                price=price, shares_outstanding=shares_outstanding,
+                risk_free_rate=RISK_FREE, eq_premium=EQ_PREM,
+                growth_rate=0.0, cost_of_capital=0.0, wealth_pc=0.0,
+                fcff_value=0.0, terminal_value=0.0, share_value=0.0,
+                margin_of_safety=0.0, margin_of_safety_pc=0.0, target_price=0.0,
+                earnings_yield=0.0, dividend_yield=dividend_yield,
+                notes=roc_notes,
+                analyst_count=analyst_count,
+            )
         growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
 
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
@@ -1966,9 +2128,11 @@ def _value_stock_detail_fcff(
                 f"Adjusted EBIAT is zero for {ticker} — cannot compute reinvestment rate."
             )
         reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
-        return_on_capital = calc_return_on_capital(
-            adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
+        return_on_capital, roc_notes = calc_gated_return_on_capital(
+            ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt
         )
+        if return_on_capital is None:
+            raise ValueError(roc_notes)
         growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
 
         # Compute discount rate components inline to capture intermediates
@@ -2084,25 +2248,33 @@ def _value_stock_detail_fcff(
                 norm_reinv_rate = min(
                     max(firm_reinvestment / norm_adjusted_ebiat, 0.0), 1.0
                 )
-                norm_return_on_capital = calc_return_on_capital(
-                    norm_adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht
+                norm_return_on_capital, norm_roc_notes = calc_gated_return_on_capital(
+                    ticker, norm_adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt
                 )
-                norm_growth_rate = min(
-                    calc_growth_rate(norm_reinv_rate, norm_return_on_capital), 0.30
-                )
-                norm_fcff_table = calc_expected_fcff(
-                    norm_adjusted_ebit, eff_tax_rate, norm_growth_rate,
-                    norm_reinv_rate, growth_period
-                )
-                norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, growth_period)
-                norm_ebit_last = norm_adjusted_ebit * (1 + norm_growth_rate) ** growth_period
-                norm_tv_pv = calc_terminal_value(
-                    norm_ebit_last, eff_tax_rate, stable_cost_of_capital,
-                    discount_rate, stable_growth, growth_period,
-                    moat_weight=moat_weight, explicit_roic=norm_return_on_capital,
-                )
-                norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
-                norm_intrinsic_value = norm_ev / shares_outstanding
+                if norm_return_on_capital is None:
+                    # Same undefined-ROIC gate as the main path (see
+                    # calc_gated_return_on_capital()) -- the normalized figure
+                    # is a supplementary display value, not a hard-blocking
+                    # path, so skip it gracefully rather than raising and
+                    # losing the already-computed GAAP result above.
+                    logger.warning(f"{ticker}: normalized valuation skipped -- {norm_roc_notes}")
+                else:
+                    norm_growth_rate = min(
+                        calc_growth_rate(norm_reinv_rate, norm_return_on_capital), 0.30
+                    )
+                    norm_fcff_table = calc_expected_fcff(
+                        norm_adjusted_ebit, eff_tax_rate, norm_growth_rate,
+                        norm_reinv_rate, growth_period
+                    )
+                    norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, growth_period)
+                    norm_ebit_last = norm_adjusted_ebit * (1 + norm_growth_rate) ** growth_period
+                    norm_tv_pv = calc_terminal_value(
+                        norm_ebit_last, eff_tax_rate, stable_cost_of_capital,
+                        discount_rate, stable_growth, growth_period,
+                        moat_weight=moat_weight, explicit_roic=norm_return_on_capital,
+                    )
+                    norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
+                    norm_intrinsic_value = norm_ev / shares_outstanding
 
         return {
             "model": "FCFF",
