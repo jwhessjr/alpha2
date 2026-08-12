@@ -1360,7 +1360,7 @@ def value_bank_stock(ticker: str, growth_period: int):
 # ---------------------------------------------------------------------------
 
 
-def value_stock(ticker: str, growth_period: int):
+def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
     """
     Route to the correct valuation model based on industry:
       - REITs → skipped (FCFF/FCFE not applicable; FFO/AFFO model pending Phase 2)
@@ -1379,10 +1379,10 @@ def value_stock(ticker: str, growth_period: int):
     if is_financial_firm(industry):
         return value_bank_stock(ticker, growth_period)
 
-    return _value_stock_fcff(ticker, growth_period, industry)
+    return _value_stock_fcff(ticker, growth_period, industry, db_path)
 
 
-def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
+def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: str | None = None):
     """
     FCFF DCF valuation for non-financial firms.
     Returns a Stock_Value dataclass or None if any step fails.
@@ -1463,7 +1463,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
         logger.info(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
         return_on_capital, roc_notes = calc_gated_return_on_capital(
-            ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt
+            ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
         )
         if return_on_capital is None:
             logger.warning(f"{ticker}: {roc_notes}")
@@ -1499,7 +1499,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str):
             de_cap=hg_dcflib.get_industry_de(industry),
         )
         ebit_last = adjusted_ebit * (1 + growth_rate) ** growth_period
-        moat_weight = get_moat_weight(ticker)
+        moat_weight = get_moat_weight(ticker, db_path)
         terminal_value_pv = calc_terminal_value(
             ebit_last,
             eff_tax_rate,
@@ -1786,7 +1786,7 @@ def _stock_value_from_detail(d: dict) -> Stock_Value:
     )
 
 
-def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
+def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = None) -> dict | None:
     """
     Route to the correct detail valuation for the Excel report:
       - REITs          → skipped (FFO/AFFO model pending Phase 2)
@@ -1804,7 +1804,7 @@ def value_stock_detail(ticker: str, growth_period: int) -> dict | None:
 
     if is_financial_firm(industry):
         return _value_bank_stock_detail(ticker, growth_period, industry)
-    return _value_stock_detail_fcff(ticker, growth_period, industry)
+    return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
 
 
 def _value_bank_stock_detail(
@@ -2073,7 +2073,7 @@ def _value_reit_stock_detail(
 
 
 def _value_stock_detail_fcff(
-    ticker: str, growth_period: int, industry: str
+    ticker: str, growth_period: int, industry: str, db_path: str | None = None
 ) -> dict | None:
     """FCFF detail dict for non-financial firms (used for Excel output)."""
     try:
@@ -2129,7 +2129,7 @@ def _value_stock_detail_fcff(
             )
         reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
         return_on_capital, roc_notes = calc_gated_return_on_capital(
-            ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt
+            ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
         )
         if return_on_capital is None:
             raise ValueError(roc_notes)
@@ -2166,7 +2166,7 @@ def _value_stock_detail_fcff(
             de_cap=hg_dcflib.get_industry_de(industry),
         )
         stable_growth = STABLE_GROWTH
-        moat_weight = get_moat_weight(ticker)
+        moat_weight = get_moat_weight(ticker, db_path)
         if moat_weight:
             assumed_stable_roic = stable_cost_of_capital + moat_weight * (return_on_capital - stable_cost_of_capital)
             stable_reinv_rate = (
@@ -2249,7 +2249,7 @@ def _value_stock_detail_fcff(
                     max(firm_reinvestment / norm_adjusted_ebiat, 0.0), 1.0
                 )
                 norm_return_on_capital, norm_roc_notes = calc_gated_return_on_capital(
-                    ticker, norm_adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt
+                    ticker, norm_adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
                 )
                 if norm_return_on_capital is None:
                     # Same undefined-ROIC gate as the main path (see
@@ -3427,7 +3427,7 @@ def main():
             _log_dir,
             f"value_{index_label}_{date.today().strftime('%Y%m%d')}.xlsx",
         )
-        detail = value_stock_detail(ticker, growth_period)
+        detail = value_stock_detail(ticker, growth_period, db_path)
         if detail:
             generate_xlsx(detail, output_file)
             try:
@@ -3496,7 +3496,7 @@ def main():
     bar_width = 40
     start_time = time.time()
     for idx, ticker in enumerate(tickers, 1):
-        result = value_stock(ticker, growth_period)
+        result = value_stock(ticker, growth_period, db_path)
         if result:
             valuations.append(result)
             valued_tickers.append(result.ticker)
@@ -3537,7 +3537,7 @@ def main():
         time.sleep(60)
         retry_total = len(failed_tickers)
         for idx, ticker in enumerate(failed_tickers, 1):
-            result = value_stock(ticker, growth_period)
+            result = value_stock(ticker, growth_period, db_path)
             if result:
                 valuations.append(result)
                 valued_tickers.append(result.ticker)
