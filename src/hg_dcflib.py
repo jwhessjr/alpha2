@@ -823,6 +823,7 @@ def get_risk_free(FRED_KEY):
 _US_EXCHANGES = {
     "NYSE",
     "NasdaqGS",
+    "NasdaqGM",
     "NasdaqCM",
     "NasdaqNM",
     "NYSEMKT",
