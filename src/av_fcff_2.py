@@ -822,6 +822,26 @@ def calc_growth_rate(reinvestment_rate, return_on_capital):
     return growth_rate
 
 
+def _bank_growth_rate(roe: float, retention_ratio: float) -> float:
+    """Shared by value_bank_stock()/_value_bank_stock_detail() — identical
+    formula in both, extracted per the av_fcff_2.py consolidation plan."""
+    return min(roe * retention_ratio, 0.30)
+
+
+def _reit_growth_rate(roe: float, retention_ratio: float, subtype_floor: float):
+    """Shared by value_reit_stock()/_value_reit_stock_detail() — identical
+    formula in both, extracted per the av_fcff_2.py consolidation plan.
+
+    Returns (growth_rate, retained_growth) — retained_growth is its own
+    Excel report field in the detail path, not just an intermediate.
+    subtype_floor itself is NOT computed here: batch resolves it before any
+    data fetch (to skip mortgage REITs early), detail resolves it after —
+    each call site keeps its own gating exactly where it already is.
+    """
+    retained_growth = min(roe * retention_ratio, 0.15)
+    return max(retained_growth, subtype_floor), retained_growth
+
+
 def calc_levered_beta(unlevered_beta, bv_debt, market_cap_equity, tax_rate, de_cap=None):
     """
     de_cap (optional): caps the D/E ratio used for re-levering at this value if
@@ -1261,7 +1281,7 @@ def value_bank_stock(ticker: str, growth_period: int):
             reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
         )
         retention_ratio = 1.0 - payout_ratio
-        growth_rate = min(roe * retention_ratio, 0.30)
+        growth_rate = _bank_growth_rate(roe, retention_ratio)
         logger.info(
             f"Growth rate = {growth_rate:.4f}  (ROE={roe:.4f} × retention={retention_ratio:.4f})"
         )
@@ -1640,12 +1660,11 @@ def value_reit_stock(ticker: str, growth_period: int):
         retention_ratio = 1.0 - payout_ratio
 
         roe             = net_income / bv_equity if bv_equity > 0 else 0.0
-        retained_growth = min(roe * retention_ratio, 0.15)
         # Use the higher of the retention-based rate and the sub-type floor.
         # The floor captures contractual lease escalators and structural growth
         # that exists independent of retained earnings (e.g. CPI escalators on
         # tower leases, 5G colocation, biological timber growth).
-        growth_rate = max(retained_growth, subtype_floor)
+        growth_rate, retained_growth = _reit_growth_rate(roe, retention_ratio, subtype_floor)
         logger.info(
             f"AFFO={affo:,.0f}  payout={payout_ratio:.3f}  ROE={roe:.4f}  "
             f"retained_g={retained_growth:.4f}  subtype_floor={subtype_floor:.4f}  "
@@ -1845,7 +1864,7 @@ def _value_bank_stock_detail(
             reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
         )
         retention_ratio = 1.0 - payout_ratio
-        growth_rate = min(roe * retention_ratio, 0.30)
+        growth_rate = _bank_growth_rate(roe, retention_ratio)
 
         bv_debt = calc_bv_debt(bal_sht)
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
@@ -1974,12 +1993,11 @@ def _value_reit_stock_detail(
         payout_ratio    = min(dividends_paid / affo, 1.0) if affo > 0 else 0.85
         retention_ratio = 1.0 - payout_ratio
         roe             = net_income / bv_equity if bv_equity > 0 else 0.0
-        retained_growth = min(roe * retention_ratio, 0.15)
         subtype_floor   = reit_subtype_growth(ticker, industry)
         if subtype_floor is None:
             logger.warning(f"Skipping {ticker}: Mortgage REIT — AFFO DDM not applicable")
             return None
-        growth_rate     = max(retained_growth, subtype_floor)
+        growth_rate, retained_growth = _reit_growth_rate(roe, retention_ratio, subtype_floor)
         bv_debt         = calc_bv_debt(bal_sht)
         levered_beta    = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         cost_of_equity  = RISK_FREE + (levered_beta * EQ_PREM)
@@ -2195,11 +2213,19 @@ def _value_stock_detail_fcff(
         # rate rather than carrying forward the explicit period's (typically
         # much higher) reinvestment rate — see calc_terminal_value() and
         # docs/known_errors.md 2026-07-31.
+        # Display-only intermediates for the Excel report (stable_reinv_rate,
+        # stable_fcff, terminal_value_undiscounted) — the authoritative
+        # terminal_value_pv below comes from the shared calc_terminal_value(),
+        # which recomputes the same values internally. See
+        # docs/known_errors.md 2026-08-01 "FCFF terminal-value consolidation".
         terminal_ebit = ebit_n[-1] * (1 + stable_growth)
         terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
         stable_fcff = terminal_ebiat * (1 - stable_reinv_rate)
-        # Gordon Growth requires cost of capital > growth rate — see
-        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
+        # Gordon Growth requires cost of capital > growth rate. This block is
+        # display-only (see comment above), but it still executes before the
+        # authoritative calc_terminal_value() call below and would still
+        # raise an unguarded ZeroDivisionError first — see docs/known_errors.md
+        # 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
         if stable_cost_of_capital <= stable_growth:
             raise ValueError(
                 f"Stable-phase cost of capital ({stable_cost_of_capital:.4f}) is at or "
@@ -2209,8 +2235,10 @@ def _value_stock_detail_fcff(
         terminal_value_undiscounted = stable_fcff / (
             stable_cost_of_capital - stable_growth
         )
-        terminal_value_pv = (
-            terminal_value_undiscounted / (1 + discount_rate) ** growth_period
+        terminal_value_pv = calc_terminal_value(
+            ebit_n[-1], eff_tax_rate, stable_cost_of_capital, discount_rate,
+            stable_growth, growth_period, moat_weight=moat_weight,
+            explicit_roic=return_on_capital,
         )
 
         cash = bal_sht["cash_and_equivalents"][0]
@@ -2782,6 +2810,23 @@ def generate_xlsx(d: dict, output_path: str) -> None:
         print(f"Saved: {output_path}")
         return
 
+    _generate_xlsx_fcff(
+        ws, d, gp, label, val_dollar, val_pct, section_header,
+        BLUE_FILL, YELLOW_FILL, GREEN_FILL,
+    )
+    wb.save(output_path)
+    print(f"Saved: {output_path}")
+
+
+def _generate_xlsx_fcff(
+    ws, d, gp, label, val_dollar, val_pct, section_header,
+    BLUE_FILL, YELLOW_FILL, GREEN_FILL,
+):
+    """Populate the worksheet for a standard non-financial firm (FCFF model)."""
+    from openpyxl.styles import Font
+
+    HEADER_FONT = Font(bold=True)
+
     # ====================================================================
     # TITLE
     # ====================================================================
@@ -3053,9 +3098,6 @@ def generate_xlsx(d: dict, output_path: str) -> None:
                 c.fill = fill
         r += 1
 
-    wb.save(output_path)
-    print(f"Saved: {output_path}")
-
 
 # ---------------------------------------------------------------------------
 # XLSX report generation
@@ -3119,67 +3161,73 @@ def generate_summary_xlsx(
         c.alignment = Alignment(horizontal="center", wrap_text=True)
         c.border = BORDER
 
-    ws.row_dimensions[HDR_ROW].height = 30
-
-    # Data rows
-    for row_idx, v in enumerate(valuations, HDR_ROW + 1):
-        if v.margin_of_safety >= 1:
-            row_fill = GREEN_FILL
-        elif v.margin_of_safety >= 0:
-            row_fill = YELLOW_FILL
-        else:
-            row_fill = RED_FILL
-
-        row_data = [
-            v.ticker,
-            v.cik,
-            v.ent_name,
-            v.industry,
-            v.price,
-            v.share_value,
-            v.target_price,
-            v.margin_of_safety,
-            v.margin_of_safety_pc,
-            v.growth_rate,
-            v.cost_of_capital,
-            v.wealth_pc,
-            v.beta,
-            v.market_cap / 1e9,
-        ]
-        num_fmts = [
-            None,
-            None,
-            None,
-            None,
-            '"$"#,##0.00',
-            '"$"#,##0.00',
-            '"$"#,##0.00',
-            '"$"#,##0.00',
-            "0.0%",
-            "0.0%",
-            "0.0%",
-            "0.0%",
-            "0.000",
-            "#,##0.00",
-        ]
-        for col, (val, fmt) in enumerate(zip(row_data, num_fmts), 1):
-            c = ws.cell(row=row_idx, column=col, value=val)
-            c.fill = row_fill
-            c.border = BORDER
-            if fmt:
-                c.number_format = fmt
-            if col <= 4:
-                c.alignment = Alignment(horizontal="left")
-            else:
-                c.alignment = Alignment(horizontal="right")
-
-    # Column widths
+    # Column widths / number formats shared by both tabs
     col_widths = [8, 12, 28, 20, 10, 14, 14, 10, 10, 12, 14, 16, 13, 14]
-    for col, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(col)].width = w
+    num_fmts = [
+        None,
+        None,
+        None,
+        None,
+        '"$"#,##0.00',
+        '"$"#,##0.00',
+        '"$"#,##0.00',
+        '"$"#,##0.00',
+        "0.0%",
+        "0.0%",
+        "0.0%",
+        "0.0%",
+        "0.000",
+        "#,##0.00",
+    ]
 
-    # Freeze header
-    ws.freeze_panes = ws.cell(row=HDR_ROW + 1, column=1)
+    def _write_tab(sheet, rows):
+        """Header row + data rows + column widths + freeze pane for one tab
+        — shared by the main Valuation Summary and Value Creators sheets."""
+        for col, hdr in enumerate(headers, 1):
+            c = sheet.cell(row=HDR_ROW, column=col, value=hdr)
+            c.font = HEADER_FONT
+            c.fill = DARK_FILL
+            c.alignment = Alignment(horizontal="center", wrap_text=True)
+            c.border = BORDER
+        sheet.row_dimensions[HDR_ROW].height = 30
+
+        for row_idx, v in enumerate(rows, HDR_ROW + 1):
+            if v.margin_of_safety >= 1:
+                row_fill = GREEN_FILL
+            elif v.margin_of_safety >= 0:
+                row_fill = YELLOW_FILL
+            else:
+                row_fill = RED_FILL
+
+            row_data = [
+                v.ticker,
+                v.cik,
+                v.ent_name,
+                v.industry,
+                v.price,
+                v.share_value,
+                v.target_price,
+                v.margin_of_safety,
+                v.margin_of_safety_pc,
+                v.growth_rate,
+                v.cost_of_capital,
+                v.wealth_pc,
+                v.beta,
+                v.market_cap / 1e9,
+            ]
+            for col, (val, fmt) in enumerate(zip(row_data, num_fmts), 1):
+                c = sheet.cell(row=row_idx, column=col, value=val)
+                c.fill = row_fill
+                c.border = BORDER
+                if fmt:
+                    c.number_format = fmt
+                c.alignment = Alignment(horizontal="left" if col <= 4 else "right")
+
+        for col, w in enumerate(col_widths, 1):
+            sheet.column_dimensions[get_column_letter(col)].width = w
+        sheet.freeze_panes = sheet.cell(row=HDR_ROW + 1, column=1)
+
+    _write_tab(ws, valuations)
 
     # ----------------------------------------------------------------
     # Tab 2 — Value Creators with positive MoS, sorted by Excess Return desc
@@ -3203,49 +3251,7 @@ def generate_summary_xlsx(
         value=f"{len(creators)} of {len(valuations)} stocks (ROIC > WACC or MoS > $0) — sorted by Excess Return (ROIC − WACC) descending",
     ).font = Font(italic=True, color="666666")
 
-    for col, hdr in enumerate(headers, 1):
-        c = vc.cell(row=HDR_ROW, column=col, value=hdr)
-        c.font = HEADER_FONT
-        c.fill = DARK_FILL
-        c.alignment = Alignment(horizontal="center", wrap_text=True)
-        c.border = BORDER
-
-    vc.row_dimensions[HDR_ROW].height = 30
-
-    for row_idx, v in enumerate(creators, HDR_ROW + 1):
-        row_fill = (
-            GREEN_FILL
-            if v.margin_of_safety >= 1
-            else (YELLOW_FILL if v.margin_of_safety >= 0 else RED_FILL)
-        )
-        row_data = [
-            v.ticker,
-            v.cik,
-            v.ent_name,
-            v.industry,
-            v.price,
-            v.share_value,
-            v.target_price,
-            v.margin_of_safety,
-            v.margin_of_safety_pc,
-            v.growth_rate,
-            v.cost_of_capital,
-            v.wealth_pc,
-            v.beta,
-            v.market_cap / 1e9,
-        ]
-        for col, (val, fmt) in enumerate(zip(row_data, num_fmts), 1):
-            c = vc.cell(row=row_idx, column=col, value=val)
-            c.fill = row_fill
-            c.border = BORDER
-            if fmt:
-                c.number_format = fmt
-            c.alignment = Alignment(horizontal="left" if col <= 4 else "right")
-
-    for col, w in enumerate(col_widths, 1):
-        vc.column_dimensions[get_column_letter(col)].width = w
-
-    vc.freeze_panes = vc.cell(row=HDR_ROW + 1, column=1)
+    _write_tab(vc, creators)
 
     wb.save(output_path)
     print(f"Saved: {output_path}")

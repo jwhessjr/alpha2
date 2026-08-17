@@ -99,6 +99,8 @@ def _get_damodaran_file(name: str) -> Path:
 
 
 def _get_indname() -> pd.DataFrame:
+    """Cached loader for Damodaran's industry-name-by-exchange table, used by
+    get_industry(). Downloaded/refreshed yearly via _get_damodaran_file()."""
     global _indname_df
     if _indname_df is None:
         path = _get_damodaran_file("indname")
@@ -113,6 +115,9 @@ def _get_indname() -> pd.DataFrame:
 
 
 def _get_betas() -> pd.DataFrame:
+    """Cached loader for Damodaran's industry unlevered-beta / D-E-ratio table,
+    used by get_beta() and get_industry_de(). Downloaded/refreshed yearly via
+    _get_damodaran_file()."""
     global _betas_df
     if _betas_df is None:
         path = _get_damodaran_file("betas")
@@ -125,6 +130,12 @@ def _get_betas() -> pd.DataFrame:
 
 
 def _get_default_spread() -> pd.DataFrame:
+    """Cached loader for Damodaran's interest-coverage default-spread bucket
+    table, used by get_default_spread(). Deliberately does NOT go through
+    _get_damodaran_file()'s yearly download/fallback pipeline — this file is
+    git-tracked and manually curated with no download URL/auto-refresh, unlike
+    indname/betas (see docs/known_errors.md, reference_data/ .gitignore notes).
+    """
     global _default_spread_df
     if _default_spread_df is None:
         _default_spread_df = pd.read_excel(_DATA_DIR / "defaultSpread.xlsx")
@@ -132,6 +143,11 @@ def _get_default_spread() -> pd.DataFrame:
 
 
 def _get_rd_amort() -> pd.DataFrame:
+    """Cached loader for Damodaran's R&D amortization-period-by-industry table,
+    used by get_rAndD_years(). Deliberately does NOT go through
+    _get_damodaran_file()'s yearly download/fallback pipeline — same reasoning
+    as _get_default_spread() above (git-tracked, manually curated, no
+    auto-refresh)."""
     global _rd_amort_df
     if _rd_amort_df is None:
         _rd_amort_df = pd.read_excel(
@@ -235,6 +251,9 @@ def _av_get(url: str) -> dict:
 
 
 def safe_float(val):
+    """Coerce val to a float, returning 0.0 for None/missing/unparseable input
+    instead of raising — used throughout this file for AV JSON fields that are
+    sometimes the string "None" or absent entirely."""
     try:
         return float(val)
     except (TypeError, ValueError):
@@ -245,6 +264,8 @@ def safe_float(val):
 
 
 def get_jsonparsed_data(url):
+    """Thin wrapper: jitter-sleep then delegate to _av_get(). Only ever called
+    internally from get_quote() in this file — no external caller today."""
     _sleep_with_jitter()
     return _av_get(url)
 
@@ -264,8 +285,7 @@ def _load_cik_map() -> None:
         return
     try:
         url = "https://www.sec.gov/files/company_tickers.json"
-        headers = {"User-Agent": "hg-dcf-model/1.0 research@example.com"}
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=_DAMODARAN_HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         for entry in data.values():
@@ -396,78 +416,6 @@ def get_inc_stmnt(company: str, apiKey: str) -> dict:
     return income_statement
 
 
-# Function to get the balance sheet and extract the required fields
-
-
-# def get_bal_sheet(company, apiKey):
-#     url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={company}&apikey={apiKey}"
-
-#     data = get_jsonparsed_data(url)
-#     balSheet = data.get("quarterlyReports", [])
-#     balSht = {}
-#     cashAndEquivalents = [
-#         safe_float(balSheet[0]["cashAndShortTermInvestments"]),
-#         safe_float(balSheet[4]["cashAndShortTermInvestments"]),
-#         safe_float(balSheet[8]["cashAndShortTermInvestments"]),
-#         safe_float(balSheet[12]["cashAndShortTermInvestments"]),
-#         safe_float(balSheet[16]["cashAndShortTermInvestments"]),
-#     ]
-#     currentAssets = [
-#         safe_float(balSheet[0]["totalCurrentAssets"]),
-#         safe_float(balSheet[4]["totalCurrentAssets"]),
-#         safe_float(balSheet[8]["totalCurrentAssets"]),
-#         safe_float(balSheet[12]["totalCurrentAssets"]),
-#         safe_float(balSheet[16]["totalCurrentAssets"]),
-#     ]
-
-#     stockholdersEquity = [
-#         safe_float(balSheet[0]["totalShareholderEquity"]),
-#         safe_float(balSheet[4]["totalShareholderEquity"]),
-#         safe_float(balSheet[8]["totalShareholderEquity"]),
-#         safe_float(balSheet[12]["totalShareholderEquity"]),
-#         safe_float(balSheet[16]["totalShareholderEquity"]),
-#     ]
-#     currentLiabilities = [
-#         safe_float(balSheet[0]["totalCurrentLiabilities"]),
-#         safe_float(balSheet[4]["totalCurrentLiabilities"]),
-#         safe_float(balSheet[8]["totalCurrentLiabilities"]),
-#         safe_float(balSheet[12]["totalCurrentLiabilities"]),
-#         safe_float(balSheet[16]["totalCurrentLiabilities"]),
-#     ]
-#     currentLongDebt = [
-#         safe_float(balSheet[0]["currentLongTermDebt"]),
-#         safe_float(balSheet[4]["currentLongTermDebt"]),
-#         safe_float(balSheet[8]["currentLongTermDebt"]),
-#         safe_float(balSheet[12]["currentLongTermDebt"]),
-#         safe_float(balSheet[16]["currentLongTermDebt"]),
-#     ]
-#     shortTermDebt = [
-#         safe_float(balSheet[0]["shortTermDebt"]),
-#         safe_float(balSheet[4]["shortTermDebt"]),
-#         safe_float(balSheet[8]["shortTermDebt"]),
-#         safe_float(balSheet[12]["shortTermDebt"]),
-#         safe_float(balSheet[16]["shortTermDebt"]),
-#     ]
-#     longTermDebt = [
-#         safe_float(balSheet[0]["longTermDebt"]),
-#         safe_float(balSheet[4]["longTermDebt"]),
-#         safe_float(balSheet[8]["longTermDebt"]),
-#         safe_float(balSheet[12]["longTermDebt"]),
-#         safe_float(balSheet[16]["longTermDebt"]),
-#     ]
-#     balSht["cash_and_equivalents"] = cashAndEquivalents
-#     balSht["total_current_assets"] = currentAssets
-#     # balSht["totalAssets"] = totalAssets
-#     # balSht["accountsPayable"] = accountsPayable
-#     balSht["current_long_debt"] = currentLongDebt
-#     balSht["short_term_debt"] = shortTermDebt
-#     balSht["long_term_debt"] = longTermDebt
-#     balSht["total_current_liabilities"] = currentLiabilities
-#     # balSht["totalLiabilities"] = liabilities
-#     balSht["total_stockholders_equity"] = stockholdersEquity
-#     return balSht
-
-
 _FINANCIAL_OR_REIT_KEYWORDS = {
     "bank", "banks", "financial services", "insurance", "reinsurance",
     "brokerage", "investment banking", "thrift", "savings", "credit",
@@ -503,7 +451,7 @@ def _q_cash_and_sti(q: dict, is_financial_or_reit: bool = False) -> float:
     short-term investments trapped inside "non-cash working capital",
     inflating calc_chng_wc()'s reinvestment estimate by roughly the same
     amount and pinning the reinvestment rate at its 100% cap. Same class of
-    problem as AV's `ebit` field (see _q_ebit() in av_fcff_2.py) — prefer the
+    problem as AV's `ebit` field (see _q_ebit() in this same file) — prefer the
     granular components over AV's own pre-summed convenience field.
 
     2026-08-02: a 63-ticker empirical audit (docs/known_errors.md) found this
@@ -527,6 +475,29 @@ def _q_cash_and_sti(q: dict, is_financial_or_reit: bool = False) -> float:
 
 
 def get_bal_sheet(company, apiKey, is_financial_or_reit: bool = False):
+    """
+    Fetch and snapshot (not summed) AV quarterly balance-sheet data for company.
+
+    Unlike get_inc_stmnt()/get_cash_flow(), this takes point-in-time quarterly
+    snapshots rather than annualizing/summing across quarters, since balance
+    sheet figures are stock (as-of-date) values, not flow (period) values.
+
+    is_financial_or_reit: pass True for banks/insurers/REITs — see
+    _q_cash_and_sti()'s docstring for why the cash-field handling differs.
+
+    Returns
+    -------
+    dict
+        Keys include 'cash_and_equivalents', 'total_current_assets',
+        'total_current_liabilities', 'current_long_debt', 'short_term_debt',
+        'long_term_debt', 'total_stockholders_equity' — each a list of
+        snapshot values across the quarters processed.
+
+    Raises
+    ------
+    ValueError
+        If no quarterly reports are returned for the ticker.
+    """
     _sleep_with_jitter()
     url = (
         f"https://www.alphavantage.co/query?"
@@ -587,7 +558,6 @@ def get_bal_sheet(company, apiKey, is_financial_or_reit: bool = False):
 
 
 def get_cash_flow(company: str, apiKey: str) -> dict:
-    _sleep_with_jitter()
     """
     Return annualized depreciation and cap‑ex from the quarterly cash‑flow data.
 
@@ -603,6 +573,7 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
     dict
         Keys: 'depreciation', 'capex' (each a list of up to 5 yearly values).
     """
+    _sleep_with_jitter()
     url = (
         f"https://www.alphavantage.co/query?"
         f"function=CASH_FLOW&symbol={company}&apikey={apiKey}"
@@ -643,7 +614,110 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
     }
 
 
-# function to retrieve R&D expense so we can capitalize it
+def get_rAndD(company, rd_years, apiKey):
+    """
+    Fetches R&D expenses for a specified number of years from Alpha Vantage.
+
+    Args:
+        company (str): The company symbol.
+        rd_years (int): The number of years to fetch R&D data for.
+        apiKey (str): The Alpha Vantage API key.
+
+    Returns:
+        tuple[dict, int]: (dict with a list of yearly R&D expenses, number of
+        years actually processed) — note the non-standard 2-tuple return, unlike
+        most other fetchers in this file which return a plain dict.
+    """
+    _sleep_with_jitter()
+    url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
+
+    rd_table = {}
+    data = _av_get(url)
+    rdExpense = data.get("quarterlyReports", [])
+
+    if not rdExpense:
+        logger.debug("No quarterly reports found.")
+        return {"research_and_development": []}, 0
+    rd_Amount = []
+
+    # We need to process quarters in chunks of 4 for each year.
+    # The number of available years is the length of the list divided by 4.
+    num_available_years = len(rdExpense) // 4
+    years_to_process = min(rd_years, num_available_years)
+
+    for i in range(years_to_process):
+        start_index = i * 4
+        end_index = start_index + 4
+
+        # Get the slice of the list for the current year's quarters
+        quarters = rdExpense[start_index:end_index]
+
+        # Calculate the sum of R&D expenses for the year
+        yearRDExpense = 0.0
+        for quarter in quarters:
+            try:
+                # Use .get() with a default value to prevent KeyError
+                rd_val = safe_float(quarter.get("researchAndDevelopment", "0"))
+                yearRDExpense += rd_val
+            except ValueError:
+                # If safe_float fails, just add 0 and continue.
+                pass
+
+        rd_Amount.append(yearRDExpense)
+
+    rd_table["research_and_development"] = rd_Amount
+    rdTable = rd_table, years_to_process
+    return rdTable
+
+
+# Function to get the current share price, shares outstanding, and market cap
+
+
+def get_quote(company, apiKey):
+    """
+    Fetch current price + company overview data (GLOBAL_QUOTE + OVERVIEW).
+
+    Returns
+    -------
+    tuple
+        Non-standard bare positional 6-tuple (not a dict, unlike most other
+        fetchers in this file): (price, sharesOutstanding, marketCap,
+        company_name, dividend_yield, analyst_count). Callers must unpack in
+        exactly this order.
+
+    Raises
+    ------
+    RuntimeError
+        If the OVERVIEW response is missing SharesOutstanding/
+        MarketCapitalization/Name — usually means no AV coverage for the symbol.
+    """
+    # ADD exchange to this extract and add it to the database
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={company}&apikey={apiKey}"
+    data = get_jsonparsed_data(url)
+    data = data.get("Global Quote", [])
+    # print(data)
+    price = safe_float(data["05. price"])
+    url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={company}&apikey={apiKey}"
+    data = get_jsonparsed_data(url)
+    # print(data)
+    if "SharesOutstanding" not in data or "MarketCapitalization" not in data or "Name" not in data:
+        raise RuntimeError(
+            f"AV OVERVIEW response for {company} is missing required fields "
+            f"(SharesOutstanding/MarketCapitalization/Name) — likely no AV coverage for this symbol"
+        )
+    sharesOutstanding = safe_float(data["SharesOutstanding"])
+    marketCap = safe_float(data["MarketCapitalization"])
+    company_name = data["Name"]
+    dividend_yield = safe_float(data.get("DividendYield", 0))
+    analyst_count = int(
+        safe_float(data.get("AnalystRatingStrongBuy", 0))
+        + safe_float(data.get("AnalystRatingBuy", 0))
+        + safe_float(data.get("AnalystRatingHold", 0))
+        + safe_float(data.get("AnalystRatingSell", 0))
+        + safe_float(data.get("AnalystRatingStrongSell", 0))
+    )
+    entQuote = price, sharesOutstanding, marketCap, company_name, dividend_yield, analyst_count
+    return entQuote
 
 
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
@@ -706,94 +780,14 @@ def get_erp():
         logger.debug("Couldn't extract ERP %s")
 
 
-def get_rAndD(company, rd_years, apiKey):
-    _sleep_with_jitter()
-    """
-    Fetches R&D expenses for a specified number of years from Alpha Vantage.
-
-    Args:
-        company (str): The company symbol.
-        rd_years (int): The number of years to fetch R&D data for.
-        apiKey (str): The Alpha Vantage API key.
-
-    Returns:
-        dict: A dictionary containing a list of yearly R&D expenses.
-    """
-    url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
-
-    rd_table = {}
-    data = _av_get(url)
-    rdExpense = data.get("quarterlyReports", [])
-
-    if not rdExpense:
-        logger.debug("No quarterly reports found.")
-        return {"research_and_development": []}, 0
-    rd_Amount = []
-
-    # We need to process quarters in chunks of 4 for each year.
-    # The number of available years is the length of the list divided by 4.
-    num_available_years = len(rdExpense) // 4
-    years_to_process = min(rd_years, num_available_years)
-
-    for i in range(years_to_process):
-        start_index = i * 4
-        end_index = start_index + 4
-
-        # Get the slice of the list for the current year's quarters
-        quarters = rdExpense[start_index:end_index]
-
-        # Calculate the sum of R&D expenses for the year
-        yearRDExpense = 0.0
-        for quarter in quarters:
-            try:
-                # Use .get() with a default value to prevent KeyError
-                rd_val = safe_float(quarter.get("researchAndDevelopment", "0"))
-                yearRDExpense += rd_val
-            except ValueError:
-                # If safe_float fails, just add 0 and continue.
-                pass
-
-        rd_Amount.append(yearRDExpense)
-
-    rd_table["research_and_development"] = rd_Amount
-    rdTable = rd_table, years_to_process
-    return rdTable
-
-
-# Function to get the current share price, shares outstanding, and market cap
-
-
-def get_quote(company, apiKey):
-    # ADD exchange to this extract and add it to the database
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={company}&apikey={apiKey}"
-    data = get_jsonparsed_data(url)
-    data = data.get("Global Quote", [])
-    # print(data)
-    price = safe_float(data["05. price"])
-    url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={company}&apikey={apiKey}"
-    data = get_jsonparsed_data(url)
-    # print(data)
-    if "SharesOutstanding" not in data or "MarketCapitalization" not in data or "Name" not in data:
-        raise RuntimeError(
-            f"AV OVERVIEW response for {company} is missing required fields "
-            f"(SharesOutstanding/MarketCapitalization/Name) — likely no AV coverage for this symbol"
-        )
-    sharesOutstanding = safe_float(data["SharesOutstanding"])
-    marketCap = safe_float(data["MarketCapitalization"])
-    company_name = data["Name"]
-    dividend_yield = safe_float(data.get("DividendYield", 0))
-    analyst_count = int(
-        safe_float(data.get("AnalystRatingStrongBuy", 0))
-        + safe_float(data.get("AnalystRatingBuy", 0))
-        + safe_float(data.get("AnalystRatingHold", 0))
-        + safe_float(data.get("AnalystRatingSell", 0))
-        + safe_float(data.get("AnalystRatingStrongSell", 0))
-    )
-    entQuote = price, sharesOutstanding, marketCap, company_name, dividend_yield, analyst_count
-    return entQuote
-
-
 def get_risk_free(FRED_KEY):
+    """
+    Fetch the latest 10-year Treasury yield (FRED series GS10) as a decimal.
+
+    Returns None (does not raise) on a non-200 HTTP response — unlike most
+    other fetchers in this file, which raise on failure. Callers must check
+    for None and apply their own fallback.
+    """
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": "GS10",
@@ -833,6 +827,18 @@ _US_EXCHANGES = {
 
 
 def get_industry(company):
+    """
+    Look up company's Damodaran industry group from the indname table.
+
+    Prefers a US-exchange match (_US_EXCHANGES) and stops immediately once
+    found; a non-US match is kept as a fallback but the scan continues in
+    case a US match appears later in the table.
+
+    Raises
+    ------
+    ValueError
+        If no matching row is found for the ticker at all.
+    """
     indName = _get_indname()
 
     industry = None
@@ -862,17 +868,32 @@ def get_industry(company):
     return industry
 
 
-def get_beta(industry):
+def _lookup_beta_row(industry):
+    """Shared row-scan for get_beta()/get_industry_de(): substring match
+    against "Industry Name" in Damodaran's industry-averages table, first
+    match wins per row order. Returns None if no row matches (or the table
+    isn't scannable), leaving the market-average default to each caller."""
     beta = _get_betas()
 
-    unleveredBeta = 1.0  # market-average default if industry not found
     for index, row in beta.iterrows():
         try:
             if industry in row["Industry Name"]:
-                unleveredBeta = row["Unlevered beta corrected for cash"]
-                break
+                return row
         except TypeError:
             continue
+    return None
+
+
+def get_beta(industry):
+    """
+    Look up industry's unlevered beta from Damodaran's industry-averages table.
+
+    Substring match against "Industry Name" (first match wins, per row order).
+    Defaults to 1.0 (does not raise) if industry isn't found — a market-average
+    assumption, unlike get_industry()'s raise-on-not-found behavior.
+    """
+    row = _lookup_beta_row(industry)
+    unleveredBeta = row["Unlevered beta corrected for cash"] if row is not None else 1.0
 
     logger.info(f"Beta {unleveredBeta}")
     return unleveredBeta
@@ -885,16 +906,8 @@ def get_industry_de(industry):
     calc_levered_beta(). See docs/decisions.md "Stable-phase capital structure"
     for why this only ever caps down, not up.
     """
-    beta = _get_betas()
-
-    industryDE = 1.0  # market-average-ish default if industry not found
-    for index, row in beta.iterrows():
-        try:
-            if industry in row["Industry Name"]:
-                industryDE = row["D/E Ratio"]
-                break
-        except TypeError:
-            continue
+    row = _lookup_beta_row(industry)
+    industryDE = row["D/E Ratio"] if row is not None else 1.0
 
     logger.info(f"Industry D/E {industryDE}")
     return industryDE
