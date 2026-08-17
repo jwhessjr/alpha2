@@ -42,7 +42,7 @@ from logging_setup import make_logger, LONG_FMT
 if getattr(sys, "frozen", False):
     _log_dir = os.path.join(os.path.dirname(sys.executable), "data")
 else:
-    _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    _log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 os.makedirs(_log_dir, exist_ok=True)
 
 logger = make_logger(__name__, os.path.join(_log_dir, "value.log"),
