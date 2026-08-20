@@ -100,6 +100,18 @@ WEALTH_GATE_MIN_YEARS = 3               # years of positive EBIT required
 WEALTH_GATE_MIN_INTEREST_COVERAGE = 4.0  # EBIT / interest expense
 WEALTH_GATE_MIN_YEARS_ABOVE_WACC = 3     # corroborating moat_scores track record
 
+# ROIC corroboration flag (decided 2026-08-20, docs/decisions.md) — for the
+# normal positive-invested-capital case, the current-period return_on_capital
+# is used as-is with no check against the company's own longer-run history.
+# Found live: NUTX (implied ROIC ~121% vs. moat_scores' own -15.3% 10-year
+# average) and NRC (~151% vs. 47.7%) both hit the 30% growth-rate cap on a
+# single strong quarter with no reference to their track record. An absolute
+# spread, not a ratio, since NUTX's own average is negative (a ratio is
+# undefined/meaningless there). Flags via `notes`, never corrects the
+# computed number — see calc_gated_return_on_capital()'s docstring.
+ROIC_CORROBORATION_MAX_SPREAD = 0.50    # percentage points above moat_scores' avg_roic
+ROIC_CORROBORATION_MIN_DATA_YEARS = 3   # avg_roic needs enough history to be a credible baseline
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -425,33 +437,38 @@ def get_moat_weight(ticker: str, db_path: str | None = None) -> float:
     return base * confidence
 
 
-def get_moat_corroboration(ticker: str, db_path: str | None = None) -> tuple[str | None, int | None, float | None]:
+def get_moat_corroboration(
+    ticker: str, db_path: str | None = None
+) -> tuple[str | None, int | None, float | None, int | None]:
     """
-    Fetch (moat_rating, years_above_wacc, avg_roic) from moat_scores — the raw
-    fields behind get_moat_weight(), used by calc_gated_return_on_capital()'s
-    Gate 3 (see docs/decisions.md "Capital-light compounder ROIC gate").
-    moat_score.py's own avg_roic already skips non-positive-invested-capital
-    years (scripts/moat_score.py: score_roic()), so it's reused directly
-    rather than inventing a second capital-efficiency heuristic here.
+    Fetch (moat_rating, years_above_wacc, avg_roic, data_years) from
+    moat_scores — the raw fields behind get_moat_weight(), used by
+    calc_gated_return_on_capital()'s Gate 3 (see docs/decisions.md
+    "Capital-light compounder ROIC gate") and its ROIC-corroboration flag
+    (docs/decisions.md, decided 2026-08-20). moat_score.py's own avg_roic
+    already skips non-positive-invested-capital years
+    (scripts/moat_score.py: score_roic()), so it's reused directly rather
+    than inventing a second capital-efficiency heuristic here.
 
     Same failure contract as get_moat_weight(): missing row, missing table,
-    or any read failure all degrade to (None, None, None) — never more
-    optimistic than "gate fails" on a data gap.
+    or any read failure all degrade to (None, None, None, None) — never more
+    optimistic than "gate fails"/"no corroboration" on a data gap.
     """
     try:
         conn = sqlite3.connect(db_path or DEFAULT_DB, timeout=10)
         row = conn.execute(
-            "SELECT moat_rating, years_above_wacc, avg_roic FROM moat_scores WHERE ticker = ?",
+            "SELECT moat_rating, years_above_wacc, avg_roic, data_years "
+            "FROM moat_scores WHERE ticker = ?",
             (ticker,),
         ).fetchone()
         conn.close()
     except Exception as e:
         logger.debug(f"{ticker}: could not read moat_scores ({e}) — no gate corroboration")
-        return None, None, None
+        return None, None, None, None
 
     if row is None:
-        return None, None, None
-    return row[0], row[1], row[2]
+        return None, None, None, None
+    return row[0], row[1], row[2], row[3]
 
 
 # ---------------------------------------------------------------------------
@@ -732,8 +749,17 @@ def calc_gated_return_on_capital(
     destroyers and collapses the moat-gated terminal value to zero.
 
     Returns (return_on_capital, notes):
-    - invested_capital > 0: unchanged passthrough to calc_return_on_capital(),
-      notes="" — zero behavior change for the normal case.
+    - invested_capital > 0: passthrough to calc_return_on_capital(), with a
+      new corroboration check (decided 2026-08-20, docs/decisions.md) — if
+      the result exceeds moat_scores' own avg_roic by more than
+      ROIC_CORROBORATION_MAX_SPREAD (and avg_roic has at least
+      ROIC_CORROBORATION_MIN_DATA_YEARS of history to be a credible
+      baseline), notes carries a flag but the computed return_on_capital is
+      returned UNCHANGED — this is an annotation, not a correction, same
+      "flag, don't silently exclude/correct" pattern as sector balance and
+      the staleness warning (docs/decisions.md). Missing/thin moat data
+      never triggers the flag — consistent with every other gate in this
+      function degrading to "no signal" rather than "more optimistic."
     - adjusted_ebiat <= 0 (regardless of invested capital): (None, reason) —
       a real operating loss is a real signal; never overridden by this gate.
     - adjusted_ebiat > 0 and invested_capital <= 0 (the ambiguous case): must
@@ -762,7 +788,22 @@ def calc_gated_return_on_capital(
     invested_capital = adjusted_bv_equity + bv_debt - cash
 
     if invested_capital > 0:
-        return calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht), ""
+        roc = calc_return_on_capital(adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht)
+        _, _, moat_avg_roic, data_years = get_moat_corroboration(ticker, db_path)
+        if (
+            moat_avg_roic is not None
+            and data_years is not None
+            and data_years >= ROIC_CORROBORATION_MIN_DATA_YEARS
+            and (roc - moat_avg_roic) > ROIC_CORROBORATION_MAX_SPREAD
+        ):
+            return roc, (
+                f"Current ROIC ({roc:.1%}) exceeds moat_scores' "
+                f"{data_years}yr average ({moat_avg_roic:.1%}) by more than "
+                f"{ROIC_CORROBORATION_MAX_SPREAD:.0%} -- growth rate and "
+                "wealth_pc are computed from the uncorroborated current "
+                "figure; verify before trusting this as sustainable."
+            )
+        return roc, ""
 
     if adjusted_ebiat <= 0:
         return None, (
@@ -784,7 +825,7 @@ def calc_gated_return_on_capital(
         coverage = float("inf")  # no debt burden -- can't fail a coverage test
     covered = coverage >= WEALTH_GATE_MIN_INTEREST_COVERAGE
 
-    moat_rating, years_above_wacc, moat_avg_roic = get_moat_corroboration(ticker, db_path)
+    moat_rating, years_above_wacc, moat_avg_roic, _ = get_moat_corroboration(ticker, db_path)
     corroborated = (
         moat_rating in ("Wide", "Narrow")
         and years_above_wacc is not None
@@ -1565,7 +1606,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         notes = (
             "Model produced non-positive intrinsic value — negative/deteriorating "
             "fundamentals; DCF result may not be economically meaningful"
-            if intrinsic_value <= 0 else ""
+            if intrinsic_value <= 0 else roc_notes
         )
 
         return Stock_Value(
@@ -2151,6 +2192,8 @@ def _value_stock_detail_fcff(
         )
         if return_on_capital is None:
             raise ValueError(roc_notes)
+        if roc_notes:
+            logger.warning(f"{ticker}: {roc_notes}")
         growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
 
         # Compute discount rate components inline to capture intermediates
@@ -2287,6 +2330,8 @@ def _value_stock_detail_fcff(
                     # losing the already-computed GAAP result above.
                     logger.warning(f"{ticker}: normalized valuation skipped -- {norm_roc_notes}")
                 else:
+                    if norm_roc_notes:
+                        logger.warning(f"{ticker}: normalized valuation -- {norm_roc_notes}")
                     norm_growth_rate = min(
                         calc_growth_rate(norm_reinv_rate, norm_return_on_capital), 0.30
                     )
