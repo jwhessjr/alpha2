@@ -513,6 +513,37 @@ def get_bal_sheet(company, apiKey, is_financial_or_reit: bool = False):
         logger.debug(f"Balance sheet raw response: {data}")
         raise ValueError(f"No quarterly balance sheet reports found for {company}")
 
+    # Sanity check: a raw AV cash figure that's wildly larger than the same
+    # quarter's own total current assets, or that jumped implausibly from
+    # the prior quarter, is a data ingestion error, not a real cash
+    # position — cash is a subset of current assets by definition, so any
+    # multiple above ~1x already indicates a problem. Confirmed live
+    # 2026-08-20: GOLF (Acushnet) reported $67.9B cash vs. $1.27B total
+    # current assets (53x) and a 1,314x jump from the prior quarter's
+    # $51.7M; ZYME (Zymeworks) reported $179.4B cash, a 734x jump from the
+    # prior quarter's $244M. Left unguarded, this silently produces a
+    # share_value many multiples of a sane DCF result (see
+    # docs/known_errors.md 2026-08-20) — the existing negative-invested-
+    # capital gate (2026-08-10) doesn't reliably catch it, since a company
+    # with a real moat rating can pass that gate's corroboration check even
+    # when the underlying cash figure is garbage.
+    latest_cash = _q_cash_and_sti(quarterly_reports[0], is_financial_or_reit)
+    latest_tca = safe_float(quarterly_reports[0].get("totalCurrentAssets"))
+    if latest_tca > 0 and latest_cash > 2 * latest_tca:
+        raise ValueError(
+            f"{company}: reported cash ({latest_cash:,.0f}) exceeds 2x total "
+            f"current assets ({latest_tca:,.0f}) for the latest quarter — "
+            f"likely an AV data ingestion error, not a real cash position."
+        )
+    if len(quarterly_reports) > 1:
+        prior_cash = _q_cash_and_sti(quarterly_reports[1], is_financial_or_reit)
+        if prior_cash > 0 and latest_cash > 20 * prior_cash:
+            raise ValueError(
+                f"{company}: reported cash ({latest_cash:,.0f}) is more than "
+                f"20x the prior quarter's cash ({prior_cash:,.0f}) — likely "
+                f"an AV data ingestion error, not a real cash position."
+            )
+
     # Balance sheet is point-in-time, so we take one snapshot per year
     # (the last quarter of each annual block) rather than summing.
     # Step through in blocks of 4, take the first quarter of each block
