@@ -27,6 +27,7 @@ from pathlib import Path as _Path
 # in HessGrp/lib), without shadowing a same-directory hg_dcflib.py copy.
 _sys.path.append(str(_Path.home() / "HessGrp" / "lib"))
 import hg_dcflib
+from config import INTRINIO_KEY
 import json
 import logging
 import os
@@ -66,6 +67,13 @@ if not FRED_KEY:
 
 MARGINAL_TAX_RATE = 0.26
 GROWTH_PERIOD = 5  # high-growth years; override with --growth N
+
+# AV->Intrinio migration Phase 2 (2026-08-24): data source for the 5 fetch
+# wrappers below. "av" (default) is production, unchanged behavior. "intrinio"
+# is opt-in via --provider, for shadow-mode validation against a disposable
+# DB only — see docs/decisions.md migration plan. Not a production default
+# switch; that's Phase 3.
+DATA_PROVIDER = "av"
 
 # DB path — override via $VALUATION_DB env var or --db argument
 DEFAULT_DB = os.environ.get("VALUATION_DB", "/Volumes/Financial_Data/valuation.db")
@@ -309,26 +317,44 @@ def get_tickers_from_filings(path: str) -> list[str]:
 
 
 def income_statement(ticker, api_key):
+    if DATA_PROVIDER == "intrinio":
+        return hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY)
     return hg_dcflib.get_inc_stmnt(ticker, api_key)
 
 
 def balance_sheet(ticker, api_key, is_financial_or_reit: bool = False):
+    if DATA_PROVIDER == "intrinio":
+        return hg_dcflib.get_bal_sheet_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit)
     return hg_dcflib.get_bal_sheet(ticker, api_key, is_financial_or_reit=is_financial_or_reit)
 
 
 def cash_flow_statement(ticker, api_key):
+    if DATA_PROVIDER == "intrinio":
+        return hg_dcflib.get_cash_flow_intrinio(ticker, INTRINIO_KEY)
     return hg_dcflib.get_cash_flow(ticker, api_key)
+
+
+def research_and_development(ticker, rd_years, api_key):
+    if DATA_PROVIDER == "intrinio":
+        return hg_dcflib.get_rAndD_intrinio(ticker, rd_years, INTRINIO_KEY)
+    return hg_dcflib.get_rAndD(ticker, rd_years, api_key)
 
 
 # Populated by prefetch_quotes() before a batch run — see that function's
 # docstring and docs/known_errors.md (2026-07-22) for why quote and
 # fundamentals calls are deliberately kept out of the same time window.
+# Keyed by (ticker, DATA_PROVIDER) so a shadow-mode comparison that runs both
+# providers within one process (e.g. a Phase 2 diff script) can't serve a
+# cached AV quote back for an Intrinio-provider call or vice versa.
 _QUOTE_CACHE: dict = {}
 
 
 def enterprise_quote(ticker, api_key):
-    if ticker in _QUOTE_CACHE:
-        return _QUOTE_CACHE[ticker]
+    cache_key = (ticker, DATA_PROVIDER)
+    if cache_key in _QUOTE_CACHE:
+        return _QUOTE_CACHE[cache_key]
+    if DATA_PROVIDER == "intrinio":
+        return hg_dcflib.get_quote_intrinio(ticker, INTRINIO_KEY)
     return hg_dcflib.get_quote(ticker, api_key)
 
 
@@ -359,7 +385,10 @@ def prefetch_quotes(tickers: list, api_key: str) -> None:
     start_time = time.time()
     for idx, ticker in enumerate(tickers, 1):
         try:
-            _QUOTE_CACHE[ticker] = hg_dcflib.get_quote(ticker, api_key)
+            if DATA_PROVIDER == "intrinio":
+                _QUOTE_CACHE[(ticker, DATA_PROVIDER)] = hg_dcflib.get_quote_intrinio(ticker, INTRINIO_KEY)
+            else:
+                _QUOTE_CACHE[(ticker, DATA_PROVIDER)] = hg_dcflib.get_quote(ticker, api_key)
         except Exception as e:
             logger.warning(f"Prefetch quote failed for {ticker}: {e}")
         filled = int(bar_width * idx / total)
@@ -619,7 +648,7 @@ def capitalizerAndD(ticker, rd_years, api_key):
             "Current_Year_Amortization": 0.0,
         }
 
-    rdTable = hg_dcflib.get_rAndD(ticker, rd_years, api_key)
+    rdTable = research_and_development(ticker, rd_years, api_key)
     rd_dict, years_to_process = rdTable
     logger.info(f"rdTable = {rdTable}")
     rd_table = {}
@@ -3401,14 +3430,21 @@ def main():
                         help="Override shareholders' equity (in dollars) for all tickers in this run. "
                              "Use when AV balance sheet data is known to be incorrect (e.g., PPG Q1 2026). "
                              "Example: --equity-override 8104000000")
+    parser.add_argument("--provider", choices=["av", "intrinio"], default="av",
+                        help="Fundamentals data source (default: av). 'intrinio' is for AV->Intrinio "
+                             "migration Phase 2 shadow-mode validation — run against a disposable --db "
+                             "copy, not production, until Phase 3.")
     args = parser.parse_args()
 
     growth_period = args.growth
 
-    global EQUITY_OVERRIDE
+    global EQUITY_OVERRIDE, DATA_PROVIDER
     if args.equity_override is not None:
         EQUITY_OVERRIDE = args.equity_override
         print(f"  equity override active: ${EQUITY_OVERRIDE:,.0f}")
+    DATA_PROVIDER = args.provider
+    if DATA_PROVIDER == "intrinio":
+        print("  data provider: INTRINIO (shadow-mode — verify --db points at a disposable copy)")
     db_path       = args.db
 
     # ---- Fetch market reference data (deferred from module level) --------
