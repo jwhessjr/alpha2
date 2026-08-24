@@ -845,8 +845,17 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
                              raw 'ebit' field being inflated)
       incomeBeforeTax     -> totalpretaxincome
       income_tax_expense  -> incometaxexpense
-      interest_expense    -> totalinterestincome (NET, not gross — confirmed
-                             not fixable by vendor switch; see field map)
+      interest_expense    -> -totalinterestincome (NET, not gross — confirmed
+                             not fixable by vendor switch; see field map. SIGN
+                             FLIP REQUIRED: Intrinio's tag is income-positive
+                             (positive = net interest income), AV's
+                             interest_expense and every downstream consumer
+                             (interest-coverage gates, cost-of-debt lookups)
+                             are expense-positive. Confirmed 2026-08-24 via
+                             compare_data_providers.py on AZO: AV +$472,052,000
+                             vs. unflipped Intrinio -$472,053,000 — same
+                             magnitude, opposite sign, both vendors actually
+                             agree on the real number.)
       totalRevenue        -> totalrevenue
       netIncome            -> netincome
     """
@@ -866,7 +875,7 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
                 "ebit": sum(safe_float(q.get("totaloperatingincome")) for q in block),
                 "incomeBeforeTax": sum(safe_float(q.get("totalpretaxincome")) for q in block),
                 "income_tax_expense": sum(safe_float(q.get("incometaxexpense")) for q in block),
-                "interest_expense": sum(safe_float(q.get("totalinterestincome")) for q in block),
+                "interest_expense": sum(-safe_float(q.get("totalinterestincome")) for q in block),
                 "totalRevenue": sum(safe_float(q.get("totalrevenue")) for q in block),
                 "netIncome": sum(safe_float(q.get("netincome")) for q in block),
             }
