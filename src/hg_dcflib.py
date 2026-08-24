@@ -751,6 +751,412 @@ def get_quote(company, apiKey):
     return entQuote
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Intrinio-backed equivalents (2026-08-24, AV→Intrinio migration Phase 1)
+#
+# Each function below returns EXACTLY the same shape as its AV counterpart
+# above (including get_rAndD's/get_quote's non-standard tuple returns), so
+# every existing downstream caller works unchanged once a call site switches
+# from get_inc_stmnt() to get_inc_stmnt_intrinio() (etc.) — see
+# docs/decisions.md for the migration plan this implements.
+#
+# Deliberately NOT wired into any call site yet. Phase 2 (shadow-mode
+# validation) calls both AV and Intrinio versions side-by-side against a
+# disposable DB before Phase 3 flips the production default.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_INTRINIO_BASE_URL = "https://api-v2.intrinio.com"
+
+
+def _intrinio_get(path: str, api_key: str, **params) -> dict:
+    """
+    Fetch a single Intrinio URL with 15s timeout, up to 3 retries on network
+    timeout. Mirrors _av_get()'s shape but Intrinio's error envelope is a
+    flat {"error": ..., "message": ...} dict, not AV's Note/Information/Error
+    Message keys — and Intrinio has no documented in-band rate-limit
+    rejection to retry-with-backoff the way AV does (2,000 calls/min, 3
+    sockets, per Jim 2026-08-20 — far more headroom than AV's premium tier).
+    """
+    params["api_key"] = api_key
+    url = f"{_INTRINIO_BASE_URL}/{path.lstrip('/')}"
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and "error" in data:
+                raise RuntimeError(
+                    f"Intrinio error on {path}: {data.get('error')} — "
+                    f"{str(data.get('message', ''))[:120]}"
+                )
+            return data
+        except RuntimeError:
+            raise
+        except requests.exceptions.Timeout:
+            if attempt < max_attempts:
+                time.sleep(5)
+            else:
+                raise RuntimeError(f"Intrinio timeout after {max_attempts} attempts on {path}")
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Intrinio network error on {path}: {exc}")
+
+
+def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int = 20) -> list[str]:
+    """
+    Most-recent-first fundamental period IDs for company/statement_code.
+    Returns [] (does NOT raise) on no coverage — callers differ on whether
+    that should be a hard failure (get_inc_stmnt_intrinio/get_bal_sheet_intrinio/
+    get_cash_flow_intrinio all raise, matching their AV equivalents) or a
+    graceful empty result (get_rAndD_intrinio, also matching its AV
+    equivalent) — see each function's own empty-check for which applies.
+    """
+    data = _intrinio_get(
+        f"companies/{company}/fundamentals",
+        api_key,
+        statement_code=statement_code,
+        type="QTR",
+    )
+    fundamentals = data.get("fundamentals", [])
+    return [f["id"] for f in fundamentals[:n]]
+
+
+def _intrinio_standardized(fundamental_id: str, api_key: str) -> dict:
+    """Flattened {tag: value} for one period's standardized view."""
+    data = _intrinio_get(f"fundamentals/{fundamental_id}/standardized_financials", api_key)
+    out = {}
+    for item in data.get("standardized_financials", []):
+        tag = (item.get("data_tag") or {}).get("tag")
+        if tag is not None:
+            out[tag] = item.get("value")
+    return out
+
+
+def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
+    """
+    Intrinio-backed equivalent of get_inc_stmnt() — same return shape,
+    same 5-year-annualized-from-quarters aggregation, same single-quarter
+    EBIT anomaly detection.
+
+    Field map (confirmed live 2026-08-24, see docs/decisions.md):
+      ebit               -> totaloperatingincome (Intrinio's clean EBIT
+                             proxy, same choice AV's operatingIncome makes
+                             per this project's own known pitfall re: AV's
+                             raw 'ebit' field being inflated)
+      incomeBeforeTax     -> totalpretaxincome
+      income_tax_expense  -> incometaxexpense
+      interest_expense    -> totalinterestincome (NET, not gross — confirmed
+                             not fixable by vendor switch; see field map)
+      totalRevenue        -> totalrevenue
+      netIncome            -> netincome
+    """
+    period_ids = _intrinio_period_ids(company, "income_statement", apiKey)
+    if not period_ids:
+        raise ValueError(f"No quarterly reports found for {company} on Intrinio")
+    quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
+
+    max_quarters = min(len(quarters), 20)
+    yearly_data = []
+    for i in range(0, max_quarters, 4):
+        block = quarters[i : i + 4]
+        if len(block) < 4:
+            break
+        yearly_data.append(
+            {
+                "ebit": sum(safe_float(q.get("totaloperatingincome")) for q in block),
+                "incomeBeforeTax": sum(safe_float(q.get("totalpretaxincome")) for q in block),
+                "income_tax_expense": sum(safe_float(q.get("incometaxexpense")) for q in block),
+                "interest_expense": sum(safe_float(q.get("totalinterestincome")) for q in block),
+                "totalRevenue": sum(safe_float(q.get("totalrevenue")) for q in block),
+                "netIncome": sum(safe_float(q.get("netincome")) for q in block),
+            }
+        )
+
+    income_statement = {
+        "ebit": [y["ebit"] for y in yearly_data],
+        "incomeBeforeTax": [y["incomeBeforeTax"] for y in yearly_data],
+        "income_tax_expense": [y["income_tax_expense"] for y in yearly_data],
+        "interest_expense": [y["interest_expense"] for y in yearly_data],
+        "totalRevenue": [y["totalRevenue"] for y in yearly_data],
+        "netIncome": [y["netIncome"] for y in yearly_data],
+    }
+
+    ebit_anomaly = None
+    if yearly_data and quarters:
+        ttm_quarters = quarters[:4]
+        q_ebits = [safe_float(q.get("totaloperatingincome")) for q in ttm_quarters]
+        ttm = sum(q_ebits)
+        if ttm < 0 and q_ebits:
+            worst_idx = min(range(len(q_ebits)), key=lambda i: q_ebits[i])
+            worst_ebit = q_ebits[worst_idx]
+            normalized_ttm = ttm - worst_ebit
+            if normalized_ttm > 0:
+                ebit_anomaly = {
+                    "quarter_date": None,  # Intrinio period date not fetched in this pass
+                    "quarter_ebit": worst_ebit,
+                    "normalized_ttm_ebit": normalized_ttm,
+                    "quarters": list(enumerate(q_ebits)),
+                }
+    income_statement["ebit_anomaly"] = ebit_anomaly
+
+    return income_statement
+
+
+def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool = False) -> dict:
+    """
+    Intrinio-backed equivalent of get_bal_sheet() — same return shape,
+    same point-in-time-snapshot-per-year aggregation.
+
+    Field map (confirmed live 2026-08-24, see docs/decisions.md):
+      cash_and_equivalents      -> cashandequivalents, falling back to
+                                    restrictedcash (GOLF-shaped filers that
+                                    tag combined cash this way)
+      total_current_assets       -> totalcurrentassets
+      total_current_liabilities  -> totalcurrentliabilities
+      short_term_debt             -> shorttermdebt (already finance-lease-
+                                    inclusive on filers that bundle it, e.g.
+                                    DAL/UPS — confirmed live)
+      long_term_debt              -> longtermdebt (same)
+      total_stockholders_equity   -> totalcommonequity (parent-only, matches
+                                    AV's totalShareholderEquity semantics —
+                                    excludes noncontrolling interest)
+
+    KNOWN GAP, deliberate scope decision for this pass: operating leases are
+    NOT folded into short_term_debt/long_term_debt here. Intrinio's
+    standardized view doesn't isolate them (same blind spot AV has) and the
+    as-reported OperatingLeaseLiabilityCurrent/Noncurrent fallback resolver
+    is real, non-trivial, filer-varying logic — deferred to Phase 1b once
+    Phase 2's shadow-mode run shows which held/candidate tickers actually
+    need it (see docs/decisions.md field map). Not silently dropped: this
+    docstring and the migration plan both flag it.
+
+    is_financial_or_reit is accepted for signature parity with
+    get_bal_sheet() but unused here — Intrinio's cashandequivalents tag has
+    not shown AV's financial-firm/REIT cash-tagging quirk (docs/known_errors.md
+    2026-08-02); revisit if Phase 2 finds otherwise.
+    """
+    period_ids = _intrinio_period_ids(company, "balance_sheet_statement", apiKey)
+    quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
+
+    if not quarters:
+        raise ValueError(f"No quarterly balance sheet reports found for {company} on Intrinio")
+
+    def _cash(q: dict) -> float:
+        v = safe_float(q.get("cashandequivalents"))
+        if v > 0:
+            return v
+        return safe_float(q.get("restrictedcash"))
+
+    # Cash-sanity check ported from get_bal_sheet(), but LOG-ONLY here rather
+    # than raising — Intrinio has not shown AV's 1000x cash-corruption
+    # pattern in anything checked so far (11/11 clean 2026-08-21, 36/36
+    # clean 2026-08-20). Keep watching via logs through Phase 2's shadow-mode
+    # run rather than blocking on a failure mode not yet observed on this
+    # vendor; promote to a raise if Phase 2 ever proves otherwise.
+    latest_cash = _cash(quarters[0])
+    latest_tca = safe_float(quarters[0].get("totalcurrentassets"))
+    if latest_tca > 0 and latest_cash > 2 * latest_tca:
+        logger.warning(
+            f"{company}: Intrinio cash ({latest_cash:,.0f}) exceeds 2x total "
+            f"current assets ({latest_tca:,.0f}) — would have raised under "
+            f"the AV guard; log-only for Intrinio pending Phase 2 evidence."
+        )
+    if len(quarters) > 1:
+        prior_cash = _cash(quarters[1])
+        if prior_cash > 0 and latest_cash > 20 * prior_cash:
+            logger.warning(
+                f"{company}: Intrinio cash ({latest_cash:,.0f}) is more than "
+                f"20x the prior quarter's cash ({prior_cash:,.0f}) — would "
+                f"have raised under the AV guard; log-only for Intrinio "
+                f"pending Phase 2 evidence."
+            )
+
+    max_quarters = min(len(quarters), 20)
+    cash_and_equivalents = []
+    total_current_assets = []
+    total_current_liabilities = []
+    short_term_debt = []
+    long_term_debt = []
+    total_stockholders_equity = []
+
+    for i in range(0, max_quarters, 4):
+        block = quarters[i : i + 4]
+        if len(block) < 4:
+            break
+        q = block[0]
+        cash_and_equivalents.append(_cash(q))
+        total_current_assets.append(safe_float(q.get("totalcurrentassets")))
+        total_current_liabilities.append(safe_float(q.get("totalcurrentliabilities")))
+        short_term_debt.append(safe_float(q.get("shorttermdebt")))
+        long_term_debt.append(safe_float(q.get("longtermdebt")))
+        total_stockholders_equity.append(safe_float(q.get("totalcommonequity")))
+
+    if not cash_and_equivalents:
+        raise ValueError(f"Insufficient quarterly data to build balance sheet for {company} on Intrinio")
+
+    return {
+        "cash_and_equivalents": cash_and_equivalents,
+        "total_current_assets": total_current_assets,
+        "total_current_liabilities": total_current_liabilities,
+        "short_term_debt": short_term_debt,
+        "long_term_debt": long_term_debt,
+        "total_stockholders_equity": total_stockholders_equity,
+    }
+
+
+def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
+    """
+    Intrinio-backed equivalent of get_cash_flow() — same return shape.
+
+    Field map (confirmed live 2026-08-24, see docs/decisions.md):
+      capex           -> -purchaseofplantpropertyandequipment. SIGN FLIP
+                          REQUIRED: Intrinio reports this as a negative
+                          outflow; AV's capitalExpenditures (and every
+                          downstream FCFF consumer, e.g.
+                          calc_capital_expenditures() in av_fcff_2.py, which
+                          sums this list with NO abs()/sign-flip of its own)
+                          expects a positive magnitude. Confirmed by reading
+                          the FCFF formula itself (ebiat - capex + ...) —
+                          getting this sign wrong would silently invert
+                          capex's effect on every Intrinio-sourced valuation.
+      depreciation     -> depreciationexpense + amortizationexpense summed,
+                          matching AV's combined depreciationDepletionAnd-
+                          Amortization field. ("Depletion" has no separate
+                          Intrinio tag seen so far; omitted if absent, same
+                          as AV only reporting what the filer discloses.)
+      dividends_paid   -> paymentofdividends. Sign doesn't matter — every
+                          call site in av_fcff_2.py wraps this in abs().
+    """
+    period_ids = _intrinio_period_ids(company, "cash_flow_statement", apiKey)
+    quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
+
+    if not quarters:
+        raise ValueError(f"No quarterly cash-flow reports found for {company} on Intrinio")
+
+    max_quarters = min(len(quarters), 20)
+    depreciation = []
+    capex = []
+    dividends_paid = []
+
+    for i in range(0, max_quarters, 4):
+        block = quarters[i : i + 4]
+        if len(block) < 4:
+            break
+        yearly_capex = sum(-safe_float(q.get("purchaseofplantpropertyandequipment")) for q in block)
+        yearly_depr = sum(
+            safe_float(q.get("depreciationexpense")) + safe_float(q.get("amortizationexpense"))
+            for q in block
+        )
+        yearly_divs = sum(safe_float(q.get("paymentofdividends")) for q in block)
+
+        capex.append(yearly_capex)
+        depreciation.append(yearly_depr)
+        dividends_paid.append(yearly_divs)
+
+    return {
+        "capex": capex,
+        "depreciation": depreciation,
+        "dividends_paid": dividends_paid,
+    }
+
+
+def get_rAndD_intrinio(company: str, rd_years: int, apiKey: str):
+    """
+    Intrinio-backed equivalent of get_rAndD() — same non-standard 2-tuple
+    return: (dict with a list of yearly R&D expenses, years actually
+    processed).
+
+    Field map: research_and_development -> rdexpense (confirmed clean,
+    single unambiguous tag — easiest field in the whole migration).
+    """
+    period_ids = _intrinio_period_ids(company, "income_statement", apiKey)
+    if not period_ids:
+        return {"research_and_development": []}, 0
+
+    num_available_years = len(period_ids) // 4
+    years_to_process = min(rd_years, num_available_years)
+
+    rd_amount = []
+    for i in range(years_to_process):
+        block_ids = period_ids[i * 4 : i * 4 + 4]
+        year_rd = 0.0
+        for pid in block_ids:
+            q = _intrinio_standardized(pid, apiKey)
+            year_rd += safe_float(q.get("rdexpense"))
+        rd_amount.append(year_rd)
+
+    return {"research_and_development": rd_amount}, years_to_process
+
+
+def get_quote_intrinio(company: str, apiKey: str):
+    """
+    Intrinio-backed equivalent of get_quote() — same non-standard bare
+    6-tuple return, same order: (price, sharesOutstanding, marketCap,
+    company_name, dividend_yield, analyst_count).
+
+    Field map (confirmed live 2026-08-24, see docs/decisions.md):
+      price             -> data_point/adj_close_price
+      marketCap          -> data_point/marketcap
+      sharesOutstanding   -> DERIVED as marketCap / price, not a weighted-
+                            average tag. Confirmed necessary: this project's
+                            own DAL/UPS work found Intrinio's
+                            weightedavebasicdilutedsharesos is a
+                            trailing-quarter EPS-denominator average, not
+                            current point-in-time shares — it understated
+                            UPS's real share count by ~12% due to real
+                            buyback activity. marketcap/price is Intrinio's
+                            own real-time-consistent pair, not a proxy.
+      company_name        -> companies/{ticker} -> "name"
+      dividend_yield       -> data_point/trailing_dividend_yield
+      analyst_count        -> NOT AVAILABLE on the current (Starter/trial)
+                            Intrinio plan — companies/{id}/data_point/
+                            analyst_ratings returned an error 2026-08-21.
+                            Degrades to 0 with a logged warning rather than
+                            crashing or omitting the tuple slot. Re-check
+                            once/if a higher tier is confirmed to cover it
+                            (see docs/decisions.md migration plan).
+
+    Raises
+    ------
+    RuntimeError
+        If price or marketCap/name data is unavailable — mirrors
+        get_quote()'s RuntimeError on missing AV OVERVIEW fields (usually
+        means no Intrinio coverage for the symbol).
+    """
+    price = safe_float(_intrinio_get(f"companies/{company}/data_point/adj_close_price", apiKey))
+    if price <= 0:
+        raise RuntimeError(
+            f"Intrinio price data for {company} is missing or zero — "
+            f"likely no Intrinio coverage for this symbol"
+        )
+
+    market_cap = safe_float(_intrinio_get(f"companies/{company}/data_point/marketcap", apiKey))
+    company_info = _intrinio_get(f"companies/{company}", apiKey)
+    company_name = company_info.get("name")
+    if not market_cap or not company_name:
+        raise RuntimeError(
+            f"Intrinio company data for {company} is missing marketCap/name — "
+            f"likely no Intrinio coverage for this symbol"
+        )
+
+    shares_outstanding = market_cap / price
+
+    try:
+        dividend_yield = safe_float(
+            _intrinio_get(f"companies/{company}/data_point/trailing_dividend_yield", apiKey)
+        )
+    except Exception:
+        dividend_yield = 0.0
+
+    analyst_count = 0
+    logger.warning(
+        f"{company}: analyst_count not available via Intrinio on the current "
+        f"plan tier — defaulting to 0. See docs/decisions.md migration plan."
+    )
+
+    return price, shares_outstanding, market_cap, company_name, dividend_yield, analyst_count
+
+
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
     """
     Shared timeout+retry wrapper for get_erp()/get_risk_free()'s network
