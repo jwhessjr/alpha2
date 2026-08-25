@@ -933,6 +933,91 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
     return income_statement
 
 
+def _intrinio_reported_tags(fundamental_id: str, api_key: str) -> dict:
+    """Flattened {tag: value} for one period's as-reported (raw XBRL) view,
+    consolidated-total values only (dimensions=None — excludes segment/
+    product breakdowns, e.g. VZ's Revenues also appears split by
+    ServiceAndOtherMember/ProductMember dimensions under the same tag name;
+    only the dimensions=None entry is the real consolidated total).
+
+    Some tags carry a genuine duplicate dimensions=None entry (observed:
+    PYPL's ProfitLoss appeared twice, once real, once a stray 0.0) — prefer
+    the non-zero value per tag rather than first-seen, to avoid a stray
+    zero silently overwriting a real figure depending on API response order.
+    """
+    data = _intrinio_get(f"fundamentals/{fundamental_id}/reported_financials", api_key)
+    out: dict[str, float] = {}
+    for item in data.get("reported_financials", []):
+        if item.get("dimensions"):
+            continue  # segment/product breakdown, not the consolidated total
+        tag = (item.get("xbrl_tag") or {}).get("tag")
+        if tag is None:
+            continue
+        val = safe_float(item.get("value"))
+        if tag not in out or (out[tag] == 0.0 and val != 0.0):
+            out[tag] = val
+    return out
+
+
+def _intrinio_lease_debt_addback(
+    fundamental_id: str, api_key: str, standardized_longtermdebt: float
+) -> tuple[float, float]:
+    """
+    Returns (current_addback, noncurrent_addback) — lease-liability amounts
+    to add to short_term_debt/long_term_debt so bv_debt reflects ALL
+    interest-bearing debt, not just bank/bond debt. Decided 2026-08-25 (see
+    docs/decisions.md): bv_debt should include all interest-bearing debt;
+    working capital should exclude it. Since working capital's formula
+    already subtracts short_term_debt from total_current_liabilities, fixing
+    short_term_debt/long_term_debt here fixes both at once — no changes
+    needed elsewhere.
+
+    Operating lease liability is ALWAYS added. Confirmed on every filer
+    checked (AAPL, DAL, and every ticker in the field-map investigation) that
+    it is never folded into a filer's own reported debt line — it always
+    sits in the generic "other liabilities" bucket instead, regardless of
+    whether the filer breaks lease out as its own balance-sheet caption
+    (DAL) or nets everything into "Other" (AAPL). Unambiguous, no detection
+    needed.
+
+    Finance lease liability is CONDITIONALLY added. Some filers (DAL, UPS
+    confirmed) already bundle it into their own combined "debt and finance
+    leases" line, which flows straight into Intrinio's standardized
+    longtermdebt tag — adding it again would double-count. Detected by
+    comparing the as-reported combined tag
+    (LongTermDebtAndCapitalLeaseObligations) against the standardized
+    longtermdebt value: a close match means finance lease is already bundled
+    in. CONSERVATIVE FALLBACK, deliberate: if this can't be determined
+    cleanly (combined tag absent, or no close match), do NOT add finance
+    lease — operating lease is the dominant term for nearly every real
+    company (e.g. AAPL: $10.9B operating vs $0.7B finance liability), so a
+    missed finance-lease addback is a much smaller residual error than a
+    double-counted one. This is the intentional backout-friendly bias in
+    this function: when uncertain, under-add rather than over-add.
+    """
+    tags = _intrinio_reported_tags(fundamental_id, api_key)
+
+    op_current = tags.get("OperatingLeaseLiabilityCurrent", 0.0)
+    op_noncurrent = tags.get("OperatingLeaseLiabilityNoncurrent", 0.0)
+
+    fin_current = 0.0
+    fin_noncurrent = 0.0
+    combined_noncurrent = tags.get("LongTermDebtAndCapitalLeaseObligations")
+    if combined_noncurrent is not None and standardized_longtermdebt > 0:
+        already_bundled = (
+            abs(combined_noncurrent - standardized_longtermdebt)
+            < max(1.0, standardized_longtermdebt * 0.01)
+        )
+        if not already_bundled:
+            fin_current = tags.get("FinanceLeaseLiabilityCurrent", 0.0)
+            fin_noncurrent = tags.get("FinanceLeaseLiabilityNoncurrent", 0.0)
+        # else: already bundled into standardized longtermdebt, add nothing.
+    # else: no combined tag to compare against — conservative fallback,
+    # add nothing rather than risk double-counting.
+
+    return (op_current + fin_current, op_noncurrent + fin_noncurrent)
+
+
 def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool = False) -> dict:
     """
     Intrinio-backed equivalent of get_bal_sheet() — same return shape,
@@ -944,22 +1029,22 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
                                     tag combined cash this way)
       total_current_assets       -> totalcurrentassets
       total_current_liabilities  -> totalcurrentliabilities
-      short_term_debt             -> shorttermdebt (already finance-lease-
-                                    inclusive on filers that bundle it, e.g.
-                                    DAL/UPS — confirmed live)
-      long_term_debt              -> longtermdebt (same)
+      short_term_debt             -> shorttermdebt + lease liability addback
+                                    (see _intrinio_lease_debt_addback())
+      long_term_debt              -> longtermdebt + lease liability addback
+                                    (same)
       total_stockholders_equity   -> totalcommonequity (parent-only, matches
                                     AV's totalShareholderEquity semantics —
                                     excludes noncontrolling interest)
 
-    KNOWN GAP, deliberate scope decision for this pass: operating leases are
-    NOT folded into short_term_debt/long_term_debt here. Intrinio's
-    standardized view doesn't isolate them (same blind spot AV has) and the
-    as-reported OperatingLeaseLiabilityCurrent/Noncurrent fallback resolver
-    is real, non-trivial, filer-varying logic — deferred to Phase 1b once
-    Phase 2's shadow-mode run shows which held/candidate tickers actually
-    need it (see docs/decisions.md field map). Not silently dropped: this
-    docstring and the migration plan both flag it.
+    LEASE-INCLUSIVE DEBT (2026-08-25, closes the Phase 1b gap): every period
+    also fetches the as-reported view and adds operating (+ conditionally
+    finance) lease liability into short_term_debt/long_term_debt via
+    _intrinio_lease_debt_addback() — see that function's docstring for the
+    full detection logic and its deliberate conservative-fallback bias.
+    Roughly doubles the API calls for a balance sheet fetch (as-reported
+    view per period, not just standardized) — accepted given Intrinio's
+    much higher rate limit vs. AV.
 
     is_financial_or_reit is accepted for signature parity with
     get_bal_sheet() but unused here — Intrinio's cashandequivalents tag has
@@ -1015,11 +1100,16 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
         if len(block) < 4:
             break
         q = block[0]
+        raw_longtermdebt = safe_float(q.get("longtermdebt"))
+        raw_shorttermdebt = safe_float(q.get("shorttermdebt"))
+        lease_current, lease_noncurrent = _intrinio_lease_debt_addback(
+            period_ids[i], apiKey, raw_longtermdebt
+        )
         cash_and_equivalents.append(_cash(q))
         total_current_assets.append(safe_float(q.get("totalcurrentassets")))
         total_current_liabilities.append(safe_float(q.get("totalcurrentliabilities")))
-        short_term_debt.append(safe_float(q.get("shorttermdebt")))
-        long_term_debt.append(safe_float(q.get("longtermdebt")))
+        short_term_debt.append(raw_shorttermdebt + lease_current)
+        long_term_debt.append(raw_longtermdebt + lease_noncurrent)
         total_stockholders_equity.append(safe_float(q.get("totalcommonequity")))
 
     if not cash_and_equivalents:
