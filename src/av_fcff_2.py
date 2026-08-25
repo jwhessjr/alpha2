@@ -68,12 +68,16 @@ if not FRED_KEY:
 MARGINAL_TAX_RATE = 0.26
 GROWTH_PERIOD = 5  # high-growth years; override with --growth N
 
-# AV->Intrinio migration Phase 2 (2026-08-24): data source for the 5 fetch
-# wrappers below. "av" (default) is production, unchanged behavior. "intrinio"
-# is opt-in via --provider, for shadow-mode validation against a disposable
-# DB only — see docs/decisions.md migration plan. Not a production default
-# switch; that's Phase 3.
-DATA_PROVIDER = "av"
+# AV->Intrinio migration Phase 3 (2026-08-24): "intrinio" is now the
+# production default for the 5 fetch wrappers below, with automatic
+# per-call fallback to AV if an Intrinio fetch fails for a given ticker
+# (see _fetch_with_fallback()) -- not just an available alternative via
+# --provider av. AV's own subscription runs regardless through April 2027,
+# and Phase 2's real 3-way comparison against SEC EDGAR ground truth found
+# each vendor fails on different tickers for different reasons, so combining
+# both should reduce total nightly failures versus either alone. Full
+# rationale: docs/decisions.md, "Data provider: Intrinio becomes primary".
+DATA_PROVIDER = "intrinio"
 
 # DB path — override via $VALUATION_DB env var or --db argument
 DEFAULT_DB = os.environ.get("VALUATION_DB", "/Volumes/Financial_Data/valuation.db")
@@ -316,28 +320,66 @@ def get_tickers_from_filings(path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_with_fallback(ticker, intrinio_fn, av_fn, label):
+    """
+    Phase 3 (2026-08-24): when DATA_PROVIDER == "intrinio" (the production
+    default), try Intrinio first and automatically fall back to AV if the
+    Intrinio call fails for this ticker -- not just AV being reachable via
+    --provider av. Phase 2's real 3-way comparison against SEC EDGAR found
+    each vendor fails on different tickers for different reasons (Intrinio:
+    genuine coverage gaps on foreign-domiciled names; AV: the cash-corruption/
+    coverage pattern that motivated the migration), so combining both
+    automatically should reduce total nightly failures versus either alone.
+    See docs/decisions.md, "Data provider: Intrinio becomes primary".
+
+    When DATA_PROVIDER == "av" explicitly (manual/shadow-mode AV-only runs),
+    no fallback applies -- calls AV directly, unchanged from Phase 1/2.
+    """
+    if DATA_PROVIDER != "intrinio":
+        return av_fn()
+    try:
+        return intrinio_fn()
+    except Exception as exc:
+        logger.warning(
+            f"{ticker}: Intrinio {label} fetch failed ({exc}) — falling back to AV."
+        )
+        return av_fn()
+
+
 def income_statement(ticker, api_key):
-    if DATA_PROVIDER == "intrinio":
-        return hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY)
-    return hg_dcflib.get_inc_stmnt(ticker, api_key)
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY),
+        lambda: hg_dcflib.get_inc_stmnt(ticker, api_key),
+        "income statement",
+    )
 
 
 def balance_sheet(ticker, api_key, is_financial_or_reit: bool = False):
-    if DATA_PROVIDER == "intrinio":
-        return hg_dcflib.get_bal_sheet_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit)
-    return hg_dcflib.get_bal_sheet(ticker, api_key, is_financial_or_reit=is_financial_or_reit)
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_bal_sheet_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit),
+        lambda: hg_dcflib.get_bal_sheet(ticker, api_key, is_financial_or_reit=is_financial_or_reit),
+        "balance sheet",
+    )
 
 
 def cash_flow_statement(ticker, api_key):
-    if DATA_PROVIDER == "intrinio":
-        return hg_dcflib.get_cash_flow_intrinio(ticker, INTRINIO_KEY)
-    return hg_dcflib.get_cash_flow(ticker, api_key)
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_cash_flow_intrinio(ticker, INTRINIO_KEY),
+        lambda: hg_dcflib.get_cash_flow(ticker, api_key),
+        "cash flow statement",
+    )
 
 
 def research_and_development(ticker, rd_years, api_key):
-    if DATA_PROVIDER == "intrinio":
-        return hg_dcflib.get_rAndD_intrinio(ticker, rd_years, INTRINIO_KEY)
-    return hg_dcflib.get_rAndD(ticker, rd_years, api_key)
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_rAndD_intrinio(ticker, rd_years, INTRINIO_KEY),
+        lambda: hg_dcflib.get_rAndD(ticker, rd_years, api_key),
+        "R&D",
+    )
 
 
 # Populated by prefetch_quotes() before a batch run — see that function's
@@ -345,7 +387,10 @@ def research_and_development(ticker, rd_years, api_key):
 # fundamentals calls are deliberately kept out of the same time window.
 # Keyed by (ticker, DATA_PROVIDER) so a shadow-mode comparison that runs both
 # providers within one process (e.g. a Phase 2 diff script) can't serve a
-# cached AV quote back for an Intrinio-provider call or vice versa.
+# cached AV quote back for an Intrinio-provider call or vice versa. A
+# fallback-to-AV quote (Phase 3) is cached under the "intrinio" provider key
+# it was requested under, not "av" -- it's what enterprise_quote() actually
+# returned for that (ticker, DATA_PROVIDER) combination.
 _QUOTE_CACHE: dict = {}
 
 
@@ -353,9 +398,12 @@ def enterprise_quote(ticker, api_key):
     cache_key = (ticker, DATA_PROVIDER)
     if cache_key in _QUOTE_CACHE:
         return _QUOTE_CACHE[cache_key]
-    if DATA_PROVIDER == "intrinio":
-        return hg_dcflib.get_quote_intrinio(ticker, INTRINIO_KEY)
-    return hg_dcflib.get_quote(ticker, api_key)
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_quote_intrinio(ticker, INTRINIO_KEY),
+        lambda: hg_dcflib.get_quote(ticker, api_key),
+        "quote",
+    )
 
 
 def prefetch_quotes(tickers: list, api_key: str) -> None:
@@ -385,11 +433,17 @@ def prefetch_quotes(tickers: list, api_key: str) -> None:
     start_time = time.time()
     for idx, ticker in enumerate(tickers, 1):
         try:
-            if DATA_PROVIDER == "intrinio":
-                _QUOTE_CACHE[(ticker, DATA_PROVIDER)] = hg_dcflib.get_quote_intrinio(ticker, INTRINIO_KEY)
-            else:
-                _QUOTE_CACHE[(ticker, DATA_PROVIDER)] = hg_dcflib.get_quote(ticker, api_key)
+            _QUOTE_CACHE[(ticker, DATA_PROVIDER)] = _fetch_with_fallback(
+                ticker,
+                lambda t=ticker: hg_dcflib.get_quote_intrinio(t, INTRINIO_KEY),
+                lambda t=ticker: hg_dcflib.get_quote(t, api_key),
+                "quote",
+            )
         except Exception as e:
+            # Both Intrinio and its AV fallback failed (or DATA_PROVIDER=="av"
+            # and AV itself failed) -- logged and left out of the cache;
+            # enterprise_quote()'s own fallback-aware live call covers this
+            # ticker later, same degrade-gracefully behavior as before.
             logger.warning(f"Prefetch quote failed for {ticker}: {e}")
         filled = int(bar_width * idx / total)
         bar = "#" * filled + "-" * (bar_width - filled)
@@ -3430,10 +3484,11 @@ def main():
                         help="Override shareholders' equity (in dollars) for all tickers in this run. "
                              "Use when AV balance sheet data is known to be incorrect (e.g., PPG Q1 2026). "
                              "Example: --equity-override 8104000000")
-    parser.add_argument("--provider", choices=["av", "intrinio"], default="av",
-                        help="Fundamentals data source (default: av). 'intrinio' is for AV->Intrinio "
-                             "migration Phase 2 shadow-mode validation — run against a disposable --db "
-                             "copy, not production, until Phase 3.")
+    parser.add_argument("--provider", choices=["av", "intrinio"], default="intrinio",
+                        help="Fundamentals data source (default: intrinio, with automatic fallback "
+                             "to AV per-ticker if an Intrinio fetch fails — see docs/decisions.md, "
+                             "'Data provider: Intrinio becomes primary'). Pass --provider av to force "
+                             "AV only, no fallback, e.g. for a manual AV-side comparison run.")
     args = parser.parse_args()
 
     growth_period = args.growth
@@ -3444,7 +3499,9 @@ def main():
         print(f"  equity override active: ${EQUITY_OVERRIDE:,.0f}")
     DATA_PROVIDER = args.provider
     if DATA_PROVIDER == "intrinio":
-        print("  data provider: INTRINIO (shadow-mode — verify --db points at a disposable copy)")
+        print("  data provider: Intrinio (primary), AV fallback on per-ticker failure")
+    else:
+        print("  data provider: AV only (--provider av — no Intrinio fallback)")
     db_path       = args.db
 
     # ---- Fetch market reference data (deferred from module level) --------
