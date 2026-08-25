@@ -802,14 +802,14 @@ def _intrinio_get(path: str, api_key: str, **params) -> dict:
             raise RuntimeError(f"Intrinio network error on {path}: {exc}")
 
 
-def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int = 20) -> list[str]:
+def _intrinio_periods(company: str, statement_code: str, api_key: str, n: int = 20) -> list[dict]:
     """
-    Most-recent-first fundamental period IDs for company/statement_code.
-    Returns [] (does NOT raise) on no coverage — callers differ on whether
-    that should be a hard failure (get_inc_stmnt_intrinio/get_bal_sheet_intrinio/
-    get_cash_flow_intrinio all raise, matching their AV equivalents) or a
-    graceful empty result (get_rAndD_intrinio, also matching its AV
-    equivalent) — see each function's own empty-check for which applies.
+    Most-recent-first fundamental periods for company/statement_code, each
+    {"id": ..., "fiscal_year": ..., "fiscal_period": ...}. Returns [] (does
+    NOT raise) on no coverage — see _intrinio_period_ids()'s docstring for
+    which callers treat that as fatal. This single discovery call is cheap
+    regardless of n (one API call either way) — n only bounds how many
+    period entries are returned in that one response, not the call count.
     """
     data = _intrinio_get(
         f"companies/{company}/fundamentals",
@@ -818,7 +818,24 @@ def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int
         type="QTR",
     )
     fundamentals = data.get("fundamentals", [])
-    return [f["id"] for f in fundamentals[:n]]
+    return [
+        {"id": f["id"], "fiscal_year": f.get("fiscal_year"), "fiscal_period": f.get("fiscal_period")}
+        for f in fundamentals[:n]
+    ]
+
+
+def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int = 20) -> list[str]:
+    """
+    Most-recent-first fundamental period IDs for company/statement_code.
+    Thin wrapper over _intrinio_periods() for callers that only need bare
+    IDs. Returns [] (does NOT raise) on no coverage — callers differ on
+    whether that should be a hard failure (get_inc_stmnt_intrinio/
+    get_bal_sheet_intrinio/get_cash_flow_intrinio all raise, matching their
+    AV equivalents) or a graceful empty result (get_rAndD_intrinio, also
+    matching its AV equivalent) — see each function's own empty-check for
+    which applies.
+    """
+    return [p["id"] for p in _intrinio_periods(company, statement_code, api_key, n)]
 
 
 def _intrinio_standardized(fundamental_id: str, api_key: str) -> dict:
@@ -881,12 +898,17 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
       totalRevenue        -> totalrevenue
       netIncome            -> netincome
     """
-    period_ids = _intrinio_period_ids(company, "income_statement", apiKey)
+    # Fetch only 3 years (12 quarters), not 5 (20) -- confirmed via direct
+    # grep of av_fcff_2.py (2026-08-25) that no caller ever reads beyond
+    # ebit[:WEALTH_GATE_MIN_YEARS] (=3, the capital-light-compounder
+    # durability gate); every other field only reads index [0]. Cuts 8
+    # wasted standardized_financials calls per income-statement fetch.
+    period_ids = _intrinio_period_ids(company, "income_statement", apiKey, n=12)
     if not period_ids:
         raise ValueError(f"No quarterly reports found for {company} on Intrinio")
     quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
 
-    max_quarters = min(len(quarters), 20)
+    max_quarters = min(len(quarters), 12)
     yearly_data = []
     for i in range(0, max_quarters, 4):
         block = quarters[i : i + 4]
@@ -1037,25 +1059,49 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
                                     AV's totalShareholderEquity semantics —
                                     excludes noncontrolling interest)
 
-    LEASE-INCLUSIVE DEBT (2026-08-25, closes the Phase 1b gap): every period
-    also fetches the as-reported view and adds operating (+ conditionally
-    finance) lease liability into short_term_debt/long_term_debt via
-    _intrinio_lease_debt_addback() — see that function's docstring for the
-    full detection logic and its deliberate conservative-fallback bias.
-    Roughly doubles the API calls for a balance sheet fetch (as-reported
-    view per period, not just standardized) — accepted given Intrinio's
-    much higher rate limit vs. AV.
+    LEASE-INCLUSIVE DEBT (2026-08-25, closes the Phase 1b gap): each period
+    fetched also gets the as-reported view checked, adding operating (+
+    conditionally finance) lease liability into short_term_debt/long_term_debt
+    via _intrinio_lease_debt_addback() — see that function's docstring for
+    the full detection logic and its deliberate conservative-fallback bias.
+
+    PERIOD SELECTION (2026-08-25, efficiency fix): balance sheet is
+    point-in-time, and every real downstream consumer in av_fcff_2.py only
+    ever reads index [0] (current) or [1] (one year prior) — confirmed via
+    direct grep, not assumption: calc_chng_wc() explicitly requires exactly
+    2 years, calc_bv_debt()/the cash checks only read [0]. So this fetches
+    ONLY the current period plus the period exactly one fiscal year prior —
+    matched on fiscal_year/fiscal_period from the discovery response (which
+    is one cheap call regardless of how many periods it lists), not just
+    "4 periods back", since a gap or restated duplicate in the period
+    sequence could otherwise silently misalign that offset. Cuts a full
+    balance-sheet fetch from 26 API calls (1 discovery + 20 standardized +
+    5 as-reported, most of it fetched-then-discarded before this fix) down
+    to 5 (1 discovery + 2 standardized + 2 as-reported).
 
     is_financial_or_reit is accepted for signature parity with
     get_bal_sheet() but unused here — Intrinio's cashandequivalents tag has
     not shown AV's financial-firm/REIT cash-tagging quirk (docs/known_errors.md
     2026-08-02); revisit if Phase 2 finds otherwise.
     """
-    period_ids = _intrinio_period_ids(company, "balance_sheet_statement", apiKey)
-    quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
-
-    if not quarters:
+    periods = _intrinio_periods(company, "balance_sheet_statement", apiKey, n=20)
+    if not periods:
         raise ValueError(f"No quarterly balance sheet reports found for {company} on Intrinio")
+
+    current = periods[0]
+    prior_year = None
+    for p in periods[1:]:
+        if (
+            p.get("fiscal_period") == current.get("fiscal_period")
+            and p.get("fiscal_year") is not None
+            and current.get("fiscal_year") is not None
+            and p["fiscal_year"] == current["fiscal_year"] - 1
+        ):
+            prior_year = p
+            break
+
+    selected_periods = [current] + ([prior_year] if prior_year else [])
+    quarters = [_intrinio_standardized(p["id"], apiKey) for p in selected_periods]
 
     def _cash(q: dict) -> float:
         v = safe_float(q.get("cashandequivalents"))
@@ -1087,7 +1133,6 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
                 f"pending Phase 2 evidence."
             )
 
-    max_quarters = min(len(quarters), 20)
     cash_and_equivalents = []
     total_current_assets = []
     total_current_liabilities = []
@@ -1095,15 +1140,11 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
     long_term_debt = []
     total_stockholders_equity = []
 
-    for i in range(0, max_quarters, 4):
-        block = quarters[i : i + 4]
-        if len(block) < 4:
-            break
-        q = block[0]
+    for i, q in enumerate(quarters):
         raw_longtermdebt = safe_float(q.get("longtermdebt"))
         raw_shorttermdebt = safe_float(q.get("shorttermdebt"))
         lease_current, lease_noncurrent = _intrinio_lease_debt_addback(
-            period_ids[i], apiKey, raw_longtermdebt
+            selected_periods[i]["id"], apiKey, raw_longtermdebt
         )
         cash_and_equivalents.append(_cash(q))
         total_current_assets.append(safe_float(q.get("totalcurrentassets")))
