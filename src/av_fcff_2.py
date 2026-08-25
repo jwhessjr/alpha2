@@ -859,13 +859,18 @@ def calc_gated_return_on_capital(
       already-guarded computation rather than inventing a second heuristic).
       Any gate fails: (None, reason naming the failed gate(s)).
 
-    Callers must treat a None result the same as the existing negative-book-
-    equity case: write a flagged, zeroed Stock_Value with notes=<reason>
-    instead of continuing the DCF. docs/decisions.md's existing "downstream
-    consumers filter on non-empty notes" rule already makes that row
-    correctly invisible to replacer.py's candidate queries and skips
-    portfolio_monitor.py's elimination check — no consumer-side changes
-    needed.
+    Callers must treat a None result by writing a flagged, zeroed Stock_Value
+    with notes=<reason> instead of continuing the DCF -- this is now the ONLY
+    negative-book-equity-adjacent skip path (see docs/known_errors.md
+    2026-08-25 in HessGrp: a separate, cruder `adjusted_bv_equity < 0` guard
+    used to fire before this function ever ran, unconditionally killing the
+    DCF for any negative-book-equity ticker regardless of invested capital --
+    removed so every such ticker gets a real shot at the three-gate test
+    above instead of being assumed to fail it). docs/decisions.md's existing
+    "downstream consumers filter on non-empty notes" rule already makes a
+    None-result row correctly invisible to replacer.py's candidate queries
+    and skips portfolio_monitor.py's elimination check — no consumer-side
+    changes needed.
     """
     cash = bal_sht["cash_and_equivalents"][0]
     invested_capital = adjusted_bv_equity + bv_debt - cash
@@ -1574,23 +1579,6 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
 
-        if adjusted_bv_equity < 0:
-            logger.warning(f"{ticker}: negative book equity ({adjusted_bv_equity:,.0f}) — DCF not applicable")
-            return Stock_Value(
-                ticker=ticker, valuation_date=valuation_date, ent_name=ent_name,
-                industry=industry, cik=cik,
-                beta=calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE),
-                market_cap=market_cap,
-                price=price, shares_outstanding=shares_outstanding,
-                risk_free_rate=RISK_FREE, eq_premium=EQ_PREM,
-                growth_rate=0.0, cost_of_capital=0.0, wealth_pc=0.0,
-                fcff_value=0.0, terminal_value=0.0, share_value=0.0,
-                margin_of_safety=0.0, margin_of_safety_pc=0.0, target_price=0.0,
-                earnings_yield=0.0, dividend_yield=dividend_yield,
-                notes="DCF not applicable — negative book equity",
-                analyst_count=analyst_count,
-            )
-
         # Sanity check: if |EBIT| dwarfs the market cap by more than 10×,
         # the quarterly working-capital data is almost certainly corrupted.
         if market_cap > 0 and abs(adjusted_ebit) > 10 * market_cap:
@@ -2252,12 +2240,6 @@ def _value_stock_detail_fcff(
         )
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
-
-        if adjusted_bv_equity < 0:
-            raise ValueError(
-                f"Negative book equity ({adjusted_bv_equity:,.0f}) — "
-                "DCF not applicable for companies with negative equity"
-            )
 
         if market_cap > 0 and abs(adjusted_ebit) > 10 * market_cap:
             raise ValueError(
