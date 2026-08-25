@@ -832,6 +832,33 @@ def _intrinio_standardized(fundamental_id: str, api_key: str) -> dict:
     return out
 
 
+def _intrinio_quarter_interest_expense(q: dict) -> float:
+    """Prefer Intrinio's dedicated gross interest-expense tag when the filer
+    reports one separately; fall back to the net combined interest-income
+    tag (sign-flipped) only when the dedicated tag is absent.
+
+    Real bug found 2026-08-25 (see docs/known_errors.md): get_inc_stmnt_intrinio()
+    previously read ONLY totalinterestincome, sign-flipped. That's correct for
+    filers that report one combined net interest line (e.g. AZO), but wrong
+    for filers that report gross interest expense as its own tag -- confirmed
+    live: VZ ($1,985,000,000), GOGO ($17,987,000), IT ($22,266,000), AOS
+    ($8,100,000), ETD ($55,000) all have a real, separately-populated
+    totalinterestexpense tag that this function was silently never reading,
+    dropping straight to $0 on every one of them. totalinterestexpense is
+    already expense-positive -- no sign flip needed when present.
+
+    When NEITHER tag is present (confirmed live: APA, PYPL) -- a genuine
+    filer-presentation gap, not a vendor-fixable data bug (verified directly
+    against PYPL's real 10-Q: no interest line at all, folded into "Other
+    income (expense), net") -- this correctly falls through to 0.0, same as
+    before.
+    """
+    raw_expense = q.get("totalinterestexpense")
+    if raw_expense is not None:
+        return safe_float(raw_expense)
+    return -safe_float(q.get("totalinterestincome"))
+
+
 def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
     """
     Intrinio-backed equivalent of get_inc_stmnt() — same return shape,
@@ -845,17 +872,12 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
                              raw 'ebit' field being inflated)
       incomeBeforeTax     -> totalpretaxincome
       income_tax_expense  -> incometaxexpense
-      interest_expense    -> -totalinterestincome (NET, not gross — confirmed
-                             not fixable by vendor switch; see field map. SIGN
-                             FLIP REQUIRED: Intrinio's tag is income-positive
-                             (positive = net interest income), AV's
-                             interest_expense and every downstream consumer
-                             (interest-coverage gates, cost-of-debt lookups)
-                             are expense-positive. Confirmed 2026-08-24 via
-                             compare_data_providers.py on AZO: AV +$472,052,000
-                             vs. unflipped Intrinio -$472,053,000 — same
-                             magnitude, opposite sign, both vendors actually
-                             agree on the real number.)
+      interest_expense    -> totalinterestexpense when present (already
+                             expense-positive), else -totalinterestincome
+                             (NET, sign-flipped) as a fallback for filers that
+                             only report one combined net interest line. See
+                             _intrinio_quarter_interest_expense() docstring
+                             for the 2026-08-25 bug this fixes.
       totalRevenue        -> totalrevenue
       netIncome            -> netincome
     """
@@ -875,7 +897,7 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
                 "ebit": sum(safe_float(q.get("totaloperatingincome")) for q in block),
                 "incomeBeforeTax": sum(safe_float(q.get("totalpretaxincome")) for q in block),
                 "income_tax_expense": sum(safe_float(q.get("incometaxexpense")) for q in block),
-                "interest_expense": sum(-safe_float(q.get("totalinterestincome")) for q in block),
+                "interest_expense": sum(_intrinio_quarter_interest_expense(q) for q in block),
                 "totalRevenue": sum(safe_float(q.get("totalrevenue")) for q in block),
                 "netIncome": sum(safe_float(q.get("netincome")) for q in block),
             }
