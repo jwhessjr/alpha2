@@ -876,7 +876,7 @@ def _intrinio_quarter_interest_expense(q: dict) -> float:
     return -safe_float(q.get("totalinterestincome"))
 
 
-def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
+def get_inc_stmnt_intrinio(company: str, apiKey: str, is_financial_or_reit: bool = False) -> dict:
     """
     Intrinio-backed equivalent of get_inc_stmnt() — same return shape,
     same 5-year-annualized-from-quarters aggregation, same single-quarter
@@ -897,6 +897,19 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
                              for the 2026-08-25 bug this fixes.
       totalRevenue        -> totalrevenue
       netIncome            -> netincome
+
+    is_financial_or_reit: when False (the FCFF/non-bank caller), a response
+    that uses the bank/financial-institution standardized template
+    ('totalinterestincome' present, 'totaloperatingincome' absent as a KEY,
+    not merely zero) raises instead of silently returning ebit=0 for every
+    quarter. Found live 2026-08-26: GRBK (Green Brick Partners, a
+    homebuilder) gets Intrinio's bank template despite genuinely not being a
+    bank -- Intrinio's own internal industry classification appears wrong for
+    this ticker specifically. AV's data is correct (real EBIT ~$400M/quarter,
+    not 0) but was never attempted, since a "successful" (non-raising)
+    Intrinio call never triggers _fetch_with_fallback()'s AV fallback. When
+    is_financial_or_reit=True (a real bank/REIT caller, e.g. value_bank_stock()),
+    the bank template is the CORRECT, expected shape -- this check is skipped.
     """
     # Fetch only 3 years (12 quarters), not 5 (20) -- confirmed via direct
     # grep of av_fcff_2.py (2026-08-25) that no caller ever reads beyond
@@ -907,6 +920,15 @@ def get_inc_stmnt_intrinio(company: str, apiKey: str) -> dict:
     if not period_ids:
         raise ValueError(f"No quarterly reports found for {company} on Intrinio")
     quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
+
+    if not is_financial_or_reit and quarters:
+        if "totaloperatingincome" not in quarters[0] and "totalinterestincome" in quarters[0]:
+            raise ValueError(
+                f"{company}: Intrinio returned the bank/financial-institution "
+                f"template (totalinterestincome present, totaloperatingincome "
+                f"absent) for a non-financial ticker -- likely an Intrinio-side "
+                f"industry misclassification, not a real zero-EBIT company."
+            )
 
     max_quarters = min(len(quarters), 12)
     yearly_data = []
@@ -1233,7 +1255,7 @@ def get_rAndD_intrinio(company: str, rd_years: int, apiKey: str):
     """
     period_ids = _intrinio_period_ids(company, "income_statement", apiKey)
     if not period_ids:
-        return {"research_and_development": []}, 0
+        raise ValueError(f"No quarterly reports found for {company} on Intrinio")
 
     num_available_years = len(period_ids) // 4
     years_to_process = min(rd_years, num_available_years)

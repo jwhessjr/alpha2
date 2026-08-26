@@ -346,10 +346,10 @@ def _fetch_with_fallback(ticker, intrinio_fn, av_fn, label):
         return av_fn()
 
 
-def income_statement(ticker, api_key):
+def income_statement(ticker, api_key, is_financial_or_reit: bool = False):
     return _fetch_with_fallback(
         ticker,
-        lambda: hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY),
+        lambda: hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit),
         lambda: hg_dcflib.get_inc_stmnt(ticker, api_key),
         "income statement",
     )
@@ -705,6 +705,26 @@ def capitalizerAndD(ticker, rd_years, api_key):
     rdTable = research_and_development(ticker, rd_years, api_key)
     rd_dict, years_to_process = rdTable
     logger.info(f"rdTable = {rdTable}")
+
+    if years_to_process == 0:
+        # Same zero-filled shape as the rd_years <= 1 branch above -- a
+        # vendor returning fewer than 4 quarters of income-statement history
+        # (thin data, not necessarily "no R&D") must degrade the same safe
+        # way, not leave rAndDExpense as an empty list. calc_adj_ebiat() and
+        # calc_reinvestment() both unconditionally index amort_schedule[...][0]
+        # -- an empty list crashes with "list index out of range" instead of
+        # a clear message. Confirmed live 2026-08-26: CMCL/CMRE/TNK (real
+        # zero-R&D companies -- shipping/mining, not thin data) hit exactly
+        # this path after get_rAndD_intrinio() started raising instead of
+        # silently returning empty (see docs/known_errors.md 2026-08-26).
+        return {
+            "rAndDExpense": [0.0],
+            "unamortized_percent": [0.0],
+            "unamort_amount": [0.0],
+            "RD_Asset_Value": 0.0,
+            "Current_Year_Amortization": 0.0,
+        }
+
     rd_table = {}
     rd_expense = []
     unamort_percent = []
@@ -862,15 +882,15 @@ def calc_gated_return_on_capital(
     Callers must treat a None result by writing a flagged, zeroed Stock_Value
     with notes=<reason> instead of continuing the DCF -- this is now the ONLY
     negative-book-equity-adjacent skip path (see docs/known_errors.md
-    2026-08-25 in HessGrp: a separate, cruder `adjusted_bv_equity < 0` guard
-    used to fire before this function ever ran, unconditionally killing the
-    DCF for any negative-book-equity ticker regardless of invested capital --
-    removed so every such ticker gets a real shot at the three-gate test
-    above instead of being assumed to fail it). docs/decisions.md's existing
-    "downstream consumers filter on non-empty notes" rule already makes a
-    None-result row correctly invisible to replacer.py's candidate queries
-    and skips portfolio_monitor.py's elimination check — no consumer-side
-    changes needed.
+    2026-08-25: a separate, cruder `adjusted_bv_equity < 0` guard used to fire
+    before this function ever ran, unconditionally killing the DCF for any
+    negative-book-equity ticker regardless of invested capital -- removed so
+    every such ticker gets a real shot at the three-gate test above instead
+    of being assumed to fail it). docs/decisions.md's existing "downstream
+    consumers filter on non-empty notes" rule already makes a None-result row
+    correctly invisible to replacer.py's candidate queries and skips
+    portfolio_monitor.py's elimination check — no consumer-side changes
+    needed.
     """
     cash = bal_sht["cash_and_equivalents"][0]
     invested_capital = adjusted_bv_equity + bv_debt - cash
@@ -1371,7 +1391,7 @@ def value_bank_stock(ticker: str, growth_period: int):
         industry = hg_dcflib.get_industry(ticker)
         unlevered_beta = hg_dcflib.get_beta(industry)
 
-        inc_stmnt = income_statement(ticker, MY_API_KEY)
+        inc_stmnt = income_statement(ticker, MY_API_KEY, is_financial_or_reit=True)
         bal_sht = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
@@ -1745,7 +1765,7 @@ def value_reit_stock(ticker: str, growth_period: int):
 
         unlevered_beta = hg_dcflib.get_beta(industry)
 
-        inc_stmnt = income_statement(ticker, MY_API_KEY)
+        inc_stmnt = income_statement(ticker, MY_API_KEY, is_financial_or_reit=True)
         bal_sht   = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
@@ -1945,7 +1965,7 @@ def _value_bank_stock_detail(
     try:
         unlevered_beta = hg_dcflib.get_beta(industry)
 
-        inc_stmnt = income_statement(ticker, MY_API_KEY)
+        inc_stmnt = income_statement(ticker, MY_API_KEY, is_financial_or_reit=True)
         bal_sht = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
@@ -2082,7 +2102,7 @@ def _value_reit_stock_detail(
     try:
         unlevered_beta = hg_dcflib.get_beta(industry)
 
-        inc_stmnt = income_statement(ticker, MY_API_KEY)
+        inc_stmnt = income_statement(ticker, MY_API_KEY, is_financial_or_reit=True)
         bal_sht   = balance_sheet(ticker, MY_API_KEY, is_financial_or_reit=True)
         cash_flw  = cash_flow_statement(ticker, MY_API_KEY)
         ent_quote = enterprise_quote(ticker, MY_API_KEY)
