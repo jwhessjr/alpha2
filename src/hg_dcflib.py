@@ -1290,6 +1290,20 @@ def get_inc_stmnt_intrinio_annual(company: str, apiKey: str, years: int = 10, is
                           helper (period-agnostic despite the name -- prefers
                           totalinterestexpense, falls back to sign-flipped
                           totalinterestincome, same logic as the quarterly path)
+      commonStockSharesOutstanding -> weightedavebasicdilutedsharesos (added
+                          2026-08-26 for lynch_score.py; lives on the income
+                          statement in Intrinio's schema, not the balance
+                          sheet where AV puts it -- see
+                          get_bal_sheet_intrinio_annual() and
+                          fetch_lynch_financials() for how the two get
+                          reconciled back into AV's shape. Same tag
+                          get_quote_intrinio()'s docstring already flagged as
+                          WRONG for a point-in-time shares-outstanding proxy
+                          (understated UPS's real count by ~12%) -- but here
+                          it's used only to compute a PAST year's EPS
+                          (net_income / weighted-average shares during that
+                          year), which is the textbook-correct EPS
+                          denominator, not a misuse of the tag.
 
     is_financial_or_reit: same bank-template guard as get_inc_stmnt_intrinio()
     (see its docstring, 2026-08-26) -- when False, a response using the bank
@@ -1336,6 +1350,7 @@ def get_inc_stmnt_intrinio_annual(company: str, apiKey: str, years: int = 10, is
             "incomeTaxExpense": q.get("incometaxexpense"),
             "incomeBeforeTax": q.get("totalpretaxincome"),
             "interestExpense": _intrinio_quarter_interest_expense(q),
+            "commonStockSharesOutstanding": q.get("weightedavebasicdilutedsharesos"),
         })
     return annual_reports
 
@@ -1346,7 +1361,8 @@ def get_bal_sheet_intrinio_annual(company: str, apiKey: str, years: int = 10) ->
     of dicts matching AV's BALANCE_SHEET annualReports entries:
     totalShareholderEquity, longTermDebt, shortTermDebt,
     cashAndCashEquivalentsAtCarryingValue, shortTermInvestments,
-    cashAndShortTermInvestments, totalAssets. Most-recent-year-first.
+    cashAndShortTermInvestments, totalAssets, inventory,
+    currentNetReceivables. Most-recent-year-first.
 
     Field map (confirmed live 2026-08-26 against AAPL real FY periods):
       totalShareholderEquity -> totalcommonequity
@@ -1364,6 +1380,10 @@ def get_bal_sheet_intrinio_annual(company: str, apiKey: str, years: int = 10) ->
                           components are unreliable for financial firms the
                           way AV's were, see docs/known_errors.md 2026-08-02)
       totalAssets                -> totalassets
+      inventory                  -> netinventory (added 2026-08-26 for
+                          lynch_score.py's balance-sheet-discipline score;
+                          0 for service companies on both vendors)
+      currentNetReceivables       -> accountsreceivable (same, 2026-08-26)
 
     Raises ValueError on fewer than 2 years of coverage -- one year alone
     can never support a multi-year lookback, so this triggers the AV
@@ -1396,6 +1416,8 @@ def get_bal_sheet_intrinio_annual(company: str, apiKey: str, years: int = 10) ->
             "shortTermInvestments": sti,
             "cashAndShortTermInvestments": cash + sti,
             "totalAssets": q.get("totalassets"),
+            "inventory": q.get("netinventory"),
+            "currentNetReceivables": q.get("accountsreceivable"),
         })
     return annual_reports
 
@@ -1541,6 +1563,44 @@ def get_quote_intrinio(company: str, apiKey: str):
     )
 
     return price, shares_outstanding, market_cap, company_name, dividend_yield, analyst_count
+
+
+def get_overview_intrinio(company: str, apiKey: str) -> dict:
+    """
+    Intrinio-backed equivalent of AV's OVERVIEW endpoint (Phase 4,
+    2026-08-26, built for lynch_score.py/growth_monitor.py) -- a current/
+    TTM snapshot, not annual history. Returns an AV-shaped dict: PERatio,
+    SharesOutstanding, DividendYield.
+
+    Field map (confirmed live 2026-08-26 against AAPL):
+      PERatio             -> data_point/pricetoearnings (confirmed live,
+                            e.g. 35.3686 for AAPL -- a real, direct trailing
+                            P/E data point, not derived)
+      SharesOutstanding     -> reuses get_quote_intrinio()'s marketCap/price
+                            derivation (a current, real-time-consistent
+                            point-in-time count -- correct here, unlike the
+                            weighted-average annual tag used for historical
+                            EPS elsewhere in this file)
+      DividendYield          -> reuses get_quote_intrinio()'s
+                            trailing_dividend_yield field
+
+    Raises whatever get_quote_intrinio() raises on missing price/marketCap/
+    name (no Intrinio coverage for the symbol) -- PERatio itself degrades to
+    None (matching AV's own behavior for loss-making companies, where
+    PERatio is legitimately absent) rather than being treated as fatal.
+    """
+    price, shares_outstanding, market_cap, company_name, dividend_yield, _ = get_quote_intrinio(company, apiKey)
+
+    try:
+        pe_ratio = safe_float(_intrinio_get(f"companies/{company}/data_point/pricetoearnings", apiKey))
+    except Exception:
+        pe_ratio = None
+
+    return {
+        "PERatio": pe_ratio,
+        "SharesOutstanding": shares_outstanding,
+        "DividendYield": dividend_yield,
+    }
 
 
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
