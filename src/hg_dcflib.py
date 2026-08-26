@@ -802,7 +802,7 @@ def _intrinio_get(path: str, api_key: str, **params) -> dict:
             raise RuntimeError(f"Intrinio network error on {path}: {exc}")
 
 
-def _intrinio_periods(company: str, statement_code: str, api_key: str, n: int = 20) -> list[dict]:
+def _intrinio_periods(company: str, statement_code: str, api_key: str, n: int = 20, period_type: str = "QTR") -> list[dict]:
     """
     Most-recent-first fundamental periods for company/statement_code, each
     {"id": ..., "fiscal_year": ..., "fiscal_period": ...}. Returns [] (does
@@ -810,12 +810,23 @@ def _intrinio_periods(company: str, statement_code: str, api_key: str, n: int = 
     which callers treat that as fatal. This single discovery call is cheap
     regardless of n (one API call either way) — n only bounds how many
     period entries are returned in that one response, not the call count.
+
+    period_type="FY" (added 2026-08-26) requests true fiscal-year periods --
+    real, as-filed annual figures, not a synthetic 4-quarter aggregation.
+    Confirmed live (AAPL): Intrinio's API accepts type="FY" directly and
+    returns up to 10+ real annual periods in one discovery call, the same
+    semantic as Alpha Vantage's annualReports array. Needed for moat_score.py/
+    lynch_score.py/growth_screen_2.py, which all want multi-year ANNUAL
+    history (moat_score.py specifically wants up to 10 years) -- the existing
+    type="QTR" callers (get_inc_stmnt_intrinio() and friends) only ever
+    aggregate a handful of quarters into an implicit TTM/short lookback for
+    av_fcff_2.py's own needs, a different use case.
     """
     data = _intrinio_get(
         f"companies/{company}/fundamentals",
         api_key,
         statement_code=statement_code,
-        type="QTR",
+        type=period_type,
     )
     fundamentals = data.get("fundamentals", [])
     return [
@@ -824,7 +835,7 @@ def _intrinio_periods(company: str, statement_code: str, api_key: str, n: int = 
     ]
 
 
-def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int = 20) -> list[str]:
+def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int = 20, period_type: str = "QTR") -> list[str]:
     """
     Most-recent-first fundamental period IDs for company/statement_code.
     Thin wrapper over _intrinio_periods() for callers that only need bare
@@ -835,7 +846,7 @@ def _intrinio_period_ids(company: str, statement_code: str, api_key: str, n: int
     matching its AV equivalent) — see each function's own empty-check for
     which applies.
     """
-    return [p["id"] for p in _intrinio_periods(company, statement_code, api_key, n)]
+    return [p["id"] for p in _intrinio_periods(company, statement_code, api_key, n, period_type=period_type)]
 
 
 def _intrinio_standardized(fundamental_id: str, api_key: str) -> dict:
@@ -1242,6 +1253,197 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
         "depreciation": depreciation,
         "dividends_paid": dividends_paid,
     }
+
+
+# ---------------------------------------------------------------------------
+# Annual-history Intrinio fetchers (Phase 4, 2026-08-26) — moat_score.py/
+# lynch_score.py/growth_screen_2.py want up to 10 years of true ANNUAL
+# figures (AV's annualReports semantic), a different shape from the
+# quarterly-aggregating fetchers above (built for av_fcff_2.py, which only
+# ever reads a handful of recent years). Each function here returns a list
+# of dicts using AV's OWN field names, most-recent-year-first, so the
+# existing AV-shaped parsing code in each caller needs zero changes -- only
+# the fetch call itself swaps to a fallback-aware wrapper. Uses Intrinio's
+# native type="FY" periods (real, as-filed annual figures) rather than
+# summing 4 quarters -- more accurate, and needs far fewer API calls for a
+# 10-year lookback (10 FY periods vs. 40 quarterly periods).
+# ---------------------------------------------------------------------------
+
+
+def get_inc_stmnt_intrinio_annual(company: str, apiKey: str, years: int = 10, is_financial_or_reit: bool = False) -> list[dict]:
+    """
+    Up to `years` years of real annual income-statement data, shaped as a
+    list of dicts matching AV's INCOME_STATEMENT annualReports entries:
+    totalRevenue, grossProfit, ebit, netIncome, incomeTaxExpense,
+    incomeBeforeTax, interestExpense. Most-recent-year-first.
+
+    Field map (confirmed live 2026-08-26 against AAPL real FY periods):
+      totalRevenue     -> totalrevenue
+      grossProfit       -> totalgrossprofit (NOT "grossprofit" -- that tag
+                          returns None; confirmed via a real AAPL FY period)
+      ebit               -> totaloperatingincome (same EBIT proxy choice as
+                          the quarterly fetcher, and AV's operatingIncome)
+      netIncome           -> netincome
+      incomeTaxExpense     -> incometaxexpense
+      incomeBeforeTax       -> totalpretaxincome
+      interestExpense        -> via the shared _intrinio_quarter_interest_expense()
+                          helper (period-agnostic despite the name -- prefers
+                          totalinterestexpense, falls back to sign-flipped
+                          totalinterestincome, same logic as the quarterly path)
+
+    is_financial_or_reit: same bank-template guard as get_inc_stmnt_intrinio()
+    (see its docstring, 2026-08-26) -- when False, a response using the bank
+    template (totalinterestincome present, totaloperatingincome absent as a
+    key) raises instead of silently returning ebit=0 for every year. Found
+    live the same day this function was written: GRBK scored a bogus
+    all-zero moat (avg_roic=0.0, avg_gross_margin=0.0, rating "None")
+    through this exact path before the guard was added here too -- the
+    quarterly fetcher's guard does not cover this separate annual code path.
+
+    Raises ValueError on fewer than 2 years of coverage -- one year alone
+    can never support a multi-year lookback, so this triggers the AV
+    fallback the same way zero coverage does. Found live 2026-08-26: XOM
+    genuinely has 20 years of Intrinio income-statement and cash-flow FY
+    history but only 1 year of balance-sheet FY history -- a real, narrow
+    per-statement gap, not a bug -- which silently passed the old
+    "if not period_ids" check (1 is non-empty) and produced a useless
+    1-year AnnualFinancials that then failed moat_score.py's own
+    MIN_YEARS=3 check with a confusing downstream message instead of
+    falling back to AV, which has full history.
+    """
+    period_ids = _intrinio_period_ids(company, "income_statement", apiKey, n=years, period_type="FY")
+    if len(period_ids) < 2:
+        raise ValueError(
+            f"Insufficient annual income statement data for {company} on Intrinio "
+            f"({len(period_ids)} year(s) available)"
+        )
+
+    annual_reports = []
+    for pid in period_ids:
+        q = _intrinio_standardized(pid, apiKey)
+        if not is_financial_or_reit and "totaloperatingincome" not in q and "totalinterestincome" in q:
+            raise ValueError(
+                f"{company}: Intrinio returned the bank/financial-institution "
+                f"template (totalinterestincome present, totaloperatingincome "
+                f"absent) for a non-financial ticker -- likely an Intrinio-side "
+                f"industry misclassification, not a real zero-EBIT company."
+            )
+        annual_reports.append({
+            "totalRevenue": q.get("totalrevenue"),
+            "grossProfit": q.get("totalgrossprofit"),
+            "ebit": q.get("totaloperatingincome"),
+            "netIncome": q.get("netincome"),
+            "incomeTaxExpense": q.get("incometaxexpense"),
+            "incomeBeforeTax": q.get("totalpretaxincome"),
+            "interestExpense": _intrinio_quarter_interest_expense(q),
+        })
+    return annual_reports
+
+
+def get_bal_sheet_intrinio_annual(company: str, apiKey: str, years: int = 10) -> list[dict]:
+    """
+    Up to `years` years of real annual balance-sheet data, shaped as a list
+    of dicts matching AV's BALANCE_SHEET annualReports entries:
+    totalShareholderEquity, longTermDebt, shortTermDebt,
+    cashAndCashEquivalentsAtCarryingValue, shortTermInvestments,
+    cashAndShortTermInvestments, totalAssets. Most-recent-year-first.
+
+    Field map (confirmed live 2026-08-26 against AAPL real FY periods):
+      totalShareholderEquity -> totalcommonequity
+      longTermDebt             -> longtermdebt (raw, no lease addback --
+                          deliberately matches what AV's own annualReports
+                          already provided for moat_score.py; this is a
+                          vendor swap, not a methodology change)
+      shortTermDebt             -> shorttermdebt (same, raw)
+      cashAndCashEquivalentsAtCarryingValue -> cashandequivalents
+      shortTermInvestments       -> shortterminvestments
+      cashAndShortTermInvestments -> cashandequivalents + shortterminvestments
+                          (Intrinio has no distinct pre-aggregated tag the
+                          way AV does; the granular sum is the best available
+                          substitute -- no evidence Intrinio's granular
+                          components are unreliable for financial firms the
+                          way AV's were, see docs/known_errors.md 2026-08-02)
+      totalAssets                -> totalassets
+
+    Raises ValueError on fewer than 2 years of coverage -- one year alone
+    can never support a multi-year lookback, so this triggers the AV
+    fallback the same way zero coverage does. Found live 2026-08-26: XOM
+    genuinely has 20 years of Intrinio income-statement and cash-flow FY
+    history but only 1 year of balance-sheet FY history -- a real, narrow
+    per-statement gap, not a bug -- which silently passed the old
+    "if not period_ids" check (1 is non-empty) and produced a useless
+    1-year AnnualFinancials that then failed moat_score.py's own
+    MIN_YEARS=3 check with a confusing downstream message instead of
+    falling back to AV, which has full history.
+    """
+    period_ids = _intrinio_period_ids(company, "balance_sheet_statement", apiKey, n=years, period_type="FY")
+    if len(period_ids) < 2:
+        raise ValueError(
+            f"Insufficient annual balance sheet data for {company} on Intrinio "
+            f"({len(period_ids)} year(s) available)"
+        )
+
+    annual_reports = []
+    for pid in period_ids:
+        q = _intrinio_standardized(pid, apiKey)
+        cash = safe_float(q.get("cashandequivalents"))
+        sti = safe_float(q.get("shortterminvestments"))
+        annual_reports.append({
+            "totalShareholderEquity": q.get("totalcommonequity"),
+            "longTermDebt": q.get("longtermdebt"),
+            "shortTermDebt": q.get("shorttermdebt"),
+            "cashAndCashEquivalentsAtCarryingValue": cash,
+            "shortTermInvestments": sti,
+            "cashAndShortTermInvestments": cash + sti,
+            "totalAssets": q.get("totalassets"),
+        })
+    return annual_reports
+
+
+def get_cash_flow_intrinio_annual(company: str, apiKey: str, years: int = 10) -> list[dict]:
+    """
+    Up to `years` years of real annual cash-flow data, shaped as a list of
+    dicts matching AV's CASH_FLOW annualReports entries: operatingCashflow,
+    capitalExpenditures. Most-recent-year-first.
+
+    Field map (confirmed live 2026-08-26 against AAPL real FY periods):
+      operatingCashflow  -> netcashfromoperatingactivities
+      capitalExpenditures -> purchaseofplantpropertyandequipment, UNCHANGED
+                          SIGN (negative, an outflow) -- matches AV's own raw
+                          annualReports convention exactly (AV also stores
+                          this negative; moat_score.py's calc_fcf_margin_series()
+                          already adds it as a negative: `fcf = operating_cf +
+                          capex`). Do NOT sign-flip here the way
+                          get_cash_flow_intrinio() above does -- that
+                          function serves av_fcff_2.py's different
+                          convention (positive capex), not this one.
+
+    Raises ValueError on fewer than 2 years of coverage -- one year alone
+    can never support a multi-year lookback, so this triggers the AV
+    fallback the same way zero coverage does. Found live 2026-08-26: XOM
+    genuinely has 20 years of Intrinio income-statement and cash-flow FY
+    history but only 1 year of balance-sheet FY history -- a real, narrow
+    per-statement gap, not a bug -- which silently passed the old
+    "if not period_ids" check (1 is non-empty) and produced a useless
+    1-year AnnualFinancials that then failed moat_score.py's own
+    MIN_YEARS=3 check with a confusing downstream message instead of
+    falling back to AV, which has full history.
+    """
+    period_ids = _intrinio_period_ids(company, "cash_flow_statement", apiKey, n=years, period_type="FY")
+    if len(period_ids) < 2:
+        raise ValueError(
+            f"Insufficient annual cash flow data for {company} on Intrinio "
+            f"({len(period_ids)} year(s) available)"
+        )
+
+    annual_reports = []
+    for pid in period_ids:
+        q = _intrinio_standardized(pid, apiKey)
+        annual_reports.append({
+            "operatingCashflow": q.get("netcashfromoperatingactivities"),
+            "capitalExpenditures": q.get("purchaseofplantpropertyandequipment"),
+        })
+    return annual_reports
 
 
 def get_rAndD_intrinio(company: str, rd_years: int, apiKey: str):
