@@ -1603,6 +1603,46 @@ def get_overview_intrinio(company: str, apiKey: str) -> dict:
     }
 
 
+def get_quarterly_eps_intrinio(company: str, apiKey: str, quarters: int = 20) -> list[float]:
+    """
+    Intrinio-backed equivalent of AV's INCOME_STATEMENT quarterlyReports
+    reportedEPS series (Phase 4, 2026-08-26, built for growth_monitor.py's
+    negative-quarterly-EPS growth-screen gate). Returns a plain list of
+    per-quarter EPS floats, most-recent-first -- same order as AV's
+    quarterlyReports and as _intrinio_period_ids().
+
+    Deliberately a separate fetch from get_inc_stmnt_intrinio(): that
+    function aggregates quarters into 4-quarter annual blocks and fetches
+    only 12 quarters (3 years) for the FCFF wealth-gate check; this caller
+    needs up to 20 individual, unaggregated quarters (5 years) to match
+    AV's QUARTERS_TO_CHECK=20 window.
+
+    Field map (confirmed live 2026-08-26 against AAPL):
+      reportedEPS -> dilutedeps, falling back to basiceps for periods/
+                     filers where Intrinio's standardized template omits
+                     the diluted figure (both are direct reported tags,
+                     not derived here).
+
+    Raises if Intrinio has no income_statement periods at all for the
+    ticker (triggers the caller's AV fallback); a period present in the
+    list but missing both EPS tags degrades that single entry to None
+    rather than raising, matching AV's own behavior for periods with an
+    EPS gap.
+    """
+    period_ids = _intrinio_period_ids(company, "income_statement", apiKey, n=quarters)
+    if not period_ids:
+        raise ValueError(f"No quarterly reports found for {company} on Intrinio")
+
+    eps = []
+    for pid in period_ids:
+        q = _intrinio_standardized(pid, apiKey)
+        val = q.get("dilutedeps")
+        if val is None:
+            val = q.get("basiceps")
+        eps.append(safe_float(val) if val is not None else None)
+    return eps
+
+
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
     """
     Shared timeout+retry wrapper for get_erp()/get_risk_free()'s network
