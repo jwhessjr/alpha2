@@ -1568,11 +1568,17 @@ def get_quote_intrinio(company: str, apiKey: str):
 def get_overview_intrinio(company: str, apiKey: str) -> dict:
     """
     Intrinio-backed equivalent of AV's OVERVIEW endpoint (Phase 4,
-    2026-08-26, built for lynch_score.py/growth_monitor.py) -- a current/
-    TTM snapshot, not annual history. Returns an AV-shaped dict: PERatio,
-    SharesOutstanding, DividendYield.
+    2026-08-26, built for lynch_score.py/growth_monitor.py; extended
+    2026-08-26 same day for growth_screen_2.py) -- a current/TTM snapshot,
+    not annual history. Returns an AV-shaped dict: Symbol, PERatio,
+    SharesOutstanding, DividendYield, Name, MarketCapitalization.
 
     Field map (confirmed live 2026-08-26 against AAPL):
+      Symbol               -> the `company` argument itself, echoed back
+                            (matches AV's OVERVIEW, which also just echoes
+                            the requested symbol) -- growth_screen_2.py's
+                            "not overview or 'Symbol' not in overview"
+                            no-coverage check needs this key present.
       PERatio             -> data_point/pricetoearnings (confirmed live,
                             e.g. 35.3686 for AAPL -- a real, direct trailing
                             P/E data point, not derived)
@@ -1583,6 +1589,21 @@ def get_overview_intrinio(company: str, apiKey: str) -> dict:
                             EPS elsewhere in this file)
       DividendYield          -> reuses get_quote_intrinio()'s
                             trailing_dividend_yield field
+      Name                   -> reuses get_quote_intrinio()'s company_name
+                            (already fetched internally to build the tuple
+                            above; just wasn't surfaced until
+                            growth_screen_2.py needed it)
+      MarketCapitalization    -> reuses get_quote_intrinio()'s market_cap,
+                            same reasoning
+
+    Deliberately does NOT include a "Sector"/"Industry" key -- unlike AV's
+    own OVERVIEW classification, every caller in this codebase that needs
+    sector/industry (including the valuation table's own `industry` column,
+    see av_fcff_2.py) already sources it from hg_dcflib.get_industry()'s
+    Damodaran table, not any vendor's OVERVIEW endpoint. Callers that display
+    sector/industry alongside this dict (growth_screen_2.py) should call
+    get_industry()/replacer.industry_to_sector() directly rather than
+    expecting this function to carry it.
 
     Raises whatever get_quote_intrinio() raises on missing price/marketCap/
     name (no Intrinio coverage for the symbol) -- PERatio itself degrades to
@@ -1597,19 +1618,23 @@ def get_overview_intrinio(company: str, apiKey: str) -> dict:
         pe_ratio = None
 
     return {
+        "Symbol": company,
         "PERatio": pe_ratio,
         "SharesOutstanding": shares_outstanding,
         "DividendYield": dividend_yield,
+        "Name": company_name,
+        "MarketCapitalization": market_cap,
     }
 
 
-def get_quarterly_eps_intrinio(company: str, apiKey: str, quarters: int = 20) -> list[float]:
+def get_quarterly_eps_intrinio(company: str, apiKey: str, quarters: int = 20) -> list[dict]:
     """
-    Intrinio-backed equivalent of AV's INCOME_STATEMENT quarterlyReports
-    reportedEPS series (Phase 4, 2026-08-26, built for growth_monitor.py's
-    negative-quarterly-EPS growth-screen gate). Returns a plain list of
-    per-quarter EPS floats, most-recent-first -- same order as AV's
-    quarterlyReports and as _intrinio_period_ids().
+    Intrinio-backed equivalent of AV's EARNINGS endpoint's quarterlyEarnings
+    array (Phase 4, 2026-08-26, built for growth_monitor.py's and
+    growth_screen_2.py's negative-quarterly-EPS growth-screen gate). Returns
+    an AV-shaped list of {"fiscalDateEnding": ..., "reportedEPS": ...}
+    dicts, most-recent-first -- same order as AV's quarterlyEarnings and as
+    _intrinio_period_ids().
 
     Deliberately a separate fetch from get_inc_stmnt_intrinio(): that
     function aggregates quarters into 4-quarter annual blocks and fetches
@@ -1618,29 +1643,42 @@ def get_quarterly_eps_intrinio(company: str, apiKey: str, quarters: int = 20) ->
     AV's QUARTERS_TO_CHECK=20 window.
 
     Field map (confirmed live 2026-08-26 against AAPL):
-      reportedEPS -> dilutedeps, falling back to basiceps for periods/
-                     filers where Intrinio's standardized template omits
-                     the diluted figure (both are direct reported tags,
-                     not derived here).
+      reportedEPS      -> dilutedeps, falling back to basiceps for periods/
+                          filers where Intrinio's standardized template
+                          omits the diluted figure (both are direct reported
+                          tags, not derived here).
+      fiscalDateEnding  -> synthesized as "{fiscal_year}-{fiscal_period}"
+                          (e.g. "2026-Q3"), NOT a real calendar date the way
+                          AV's fiscalDateEnding is -- Intrinio's period
+                          discovery only exposes fiscal year/quarter labels,
+                          not the underlying period-end date, at this call
+                          site. Sufficient for every caller's actual use
+                          (chronological sort -- this label sorts correctly
+                          because fiscal_year always dominates the
+                          comparison -- and human-readable display), but
+                          don't treat it as an ISO date.
 
     Raises if Intrinio has no income_statement periods at all for the
     ticker (triggers the caller's AV fallback); a period present in the
-    list but missing both EPS tags degrades that single entry to None
-    rather than raising, matching AV's own behavior for periods with an
-    EPS gap.
+    list but missing both EPS tags degrades that single entry's
+    reportedEPS to None rather than raising, matching AV's own behavior for
+    periods with an EPS gap.
     """
-    period_ids = _intrinio_period_ids(company, "income_statement", apiKey, n=quarters)
-    if not period_ids:
+    periods = _intrinio_periods(company, "income_statement", apiKey, n=quarters)
+    if not periods:
         raise ValueError(f"No quarterly reports found for {company} on Intrinio")
 
-    eps = []
-    for pid in period_ids:
-        q = _intrinio_standardized(pid, apiKey)
+    reports = []
+    for p in periods:
+        q = _intrinio_standardized(p["id"], apiKey)
         val = q.get("dilutedeps")
         if val is None:
             val = q.get("basiceps")
-        eps.append(safe_float(val) if val is not None else None)
-    return eps
+        reports.append({
+            "fiscalDateEnding": f"{p.get('fiscal_year')}-{p.get('fiscal_period')}",
+            "reportedEPS": safe_float(val) if val is not None else None,
+        })
+    return reports
 
 
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
