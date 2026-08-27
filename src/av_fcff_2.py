@@ -124,6 +124,18 @@ WEALTH_GATE_MIN_YEARS_ABOVE_WACC = 3     # corroborating moat_scores track recor
 ROIC_CORROBORATION_MAX_SPREAD = 0.50    # percentage points above moat_scores' avg_roic
 ROIC_CORROBORATION_MIN_DATA_YEARS = 3   # avg_roic needs enough history to be a credible baseline
 
+# Terminal value dominance flag (decided 2026-08-27, see docs/decisions.md).
+# Calibrated empirically against the real ~2,400-ticker universe, not chosen
+# arbitrarily: terminal_value/market_cap has a median of 0.42x and a 99th
+# percentile of 4.63x across the whole database, then a clean cliff to a
+# small set of genuine outliers (15 tickers, all >5x) -- 5.0x sits right at
+# that cliff. Same "flag, don't silently exclude/correct" pattern as
+# ROIC_CORROBORATION above and replacer.py's staleness annotation -- see
+# terminal_value_dominance_note()'s docstring for the full rationale,
+# including why this deliberately self-clears on every revaluation rather
+# than needing a manual reset.
+TV_MARKET_CAP_MAX_RATIO = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -965,6 +977,54 @@ def calc_gated_return_on_capital(
     )
 
 
+def terminal_value_dominance_note(terminal_value_pv: float, market_cap: float) -> str:
+    """
+    Flag (never filter) when a DCF's terminal value dominates market cap by
+    an extreme multiple -- decided 2026-08-27 after investigating why
+    Value 10/20's top replacement candidates kept surfacing implausible
+    93-99% margins of safety (see docs/decisions.md "Terminal value
+    dominance flag" for the full investigation).
+
+    Same "flag, don't silently exclude/correct" pattern as
+    calc_gated_return_on_capital()'s ROIC-corroboration note and
+    replacer.py's staleness annotation -- share_value/margin_of_safety/rank
+    are returned completely unchanged; this only ever appends to `notes`.
+
+    Deliberately NOT a permanent classification. `notes` is rebuilt from
+    scratch on every single valuation run (this function is called fresh
+    each time, off that run's own terminal_value/market_cap), so a ticker
+    that trips this today and later stops -- a one-time event rolls out of
+    the trailing-financials window, a company's distress eases, a vendor
+    fixes a data bug -- simply stops carrying the note the very next time
+    it's revalued. No separate reset step, expiry timer, or manual review
+    queue is needed; the flag only ever reflects the most recent valuation.
+    (It does depend on the ticker actually continuing to get revalued on
+    the normal cadence -- an excluded/stale ticker keeps whatever note its
+    last real valuation carried, same as every other field on that row.)
+
+    A live cross-vendor + SEC-filing investigation of 9 flagged tickers
+    (2026-08-27) found this doesn't distinguish *why* a ticker trips it --
+    3 were genuine Ben Graham-style deep-value candidates where the model
+    math itself is just unstable for that capital structure (not a data
+    problem), 1 was a real one-time corporate event making trailing
+    financials temporarily meaningless (also not a data problem, self-
+    resolves in future quarters), and 2 were confirmed vendor-specific data
+    bugs. All 9 were correctly worth a second look either way -- that's the
+    intended behavior, not a limitation to fix.
+    """
+    if not market_cap or market_cap <= 0 or terminal_value_pv is None:
+        return ""
+    ratio = terminal_value_pv / market_cap
+    if ratio <= TV_MARKET_CAP_MAX_RATIO:
+        return ""
+    return (
+        f"Terminal value (${terminal_value_pv:,.0f}) is {ratio:.1f}x current "
+        f"market cap (${market_cap:,.0f}) -- DCF result is dominated by the "
+        "perpetuity-growth terminal period rather than near-term cash flows; "
+        "verify before trusting this valuation."
+    )
+
+
 def calc_growth_rate(reinvestment_rate, return_on_capital):
     growth_rate = reinvestment_rate * return_on_capital
     logger.info(f"Growth Rate = {growth_rate:,.4f}")
@@ -1512,6 +1572,7 @@ def value_bank_stock(ticker: str, growth_period: int):
             share_value=intrinsic_value,
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
+            notes=terminal_value_dominance_note(terminal_value_pv, market_cap),
             target_price=target_price,
             earnings_yield=0.0,  # FCFE model — EBIT/EV not applicable for banks
             dividend_yield=dividend_yield,
@@ -1699,6 +1760,9 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
             "fundamentals; DCF result may not be economically meaningful"
             if intrinsic_value <= 0 else roc_notes
         )
+        notes = " | ".join(
+            n for n in (notes, terminal_value_dominance_note(terminal_value_pv, market_cap)) if n
+        )
 
         return Stock_Value(
             ticker=ticker,
@@ -1851,6 +1915,9 @@ def value_reit_stock(ticker: str, growth_period: int):
                 "AFFO or growth ≥ cost of equity; DCF result may not be "
                 "economically meaningful"
             )
+        notes = " | ".join(
+            n for n in (notes, terminal_value_dominance_note(terminal_value_pv, market_cap)) if n
+        )
         safety_margin   = float(intrinsic_value - price)
         safety_margin_pc = (1 - price / intrinsic_value) if intrinsic_value != 0 else 0.0
         wealth_pc       = roe - cost_of_equity
