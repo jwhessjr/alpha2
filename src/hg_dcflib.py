@@ -1730,6 +1730,36 @@ def get_daily_prices_intrinio(company: str, apiKey: str, start_date: str, end_da
     ]
 
 
+def get_price_on_or_before_intrinio(company: str, apiKey: str, target_date: str, lookback_days: int = 14) -> tuple[float, str]:
+    """
+    Intrinio-backed helper for the "closest trading day on or before
+    target_date" pattern (Phase 4, 2026-08-26) shared by all 4 build_*.py
+    portfolio-construction scripts. Two of them (build_buffett_9010.py,
+    build_new_value20.py) already wrote exactly this general algorithm by
+    hand against AV's raw series; the other two (build_lynch_portfolios.py,
+    build_value20_moat.py) hardcode a 4-date FALLBACK_DATES list near
+    2026-04-01 that turns out to just be this same algorithm's result,
+    manually unrolled -- both are unified into this one function's contract.
+
+    Uses get_daily_prices_intrinio() with a lookback window ending at
+    target_date; lookback_days=14 is generous for any single holiday/
+    long-weekend cluster (AV's own hand-written version used a full
+    "compact" 100-day window for the same purpose, so this is deliberately
+    much tighter -- there's no reason to fetch 100 days to find one nearby
+    trading day).
+
+    Returns (close_price, actual_trading_date) -- actual_trading_date may
+    be earlier than target_date if target_date itself wasn't a trading day.
+    Raises if no day with real price data exists anywhere in the window.
+    """
+    start_date = (datetime.date.fromisoformat(target_date) - datetime.timedelta(days=lookback_days)).isoformat()
+    series = get_daily_prices_intrinio(company, apiKey, start_date=start_date, end_date=target_date)
+    for day in series:  # most-recent-first, already bounded by end_date=target_date
+        if day["close"] and day["close"] > 0:
+            return day["close"], day["date"]
+    raise ValueError(f"No price on or before {target_date} for {company} within {lookback_days} days")
+
+
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
     """
     Shared timeout+retry wrapper for get_erp()/get_risk_free()'s network
