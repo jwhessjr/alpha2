@@ -1681,6 +1681,55 @@ def get_quarterly_eps_intrinio(company: str, apiKey: str, quarters: int = 20) ->
     return reports
 
 
+def get_daily_prices_intrinio(company: str, apiKey: str, start_date: str, end_date: str, page_size: int = 200) -> list[dict]:
+    """
+    Intrinio-backed equivalent of AV's TIME_SERIES_DAILY_ADJUSTED endpoint
+    (Phase 4, 2026-08-26, built for drip_processor.py's dividend-detection
+    and build_*.py's historical-pricing needs). Returns an AV-shaped list of
+    {"date": ..., "close": ..., "dividend": ...} dicts, most-recent-first --
+    same order as Intrinio's own `/securities/{id}/prices` response.
+
+    Field map (confirmed live 2026-08-26 against AAPL):
+      close      -> close (real daily close; Intrinio also offers a split/
+                    dividend-adjusted `adj_close`, but every caller here
+                    needs the same as-traded close AV's "4. close" gave --
+                    dividend detection specifically needs the un-adjusted
+                    price paid on the ex-dividend date, not a backward-
+                    adjusted one)
+      dividend   -> dividend (real per-day dividend amount, 0.0 on every
+                    non-ex-dividend day -- same semantic as AV's "7. dividend
+                    amount"; confirmed live: 2 real ex-div days found in a
+                    100-day AAPL window, $0.27/share Aug-10-2026)
+
+    Single-page fetch only (`page_size` defaults to 200, comfortably
+    covering any lookback window this codebase actually uses -- the AV
+    endpoint this replaces used "outputsize=compact", itself hard-capped at
+    100 trading days, so no caller here has ever needed more than that in
+    one response). Raises if Intrinio returns no price data at all for the
+    ticker/date range (no coverage, or a date range with no trading days).
+    """
+    data = _intrinio_get(
+        f"securities/{company}/prices",
+        apiKey,
+        start_date=start_date,
+        end_date=end_date,
+        frequency="daily",
+        page_size=page_size,
+    )
+    prices = data.get("stock_prices", [])
+    if not prices:
+        raise ValueError(f"No daily price data found for {company} on Intrinio for {start_date}..{end_date}")
+
+    return [
+        {
+            "date": p.get("date"),
+            "close": safe_float(p.get("close")),
+            "dividend": safe_float(p.get("dividend")) or 0.0,
+        }
+        for p in prices
+    ]
+
+
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
     """
     Shared timeout+retry wrapper for get_erp()/get_risk_free()'s network
