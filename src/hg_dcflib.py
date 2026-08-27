@@ -1516,13 +1516,20 @@ def get_quote_intrinio(company: str, apiKey: str):
                             own real-time-consistent pair, not a proxy.
       company_name        -> companies/{ticker} -> "name"
       dividend_yield       -> data_point/trailing_dividend_yield
-      analyst_count        -> NOT AVAILABLE on the current (Starter/trial)
-                            Intrinio plan — companies/{id}/data_point/
-                            analyst_ratings returned an error 2026-08-21.
-                            Degrades to 0 with a logged warning rather than
-                            crashing or omitting the tuple slot. Re-check
-                            once/if a higher tier is confirmed to cover it
-                            (see docs/decisions.md migration plan).
+      analyst_count        -> NOT AVAILABLE via Intrinio on the current
+                            (Starter/trial) plan — companies/{id}/data_point/
+                            analyst_ratings returned an error 2026-08-21;
+                            the whole Zacks package (which would carry this)
+                            is separately plan-gated too, confirmed
+                            2026-08-26 (see project_intrinio_zacks_
+                            analyst_count_gate memory). Sourced from Yahoo
+                            Finance instead (get_analyst_count_yahoo(),
+                            2026-08-26) -- an unofficial, undocumented feed
+                            with a known history of breaking, so this
+                            degrades to 0 with a logged warning on ANY
+                            failure rather than raising, exactly like this
+                            field's original all-Intrinio-plans-lack-it
+                            degrade did before Yahoo was wired in.
 
     Raises
     ------
@@ -1556,11 +1563,15 @@ def get_quote_intrinio(company: str, apiKey: str):
     except Exception:
         dividend_yield = 0.0
 
-    analyst_count = 0
-    logger.warning(
-        f"{company}: analyst_count not available via Intrinio on the current "
-        f"plan tier — defaulting to 0. See docs/decisions.md migration plan."
-    )
+    try:
+        analyst_count = get_analyst_count_yahoo(company)
+    except Exception as exc:
+        analyst_count = 0
+        logger.warning(
+            f"{company}: analyst_count fetch failed (neither Intrinio nor AV "
+            f"has this field; Yahoo Finance fallback also failed: {exc}) — "
+            f"defaulting to 0."
+        )
 
     return price, shares_outstanding, market_cap, company_name, dividend_yield, analyst_count
 
@@ -1758,6 +1769,87 @@ def get_price_on_or_before_intrinio(company: str, apiKey: str, target_date: str,
         if day["close"] and day["close"] > 0:
             return day["close"], day["date"]
     raise ValueError(f"No price on or before {target_date} for {company} within {lookback_days} days")
+
+
+# ── Yahoo Finance (unofficial) — analyst_count only ──────────────────────────
+#
+# Neither Intrinio (Zacks package plan-gated, see project_intrinio_zacks_
+# analyst_count_gate memory) nor AV ever provided a usable analyst_count.
+# Yahoo's undocumented quoteSummary endpoint has a direct
+# numberOfAnalystOpinions field (confirmed live 2026-08-26, AAPL=39) --
+# but Jim has direct prior experience with this exact feed breaking
+# repeatedly ("the feed kept changing... I eventually quit beating my head
+# against the wall"). Deliberately isolated from every other fetcher in this
+# file: never called from get_quote_intrinio()'s core price/name/marketCap
+# path, only wired into that function's already-optional analyst_count slot
+# (which already degraded to 0 on failure before this existed). A break here
+# must never be able to threaten a valuation run.
+
+_yahoo_session: "requests.Session | None" = None
+_yahoo_crumb: str | None = None
+
+
+def _yahoo_get_crumb(force_refresh: bool = False) -> tuple["requests.Session", str]:
+    """
+    Lazily creates and caches one requests.Session + crumb token for the
+    life of the process -- re-fetching a crumb (and a fresh cookie jar) on
+    every single ticker in a full-universe batch would be both slow and a
+    faster route to Yahoo rate-limiting/blocking. Call with
+    force_refresh=True to discard a stale cached crumb and get a new one
+    (get_analyst_count_yahoo() does this once on an "Invalid Crumb" response
+    before giving up).
+    """
+    global _yahoo_session, _yahoo_crumb
+    if _yahoo_session is None or force_refresh:
+        _yahoo_session = requests.Session()
+        _yahoo_session.headers.update({"User-Agent": "Mozilla/5.0"})
+        resp = _yahoo_session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=15)
+        resp.raise_for_status()
+        crumb = resp.text.strip()
+        if not crumb or "error" in crumb.lower():
+            raise RuntimeError(f"Yahoo Finance: could not obtain a crumb token (got: {crumb!r})")
+        _yahoo_crumb = crumb
+    return _yahoo_session, _yahoo_crumb
+
+
+def get_analyst_count_yahoo(company: str) -> int:
+    """
+    Yahoo Finance (unofficial, undocumented, no API key) equivalent of an
+    analyst-coverage-count field neither Intrinio nor AV ever provided.
+    Field map (confirmed live 2026-08-26 against AAPL, 39 analysts):
+      numberOfAnalystOpinions -> quoteSummary?modules=financialData ->
+                                 financialData.numberOfAnalystOpinions.raw
+
+    Retries once with a freshly-fetched crumb on an auth failure (a stale
+    cached crumb, not necessarily a real outage) before raising. Raises
+    (does not silently return 0) on any failure -- matches every other
+    fetcher in this file; the caller (get_quote_intrinio()) decides how to
+    degrade, same pattern already used for its dividend_yield field.
+    """
+    session, crumb = _yahoo_get_crumb()
+    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{company}"
+    resp = session.get(url, params={"modules": "financialData", "crumb": crumb}, timeout=15)
+
+    if resp.status_code == 401:
+        session, crumb = _yahoo_get_crumb(force_refresh=True)
+        resp = session.get(url, params={"modules": "financialData", "crumb": crumb}, timeout=15)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    error = data.get("quoteSummary", {}).get("error")
+    if error:
+        raise RuntimeError(f"Yahoo Finance error for {company}: {error}")
+
+    results = data.get("quoteSummary", {}).get("result") or []
+    if not results:
+        raise ValueError(f"Yahoo Finance: no quoteSummary result for {company}")
+
+    count = results[0].get("financialData", {}).get("numberOfAnalystOpinions", {}).get("raw")
+    if count is None:
+        raise ValueError(f"Yahoo Finance: numberOfAnalystOpinions missing for {company}")
+
+    return int(count)
 
 
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
