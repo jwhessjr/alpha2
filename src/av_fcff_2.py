@@ -638,8 +638,24 @@ def is_financial_firm(industry: str) -> bool:
 
 
 def is_insurance_firm(industry: str) -> bool:
-    """Return True for insurance companies that need normalized NI."""
+    """Return True for insurance companies that need normalized NI.
+
+    Excludes Damodaran's "Financial Svcs. (Non-bank & Insurance)" bucket --
+    its own name says what it is: NOT a bank AND NOT insurance (a catch-all
+    for financial-services companies that are neither), despite containing
+    the substring "insurance". A naive keyword match caught it anyway,
+    which meant PayPal (and any other ticker in that bucket) was valued as
+    an insurer -- normalizing net income over multiple years to smooth an
+    underwriting/catastrophe cycle that doesn't exist for a payment network.
+    Real Damodaran insurance categories (confirmed against
+    reference_data/indname_2026.xlsx 2026-08-31: "Insurance (General)",
+    "Insurance (Life)", "Insurance (Prop/Cas.)", "Reinsurance") never
+    contain "non-bank", so this exclusion is precise, not a guess. See
+    docs/known_errors.md 2026-08-31.
+    """
     low = industry.lower()
+    if "non-bank" in low:
+        return False
     return any(kw in low for kw in _INSURANCE_KEYWORDS)
 
 
@@ -1396,7 +1412,8 @@ def _rescore_tickers(db_path: str, tickers: list) -> None:
 
 
 def _bank_payout_ratio(
-    net_income: float, bv_equity_curr: float, bv_equity_prior: float, cash_flw: dict
+    net_income: float, bv_equity_curr: float, bv_equity_prior: float, cash_flw: dict,
+    dividend_yield: float = None,
 ) -> float:
     """
     Determine payout ratio for a bank using the most reliable source available.
@@ -1408,16 +1425,33 @@ def _bank_payout_ratio(
 
     AOCI swings (unrealized bond gains/losses) inflate the equity-change figure,
     so if that method would imply retention > 80% we prefer the dividend method.
+
+    dividend_yield (optional): if the ticker's own quote reports a ~0%
+    dividend yield, Method 1's "dividends paid" cash-flow figure is
+    distrusted even when nonzero and within the normal 5-95% sanity band --
+    it's more likely tax-withholding on stock-comp vesting, a minority-
+    interest distribution, or a vendor field mapping error than a real
+    shareholder dividend. Found live 2026-08-31: PYPL (which has never paid
+    a common dividend) got a 5.14% "payout ratio from dividends paid" from
+    Intrinio's cash-flow data, crushing its near-term FCFE stream to
+    produce an $8.94 share value against Morningstar's $80+. See
+    docs/known_errors.md 2026-08-31.
     """
     payout = None
 
     # --- Method 1: actual dividends paid ---
     divs = sum(abs(v) for v in cash_flw.get("dividends_paid", []) if v)
-    if net_income > 0 and divs > 0:
+    pays_no_dividend = dividend_yield is not None and dividend_yield < 0.001
+    if net_income > 0 and divs > 0 and not pays_no_dividend:
         payout_from_divs = divs / net_income
         if 0.05 <= payout_from_divs <= 0.95:
             payout = payout_from_divs
             logger.info(f"Payout ratio from dividends paid: {payout:.4f}")
+    elif net_income > 0 and divs > 0 and pays_no_dividend:
+        logger.info(
+            f"Ignoring dividends-paid figure ({divs:,.0f}) -- ticker's own "
+            f"dividend_yield is ~0, so this is not a real shareholder dividend"
+        )
 
     # --- Method 2: equity-change (only use if dividends unavailable/unreliable) ---
     if payout is None and net_income > 0:
@@ -1487,7 +1521,8 @@ def value_bank_stock(ticker: str, growth_period: int):
         logger.info(f"ROE = {roe:.4f}")
 
         payout_ratio = _bank_payout_ratio(
-            reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
+            reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw,
+            dividend_yield=dividend_yield,
         )
         retention_ratio = 1.0 - payout_ratio
         growth_rate = _bank_growth_rate(roe, retention_ratio)
@@ -2041,6 +2076,7 @@ def _value_bank_stock_detail(
         shares_outstanding = ent_quote[1]
         market_cap = ent_quote[2]
         ent_name = ent_quote[3]
+        dividend_yield = ent_quote[4]
         analyst_count = int(ent_quote[5])
         cik = hg_dcflib.get_cik(ticker)
 
@@ -2060,7 +2096,8 @@ def _value_bank_stock_detail(
 
         roe = net_income / bv_equity_curr if bv_equity_curr != 0 else 0.0
         payout_ratio = _bank_payout_ratio(
-            reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw
+            reported_net_income, bv_equity_curr, bv_equity_prior, cash_flw,
+            dividend_yield=dividend_yield,
         )
         retention_ratio = 1.0 - payout_ratio
         growth_rate = _bank_growth_rate(roe, retention_ratio)
