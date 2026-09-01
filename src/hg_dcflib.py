@@ -305,6 +305,40 @@ def get_cik(ticker: str) -> str:
     return _cik_map.get(ticker.upper(), "")
 
 
+_SIC_CACHE: dict[str, int | None] = {}
+
+
+def get_sic(ticker: str, api_key: str) -> int | None:
+    """
+    Return the SEC-assigned SIC code for ticker via Intrinio's
+    companies/{ticker} endpoint, or None if unavailable (no coverage, API
+    failure, etc.) -- callers must degrade gracefully, never raise.
+
+    Cached per ticker for the process lifetime -- this is a static
+    regulatory classification (confirmed 2026-09-01 to match
+    data.sec.gov/submissions exactly, e.g. PYPL=7389, FOA=6162), not
+    something that needs re-fetching within a single run.
+
+    Used as a cheap, SEC-sourced pre-filter for financial-firm valuation
+    routing (see is_financial_sic() in av_fcff_2.py) -- deliberately NOT
+    used for beta/R&D-years/industry-D&E lookups, which stay on
+    Damodaran's own industry classification exactly as before. See
+    docs/known_errors.md 2026-09-01.
+    """
+    if ticker in _SIC_CACHE:
+        return _SIC_CACHE[ticker]
+    sic = None
+    try:
+        data = _intrinio_get(f"companies/{ticker}", api_key)
+        raw = data.get("sic")
+        if raw is not None:
+            sic = int(raw)
+    except Exception as e:
+        logger.warning(f"{ticker}: SIC fetch failed ({e}) -- degrading to None")
+    _SIC_CACHE[ticker] = sic
+    return sic
+
+
 # Function to get the income statement and extract the required fields
 
 

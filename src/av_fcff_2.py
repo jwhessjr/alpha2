@@ -653,6 +653,29 @@ def is_reit(industry: str) -> bool:
     )
 
 
+# SIC 6000-6799 = SEC/EDGAR Division H, "Finance, Insurance, and Real
+# Estate" -- the standard regulatory classification range covering
+# depository institutions (6000s), non-depository credit institutions
+# (6100s, e.g. mortgage bankers), security/commodity brokers and
+# exchanges (6200s), insurance carriers/agents (6300s-6400s), real
+# estate (6500s), and holding/investment offices (6700s).
+SIC_FINANCIAL_RANGE = (6000, 6799)
+
+
+def is_financial_sic(sic: int) -> bool:
+    """Return True if sic falls in the SEC's own Finance/Insurance/Real-Estate
+    division. Used only as a cheap pre-filter (see value_stock()) to decide
+    whether a ticker is even a *candidate* for bank/insurance/REIT-style
+    valuation at all -- it never forces that routing on its own. Confirmed
+    live 2026-09-01: CBOE and CME both carry SIC 6200 (in-range) but value
+    correctly under plain FCFF (exchanges take fee income, not deposits) --
+    an in-range SIC narrows which tickers need the finer-grained
+    Damodaran-bucket + Intrinio-tag-magnitude check, it doesn't decide the
+    outcome by itself. See docs/known_errors.md 2026-09-01.
+    """
+    return SIC_FINANCIAL_RANGE[0] <= sic <= SIC_FINANCIAL_RANGE[1]
+
+
 def _normalized_net_income(net_income_list: list) -> tuple[float, int]:
     """
     Return (normalized_NI, years_used).
@@ -1593,6 +1616,12 @@ def value_bank_stock(ticker: str, growth_period: int):
 def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
     """
     Route to the correct valuation model based on industry:
+      - SIC pre-filter → SEC's own SIC code, when available and outside the
+        Finance/Insurance/Real-Estate division, sends the ticker straight to
+        FCFF regardless of Damodaran's bucket. Never forces bank/insurance/
+        REIT routing on its own -- an in-range SIC just falls through to the
+        checks below unchanged. See is_financial_sic() and
+        docs/known_errors.md 2026-09-01.
       - REITs → skipped (FCFF/FCFE not applicable; FFO/AFFO model pending Phase 2)
       - Financial firms (banks, insurance, etc.) → FCFE equity DCF
       - All others → FCFF firm DCF
@@ -1602,6 +1631,10 @@ def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
     except Exception as e:
         logger.warning(f"Skipping {ticker}: {e}")
         return None
+
+    sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
+    if sic is not None and not is_financial_sic(sic):
+        return _value_stock_fcff(ticker, growth_period, industry, db_path)
 
     if is_reit(industry):
         return value_reit_stock(ticker, growth_period)
@@ -2007,6 +2040,7 @@ def _stock_value_from_detail(d: dict) -> Stock_Value:
 def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = None) -> dict | None:
     """
     Route to the correct detail valuation for the Excel report:
+      - SIC pre-filter → same as value_stock(), see is_financial_sic()
       - REITs          → skipped (FFO/AFFO model pending Phase 2)
       - Financial firms → FCFE bank detail
       - All others      → FCFF detail
@@ -2016,6 +2050,10 @@ def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = No
     except Exception as e:
         logger.warning(f"Skipping {ticker}: {e}")
         return None
+
+    sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
+    if sic is not None and not is_financial_sic(sic):
+        return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
 
     if is_reit(industry):
         return _value_reit_stock_detail(ticker, growth_period, industry)
