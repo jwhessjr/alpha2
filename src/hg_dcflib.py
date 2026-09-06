@@ -1167,7 +1167,14 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
             prior_year = p
             break
 
-    selected_periods = [current] + ([prior_year] if prior_year else [])
+    if prior_year is None:
+        raise ValueError(
+            f"{company}: could not find a matching prior-year period for "
+            f"{current.get('fiscal_period')} FY{current.get('fiscal_year')} "
+            f"in Intrinio's period discovery — insufficient history for a "
+            f"2-year balance sheet comparison via Intrinio."
+        )
+    selected_periods = [current, prior_year]
     quarters = [_intrinio_standardized(p["id"], apiKey) for p in selected_periods]
 
     def _cash(q: dict) -> float:
