@@ -1048,6 +1048,55 @@ def terminal_value_dominance_note(terminal_value_pv: float, market_cap: float) -
     )
 
 
+def low_growth_rate_note(growth_rate: float, risk_free_rate: float) -> str:
+    """
+    Flag (never filter) when a DCF's modeled growth rate doesn't even keep
+    pace with the risk-free rate -- decided 2026-09-09 after HG (Hamilton
+    Insurance Group) surfaced as a replacement candidate with a 1.4%
+    modeled growth rate that Jim caught as not even beating inflation,
+    while the candidate-screening report treated the low growth as a
+    *virtue* (less terminal-value risk) rather than the quality concern it
+    actually is. Same investigation also found the real bug behind HG's
+    number specifically (_bank_payout_ratio() summing multiple years of
+    dividends against one year's net income, see docs/known_errors.md
+    2026-09-09) -- this flag is a second, independent layer: even a
+    correctly-computed low growth rate is worth a second look, the same way
+    a correctly-computed dominant terminal value is.
+
+    Symmetric to terminal_value_dominance_note()'s ceiling (growth_rate
+    capped at 30% when the model's own reinvestment math implies more) --
+    this is the floor side of the same idea, which had no equivalent check
+    before this. Same "flag, don't silently exclude" pattern as every other
+    notes annotation in this file -- share_value/margin_of_safety/rank are
+    never touched, this only ever appends to `notes`.
+
+    Tied to RISK_FREE (recomputed fresh every run from FRED, see main())
+    rather than a hardcoded inflation guess, matching how every other
+    macro-sensitive check in this codebase already uses the run's own live
+    inputs (ERP, risk-free rate) instead of a fixed constant that goes
+    stale.
+
+    Deliberately NOT wired into the REIT path (value_reit_stock() /
+    _value_reit_stock_detail()) -- REITs already have their own explicit
+    subtype_floor mechanism (_reit_growth_rate()) precisely because low
+    retention-driven growth is structural and expected there (90%+ income
+    distribution requirement, growth mostly comes from acquisitions funded
+    outside retained earnings). Applying this flag to REITs would be noise,
+    not signal -- see docs/known_errors.md 2026-09-09.
+    """
+    if growth_rate is None or risk_free_rate is None:
+        return ""
+    if growth_rate >= risk_free_rate:
+        return ""
+    return (
+        f"Growth rate ({growth_rate:.1%}) is below the risk-free rate "
+        f"({risk_free_rate:.1%}) -- this business is not compounding value "
+        "fast enough to beat holding cash; verify this is a genuine quality "
+        "read, not a fragile input, before trusting it as an attractive "
+        "candidate."
+    )
+
+
 def calc_growth_rate(reinvestment_rate, return_on_capital):
     growth_rate = reinvestment_rate * return_on_capital
     logger.info(f"Growth Rate = {growth_rate:,.4f}")
@@ -1616,7 +1665,12 @@ def value_bank_stock(ticker: str, growth_period: int):
             share_value=intrinsic_value,
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
-            notes=terminal_value_dominance_note(terminal_value_pv, market_cap),
+            notes=" | ".join(
+                n for n in (
+                    terminal_value_dominance_note(terminal_value_pv, market_cap),
+                    low_growth_rate_note(growth_rate, RISK_FREE),
+                ) if n
+            ),
             target_price=target_price,
             earnings_yield=0.0,  # FCFE model — EBIT/EV not applicable for banks
             dividend_yield=dividend_yield,
@@ -1815,7 +1869,11 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
             if intrinsic_value <= 0 else roc_notes
         )
         notes = " | ".join(
-            n for n in (notes, terminal_value_dominance_note(terminal_value_pv, market_cap)) if n
+            n for n in (
+                notes,
+                terminal_value_dominance_note(terminal_value_pv, market_cap),
+                low_growth_rate_note(growth_rate, RISK_FREE),
+            ) if n
         )
 
         return Stock_Value(
