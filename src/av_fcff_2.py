@@ -1431,11 +1431,32 @@ def _bank_payout_ratio(
 
     AOCI swings (unrealized bond gains/losses) inflate the equity-change figure,
     so if that method would imply retention > 80% we prefer the dividend method.
+
+    cash_flw["dividends_paid"] is ALREADY one already-annualized figure per
+    year (both get_cash_flow() and get_cash_flow_intrinio() sum each year's
+    4 quarters before appending -- confirmed by reading both), most-recent-
+    first, with up to 5 years of history. Method 1 must use only index [0]
+    (the most recent year) -- summing the whole list sums MULTIPLE YEARS of
+    dividends against a single year's net_income, inflating payout by
+    roughly Nx (N = years of history fetched). Fixed 2026-09-09: found live
+    on HG (Hamilton Insurance Group) -- 3 years of dividends [$472.3M,
+    $212.0M, $127.9M] were being summed to $812.2M and divided by one
+    year's net income ($862.8M), producing a 94.1% payout ratio (5.9%
+    retention, growth_rate=1.45%) -- when the correct single-year payout is
+    54.75% (45.25% retention, growth_rate≈11.2%), a difference material
+    enough to significantly change intrinsic value. This bug is old (present
+    in the original AV-only code, not something the Intrinio migration
+    introduced) and affects every bank/insurance-routed ticker with more
+    than one year of dividend history fetched -- likely the real
+    explanation behind several previously-flagged-but-never-investigated
+    "bad-looking" bank valuations (ALRS, HASI) from the 2026-08-31 12-ticker
+    classification sample. See docs/known_errors.md 2026-09-09.
     """
     payout = None
 
-    # --- Method 1: actual dividends paid ---
-    divs = sum(abs(v) for v in cash_flw.get("dividends_paid", []) if v)
+    # --- Method 1: actual dividends paid (most recent year only) ---
+    div_history = cash_flw.get("dividends_paid", [])
+    divs = abs(div_history[0]) if div_history and div_history[0] else 0.0
     if net_income > 0 and divs > 0:
         payout_from_divs = divs / net_income
         if 0.05 <= payout_from_divs <= 0.95:
