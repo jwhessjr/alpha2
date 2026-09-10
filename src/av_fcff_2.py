@@ -1284,7 +1284,7 @@ def calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital):
 
 
 def calc_terminal_value(
-    ebit_last, eff_tax_rate, stable_cost_of_capital, growth_cost_of_capital,
+    ebit_last, stable_cost_of_capital, growth_cost_of_capital,
     stable_growth, growth_period, moat_weight=0.0, explicit_roic=None
 ):
     """
@@ -1307,6 +1307,19 @@ def calc_terminal_value(
     pure WACC-convergence (weight=0, the default — identical to the
     2026-07-31 behavior). See get_moat_weight() and docs/known_errors.md
     2026-08-01 "Moat-gated stable-phase ROIC assumption".
+
+    Terminal-year EBIAT is taxed at MARGINAL_TAX_RATE, not the explicit
+    period's (possibly much lower) effective tax rate -- fixed 2026-09-10
+    per Damodaran's stated practice that a firm's tax rate should transition
+    toward the marginal rate by the stable-growth phase (NOLs, R&D credits,
+    and other current-period tax advantages don't persist forever). No
+    longer takes eff_tax_rate as a parameter -- it was only ever used for
+    this one calculation, and using the current-period rate here was the
+    bug. Also keeps this consistent with the stable-phase WACC, which
+    already assumes MARGINAL_TAX_RATE for the debt tax shield (see
+    calc_discount_rate()) -- previously the terminal discount rate assumed
+    a marginal-tax regime while the terminal cash flow it discounted did
+    not. See docs/known_errors.md 2026-09-10.
     """
     if moat_weight and explicit_roic is not None:
         assumed_stable_roic = stable_cost_of_capital + moat_weight * (explicit_roic - stable_cost_of_capital)
@@ -1317,7 +1330,7 @@ def calc_terminal_value(
     else:
         stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
     terminal_ebit = ebit_last * (1 + stable_growth)
-    terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
+    terminal_ebiat = terminal_ebit * (1 - MARGINAL_TAX_RATE)
     fcff_terminal = terminal_ebiat * (1 - stable_reinv_rate)
     # Gordon Growth requires cost of capital > growth rate — otherwise this
     # denominator is zero or negative and terminal value is undefined. Not a
@@ -1895,7 +1908,6 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         moat_weight = get_moat_weight(ticker, db_path)
         terminal_value_pv = calc_terminal_value(
             ebit_last,
-            eff_tax_rate,
             terminal_cost_of_capital,
             discount_rate,
             STABLE_GROWTH,
@@ -2606,8 +2618,12 @@ def _value_stock_detail_fcff(
         # terminal_value_pv below comes from the shared calc_terminal_value(),
         # which recomputes the same values internally. See
         # docs/known_errors.md 2026-08-01 "FCFF terminal-value consolidation".
+        # Taxed at MARGINAL_TAX_RATE, not eff_tax_rate -- matches the
+        # authoritative calc_terminal_value() call below (2026-09-10 fix,
+        # see its docstring); kept in sync here since this block is
+        # display-only but must show the same figures.
         terminal_ebit = ebit_n[-1] * (1 + stable_growth)
-        terminal_ebiat = terminal_ebit * (1 - eff_tax_rate)
+        terminal_ebiat = terminal_ebit * (1 - MARGINAL_TAX_RATE)
         stable_fcff = terminal_ebiat * (1 - stable_reinv_rate)
         # Gordon Growth requires cost of capital > growth rate. This block is
         # display-only (see comment above), but it still executes before the
@@ -2624,7 +2640,7 @@ def _value_stock_detail_fcff(
             stable_cost_of_capital - stable_growth
         )
         terminal_value_pv = calc_terminal_value(
-            ebit_n[-1], eff_tax_rate, stable_cost_of_capital, discount_rate,
+            ebit_n[-1], stable_cost_of_capital, discount_rate,
             stable_growth, growth_period, moat_weight=moat_weight,
             explicit_roic=return_on_capital,
         )
@@ -2687,7 +2703,7 @@ def _value_stock_detail_fcff(
                     norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, growth_period)
                     norm_ebit_last = norm_adjusted_ebit * (1 + norm_growth_rate) ** growth_period
                     norm_tv_pv = calc_terminal_value(
-                        norm_ebit_last, eff_tax_rate, stable_cost_of_capital,
+                        norm_ebit_last, stable_cost_of_capital,
                         discount_rate, stable_growth, growth_period,
                         moat_weight=moat_weight, explicit_roic=norm_return_on_capital,
                     )
