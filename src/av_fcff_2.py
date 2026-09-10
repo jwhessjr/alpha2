@@ -745,7 +745,7 @@ def capitalizerAndD(ticker, rd_years, api_key):
         # Same zero-filled shape as the rd_years <= 1 branch above -- a
         # vendor returning fewer than 4 quarters of income-statement history
         # (thin data, not necessarily "no R&D") must degrade the same safe
-        # way, not leave rAndDExpense as an empty list. calc_adj_ebiat() and
+        # way, not leave rAndDExpense as an empty list. calc_adj_ebit() and
         # calc_reinvestment() both unconditionally index amort_schedule[...][0]
         # -- an empty list crashes with "list index out of range" instead of
         # a clear message. Confirmed live 2026-08-26: CMCL/CMRE/TNK (real
@@ -816,14 +816,33 @@ def calc_reinvestment(capex, depreciation, chng_nc_wc, amort_schedule):
     return firm_reinvestment
 
 
-def calc_adj_ebiat(ebiat, amort_schedule):
-    adjusted_ebiat = (
-        ebiat
+def calc_adj_ebit(raw_ebit, amort_schedule):
+    """
+    R&D capitalization adjustment at the pre-tax EBIT level, per Damodaran's
+    procedure: add back R&D expense (already expensed within reported EBIT)
+    and subtract the capitalized R&D asset's amortization for the year --
+    both pre-tax figures, so the adjustment must happen before any tax rate
+    is applied, not after.
+
+    Fixed 2026-09-10 (external review flagged this, confirmed against the
+    code directly before acting on it): the prior version -- calc_adj_ebiat()
+    -- applied this same adjustment to EBIAT (already after-tax) instead of
+    EBIT, mixing pre-tax R&D/amortization figures into an after-tax base.
+    Every call site then "reconstructed" an EBIT by dividing that mixed
+    figure through (1 - eff_tax_rate) -- which doesn't undo the mixing, it
+    compounds it, since R&D/amortization were never tax-affected in the
+    first place. Net effect: adjusted EBIT (and everything downstream --
+    ROIC, growth rate, FCFF, terminal value) was overstated for any
+    R&D-capitalizing company, worse the larger R&D is relative to EBIT.
+    See docs/known_errors.md 2026-09-10.
+    """
+    adjusted_ebit = (
+        raw_ebit
         + amort_schedule["rAndDExpense"][0]
         - amort_schedule["Current_Year_Amortization"]
     )
-    logger.info(f"Adjusted ebiat {adjusted_ebiat:,.2f}")
-    return adjusted_ebiat
+    logger.info(f"Adjusted EBIT {adjusted_ebit:,.2f}")
+    return adjusted_ebit
 
 
 def calc_adj_bv_equity(bal_sht, amort_schedule):
@@ -1756,12 +1775,12 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         amort_schedule = capitalizerAndD(ticker, rd_years, MY_API_KEY)
         logger.info(f"Amortization Schedule {amort_schedule}")
 
-        adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
         # Pre-tax adjusted EBIT — used as the base for projections so that
-        # growth is applied to EBIT rather than EBIAT or FCFF.
-        adjusted_ebit = (
-            adjusted_ebiat / (1 - eff_tax_rate) if eff_tax_rate < 1 else adjusted_ebiat
-        )
+        # growth is applied to EBIT rather than EBIAT or FCFF. Adjust at the
+        # EBIT level (2026-09-10 fix), then derive EBIAT from it — not the
+        # other way around. See calc_adj_ebit()'s docstring.
+        adjusted_ebit = calc_adj_ebit(inc_stmnt["ebit"][0], amort_schedule)
+        adjusted_ebiat = adjusted_ebit * (1 - eff_tax_rate)
         firm_reinvestment = calc_reinvestment(
             capex, depreciation, chng_nc_wc, amort_schedule
         )
@@ -2435,10 +2454,8 @@ def _value_stock_detail_fcff(
         depreciation = fcff_data[3]
 
         amort_schedule = capitalizerAndD(ticker, rd_years, MY_API_KEY)
-        adjusted_ebiat = calc_adj_ebiat(ebiat, amort_schedule)
-        adjusted_ebit = (
-            adjusted_ebiat / (1 - eff_tax_rate) if eff_tax_rate < 1 else adjusted_ebiat
-        )
+        adjusted_ebit = calc_adj_ebit(inc_stmnt["ebit"][0], amort_schedule)
+        adjusted_ebiat = adjusted_ebit * (1 - eff_tax_rate)
         firm_reinvestment = calc_reinvestment(
             capex, depreciation, chng_nc_wc, amort_schedule
         )
@@ -2578,13 +2595,13 @@ def _value_stock_detail_fcff(
         norm_growth_rate = None
         if ebit_anomaly and adjusted_ebit < 0:
             norm_ttm_ebit_raw = ebit_anomaly["normalized_ttm_ebit"]
-            norm_ebiat_raw = norm_ttm_ebit_raw * (1 - eff_tax_rate)
-            norm_adjusted_ebiat = calc_adj_ebiat(norm_ebiat_raw, amort_schedule)
+            # Adjust at the EBIT level, then derive EBIAT -- same 2026-09-10
+            # fix as the main adjusted_ebit/adjusted_ebiat calc above; see
+            # calc_adj_ebit()'s docstring.
+            norm_adjusted_ebit_raw = calc_adj_ebit(norm_ttm_ebit_raw, amort_schedule)
+            norm_adjusted_ebiat = norm_adjusted_ebit_raw * (1 - eff_tax_rate)
             if norm_adjusted_ebiat > 0:
-                norm_adjusted_ebit = (
-                    norm_adjusted_ebiat / (1 - eff_tax_rate) if eff_tax_rate < 1
-                    else norm_adjusted_ebiat
-                )
+                norm_adjusted_ebit = norm_adjusted_ebit_raw
                 norm_reinv_rate = min(
                     max(firm_reinvestment / norm_adjusted_ebiat, 0.0), 1.0
                 )
