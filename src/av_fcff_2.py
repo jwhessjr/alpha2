@@ -713,16 +713,49 @@ def calc_capital_expenditures(cash_flw):
     return sum(capex_years) / len(capex_years)
 
 
+def calc_depreciation(cash_flw):
+    """
+    5-year average depreciation, mirroring calc_capital_expenditures() --
+    added 2026-09-10 (external review, finding #4: see docs/known_errors.md).
+    get_cash_flow()/get_cash_flow_intrinio() build 'depreciation' with the
+    exact same up-to-5-year annual-block shape as 'capex' (confirmed by
+    reading both fetchers directly), so the single-current-year figure
+    previously used here (cash_flw["depreciation"][0]) was discarding
+    available history for no data-availability reason -- it just wasn't
+    averaged like capex was, despite being combined with capex in the same
+    reinvestment formula one line apart.
+    """
+    depreciation_years = cash_flw["depreciation"][:5]
+    return sum(depreciation_years) / len(depreciation_years)
+
+
 def calc_chng_wc(bal_sht):
-    if len(bal_sht["total_current_assets"]) < 2:
+    """
+    Average year-over-year change in non-cash working capital, over up to
+    the same 5-year window calc_capital_expenditures() uses -- changed from
+    a single current-year delta 2026-09-10 (external review, finding #4:
+    see docs/known_errors.md). A single year's working-capital swing can be
+    driven by one-off timing (a large receivable collected late, inventory
+    build ahead of a launch) that reverses the next year; averaging several
+    years' deltas is the same smoothing rationale already applied to capex,
+    now applied consistently to the other reinvestment components combined
+    with it in calc_reinvestment().
+
+    Degrades gracefully: with only 2 years of balance-sheet history (the
+    prior minimum), this produces exactly 1 delta -- identical to the old
+    single-year behavior -- rather than requiring 5 years to run at all.
+    """
+    n = len(bal_sht["total_current_assets"])
+    if n < 2:
         raise ValueError("Insufficient balance sheet history (need 2 years) to compute working capital change")
-    curr_yr_nc_wc = (
-        bal_sht["total_current_assets"][0] - bal_sht["cash_and_equivalents"][0]
-    ) - (bal_sht["total_current_liabilities"][0] - bal_sht["short_term_debt"][0])
-    prior_yr_nc_wc = (
-        bal_sht["total_current_assets"][1] - bal_sht["cash_and_equivalents"][1]
-    ) - (bal_sht["total_current_liabilities"][1] - bal_sht["short_term_debt"][1])
-    return curr_yr_nc_wc - prior_yr_nc_wc
+    n = min(n, 5)
+    nc_wc = [
+        (bal_sht["total_current_assets"][i] - bal_sht["cash_and_equivalents"][i])
+        - (bal_sht["total_current_liabilities"][i] - bal_sht["short_term_debt"][i])
+        for i in range(n)
+    ]
+    deltas = [nc_wc[i] - nc_wc[i + 1] for i in range(len(nc_wc) - 1)]
+    return sum(deltas) / len(deltas)
 
 
 def capitalizerAndD(ticker, rd_years, api_key):
@@ -797,7 +830,7 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
     logger.info(f"Capex {capex:,.2f}")
     chng_nc_wc = calc_chng_wc(bal_sht)
     logger.info(f"Change WC {chng_nc_wc:,.2f}")
-    depreciation = cash_flw["depreciation"][0]
+    depreciation = calc_depreciation(cash_flw)
     logger.info(f"Depreciation {depreciation:,.2f}")
     fcff = ebiat - capex + depreciation - chng_nc_wc
     logger.info(f"FCFF {fcff:,.2f}")
@@ -805,11 +838,35 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
 
 
 def calc_reinvestment(capex, depreciation, chng_nc_wc, amort_schedule):
+    """
+    Net new capitalized R&D investment (rAndDExpense - amortization, the R&D
+    equivalent of capex - depreciation) now averages rAndDExpense over the
+    same up-to-5-year window as capex/depreciation/chng_nc_wc -- changed
+    2026-09-10 (external review, finding #4: see docs/known_errors.md), for
+    the same reason those three were changed: this formula combines several
+    reinvestment components that should share one consistent averaging
+    window, not mix a smoothed figure with raw single-year ones.
+
+    Current_Year_Amortization is deliberately NOT averaged here -- it's
+    already a schedule-based figure built from a multi-year straight-line
+    amortization of the capitalized R&D asset (see capitalizerAndD()), not a
+    raw single-year snapshot like rAndDExpense -- it's smoothed by
+    construction already.
+
+    calc_adj_ebit() intentionally keeps using amort_schedule["rAndDExpense"][0]
+    (this year's actual R&D expense only) -- that function restates THIS
+    YEAR's income statement onto an R&D-capitalized basis, so it needs this
+    year's actual figure, not a multi-year average; only the reinvestment
+    calculation (a genuinely lumpy, multi-year-smoothed quantity) changes
+    here.
+    """
+    rd_years = amort_schedule["rAndDExpense"][:5]
+    avg_rd_expense = sum(rd_years) / len(rd_years)
     firm_reinvestment = (
         capex
         - depreciation
         + chng_nc_wc
-        + amort_schedule["rAndDExpense"][0]
+        + avg_rd_expense
         - amort_schedule["Current_Year_Amortization"]
     )
     logger.info(f"Firm Reinvestment {firm_reinvestment:,.2f}")

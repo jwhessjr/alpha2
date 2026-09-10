@@ -1132,49 +1132,65 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
     via _intrinio_lease_debt_addback() — see that function's docstring for
     the full detection logic and its deliberate conservative-fallback bias.
 
-    PERIOD SELECTION (2026-08-25, efficiency fix): balance sheet is
-    point-in-time, and every real downstream consumer in av_fcff_2.py only
-    ever reads index [0] (current) or [1] (one year prior) — confirmed via
-    direct grep, not assumption: calc_chng_wc() explicitly requires exactly
-    2 years, calc_bv_debt()/the cash checks only read [0]. So this fetches
-    ONLY the current period plus the period exactly one fiscal year prior —
-    matched on fiscal_year/fiscal_period from the discovery response (which
-    is one cheap call regardless of how many periods it lists), not just
-    "4 periods back", since a gap or restated duplicate in the period
-    sequence could otherwise silently misalign that offset. Cuts a full
-    balance-sheet fetch from 26 API calls (1 discovery + 20 standardized +
-    5 as-reported, most of it fetched-then-discarded before this fix) down
-    to 5 (1 discovery + 2 standardized + 2 as-reported).
+    PERIOD SELECTION (2026-08-25, efficiency fix; widened 2026-09-10):
+    balance sheet is point-in-time, and this fetches the current period plus
+    up to MAX_BAL_SHEET_YEARS-1 (4) consecutive prior fiscal years — matched
+    on fiscal_year/fiscal_period from the discovery response (which is one
+    cheap call regardless of how many periods it lists), not just "N periods
+    back", since a gap or restated duplicate in the period sequence could
+    otherwise silently misalign that offset. Originally narrowed to exactly
+    2 years (current + 1 prior) because every downstream consumer in
+    av_fcff_2.py at the time only read index [0]/[1] (calc_chng_wc()
+    required exactly 2, calc_bv_debt()/cash checks only read [0]) — cutting
+    a full balance-sheet fetch from 26 API calls (1 discovery + 20
+    standardized + 5 as-reported) down to 5 (1 discovery + 2 standardized +
+    2 as-reported). Widened back to 5 years 2026-09-10 (external DCF review,
+    finding #4: see docs/known_errors.md) once calc_chng_wc() started
+    averaging working-capital change over up to 5 years to stay consistent
+    with the already-averaged capex/depreciation/R&D reinvestment
+    components — still well under the pre-2026-08-25 worst case (up to 11
+    calls: 1 discovery + up to 5 standardized + up to 5 as-reported, fewer
+    for companies with less history), and gracefully degrades to whatever
+    years actually match if a company has fewer than 5 fiscal years on
+    Intrinio.
 
     is_financial_or_reit is accepted for signature parity with
     get_bal_sheet() but unused here — Intrinio's cashandequivalents tag has
     not shown AV's financial-firm/REIT cash-tagging quirk (docs/known_errors.md
     2026-08-02); revisit if Phase 2 finds otherwise.
     """
+    MAX_BAL_SHEET_YEARS = 5
+
     periods = _intrinio_periods(company, "balance_sheet_statement", apiKey, n=20)
     if not periods:
         raise ValueError(f"No quarterly balance sheet reports found for {company} on Intrinio")
 
     current = periods[0]
-    prior_year = None
-    for p in periods[1:]:
-        if (
-            p.get("fiscal_period") == current.get("fiscal_period")
-            and p.get("fiscal_year") is not None
-            and current.get("fiscal_year") is not None
-            and p["fiscal_year"] == current["fiscal_year"] - 1
-        ):
-            prior_year = p
-            break
+    selected_periods = [current]
+    current_fiscal_year = current.get("fiscal_year")
+    target_fiscal_period = current.get("fiscal_period")
+    if current_fiscal_year is not None:
+        for offset in range(1, MAX_BAL_SHEET_YEARS):
+            target_year = current_fiscal_year - offset
+            match = next(
+                (
+                    p for p in periods[1:]
+                    if p.get("fiscal_period") == target_fiscal_period
+                    and p.get("fiscal_year") == target_year
+                ),
+                None,
+            )
+            if match is None:
+                break
+            selected_periods.append(match)
 
-    if prior_year is None:
+    if len(selected_periods) < 2:
         raise ValueError(
             f"{company}: could not find a matching prior-year period for "
             f"{current.get('fiscal_period')} FY{current.get('fiscal_year')} "
             f"in Intrinio's period discovery — insufficient history for a "
-            f"2-year balance sheet comparison via Intrinio."
+            f"balance sheet comparison via Intrinio."
         )
-    selected_periods = [current, prior_year]
     quarters = [_intrinio_standardized(p["id"], apiKey) for p in selected_periods]
 
     def _cash(q: dict) -> float:
