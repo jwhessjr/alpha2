@@ -1116,6 +1116,55 @@ def low_growth_rate_note(growth_rate: float, risk_free_rate: float) -> str:
     )
 
 
+def extreme_reinvestment_rate_note(reinvestment_rate: float) -> str:
+    """
+    Flag (never filter) when the explicit-period reinvestment rate falls
+    outside [0, 1] -- added 2026-09-10 alongside removing the hard clamp
+    that used to force it into that band (`min(max(firm_reinvestment /
+    adjusted_ebiat, 0.0), 1.0)`, both in _value_stock_fcff() and
+    _value_stock_detail_fcff()).
+
+    External review (ChatGPT, checked directly against the code before
+    acting) flagged that the clamp silently substitutes a fundamentally
+    different company for the one being valued whenever reinvestment truly
+    falls outside [0,1] -- e.g. a company reinvesting 140% of NOPAT
+    (negative FCFF while growing aggressively) got clamped to RR=100%,
+    understating both its real growth rate and its real near-term cash
+    burn; a mature company with negative reinvestment (depreciation +
+    working-capital release exceeding capex, returning capital) got
+    clamped to RR=0%, hiding that it's shrinking its capital base.
+
+    Both are legitimate economic states, not data errors -- Damodaran's own
+    framework allows reinvestment rates outside [0,1] for exactly these
+    cases. The clamp wasn't a sanity check, it was silently swapping in a
+    different growth story. Same "flag, don't filter" pattern as
+    terminal_value_dominance_note()/low_growth_rate_note(): the raw ratio
+    now flows through unmodified into growth_rate and the FCFF projections
+    (which still have their own separate safety nets -- the 30% growth-rate
+    cap, the adjusted_ebiat==0 raise above this call -- neither touched by
+    this change), and this note just surfaces the unusual case for review
+    rather than silently distorting the number to look "normal."
+
+    Deliberately NOT applied to calc_stable_reinvestment_rate() (the
+    terminal/stable-phase rate) -- that's a separate formula
+    (stable_growth / stable_cost_of_capital) where staying in [0,1] is the
+    correct Damodaran terminal-phase assumption itself (ROIC converges to
+    WACC, no permanent excess returns), not an artificial clamp on a
+    genuine outlier. See docs/known_errors.md 2026-09-10.
+    """
+    if reinvestment_rate is None:
+        return ""
+    if 0.0 <= reinvestment_rate <= 1.0:
+        return ""
+    return (
+        f"Reinvestment rate ({reinvestment_rate:.1%}) falls outside the "
+        "normal [0%, 100%] band -- this reflects either aggressive "
+        "growth funded beyond NOPAT (negative FCFF) or a mature business "
+        "releasing capital (negative reinvestment); verify this is a "
+        "genuine read before trusting the resulting growth rate and FCFF."
+    )
+
+
 def calc_growth_rate(reinvestment_rate, return_on_capital):
     growth_rate = reinvestment_rate * return_on_capital
     logger.info(f"Growth Rate = {growth_rate:,.4f}")
@@ -1799,7 +1848,11 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
             raise ValueError(
                 f"Adjusted EBIAT is zero for {ticker} — cannot compute reinvestment rate."
             )
-        reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
+        # Not clamped to [0,1] -- a company can legitimately reinvest more
+        # than 100% of NOPAT (negative FCFF, aggressive growth) or less than
+        # 0% (mature, releasing capital). See extreme_reinvestment_rate_note()
+        # docstring and docs/known_errors.md 2026-09-10.
+        reinvestment_rate = firm_reinvestment / adjusted_ebiat
         logger.info(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
         return_on_capital, roc_notes = calc_gated_return_on_capital(
@@ -1892,6 +1945,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 notes,
                 terminal_value_dominance_note(terminal_value_pv, market_cap),
                 low_growth_rate_note(growth_rate, RISK_FREE),
+                extreme_reinvestment_rate_note(reinvestment_rate),
             ) if n
         )
 
@@ -2472,7 +2526,12 @@ def _value_stock_detail_fcff(
             raise ValueError(
                 f"Adjusted EBIAT is zero for {ticker} — cannot compute reinvestment rate."
             )
-        reinvestment_rate = min(max(firm_reinvestment / adjusted_ebiat, 0.0), 1.0)
+        # Not clamped to [0,1] -- see extreme_reinvestment_rate_note()
+        # docstring and docs/known_errors.md 2026-09-10.
+        reinvestment_rate = firm_reinvestment / adjusted_ebiat
+        _extreme_rr_note = extreme_reinvestment_rate_note(reinvestment_rate)
+        if _extreme_rr_note:
+            logger.warning(f"{ticker}: {_extreme_rr_note}")
         return_on_capital, roc_notes = calc_gated_return_on_capital(
             ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
         )
@@ -2602,9 +2661,9 @@ def _value_stock_detail_fcff(
             norm_adjusted_ebiat = norm_adjusted_ebit_raw * (1 - eff_tax_rate)
             if norm_adjusted_ebiat > 0:
                 norm_adjusted_ebit = norm_adjusted_ebit_raw
-                norm_reinv_rate = min(
-                    max(firm_reinvestment / norm_adjusted_ebiat, 0.0), 1.0
-                )
+                # Not clamped -- same 2026-09-10 fix as the main
+                # reinvestment_rate calc above.
+                norm_reinv_rate = firm_reinvestment / norm_adjusted_ebiat
                 norm_return_on_capital, norm_roc_notes = calc_gated_return_on_capital(
                     ticker, norm_adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
                 )
