@@ -768,6 +768,27 @@ def calc_chng_wc(bal_sht):
 
 
 def capitalizerAndD(ticker, rd_years, api_key):
+    """
+    Damodaran's R&D-capitalization amortization schedule: R&D expense is
+    treated as a capitalized asset, amortized straight-line over rd_years.
+    Each prior year's R&D vintage contributes 1/rd_years to this year's
+    amortization charge -- e.g. rd_years=3 means each of the 3 most recent
+    prior years' R&D still has some unamortized balance, each contributing
+    an equal 1/3 share to this year's Current_Year_Amortization.
+
+    Fixed 2026-09-11 (external DCF review + a live Ginzu comparison, see
+    docs/known_errors.md): amort_percentage was 1/(rd_years-1), not
+    1/rd_years -- confirmed against Damodaran's own Ginzu R&D-converter
+    formulas directly (its 'Amortization this year' column divides by the
+    amortization period itself, not one less than it). This overstated
+    Current_Year_Amortization (and RD_Asset_Value, since both use the same
+    amort_percentage) by exactly rd_years/(rd_years-1) -- 50% for
+    rd_years=3, 25% for rd_years=5, milder for longer amortization periods
+    -- for every R&D-capitalizing company in the universe, understating
+    adjusted_ebit, adjusted_bv_equity, ROIC, growth, and IV. Live-verified:
+    GOOG/MSFT (rd_years=3) IV understated ~13.6%/~10.4% by this alone;
+    AAPL (rd_years=5) ~8.9%.
+    """
     rd_years = int(rd_years)
     if rd_years <= 1:
         # No R&D amortization for this industry — skip API call and return zeroed schedule
@@ -806,8 +827,13 @@ def capitalizerAndD(ticker, rd_years, api_key):
     rd_expense = []
     unamort_percent = []
     unamort_amt = []
-    amort_percentage = 1.0 / (rd_years - 1)
+    amort_percentage = 1.0 / rd_years
 
+    # min(years_to_process, rd_years) never actually caps anything here --
+    # research_and_development()'s own fetchers already enforce
+    # years_to_process = min(rd_years, num_available_years), so
+    # years_to_process <= rd_years always holds. Kept for defensive clarity
+    # in case that invariant ever changes upstream.
     current_year_total_amortization = 0
     for year in range(1, min(years_to_process, rd_years)):
         current_year_total_amortization += (
