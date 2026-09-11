@@ -67,6 +67,15 @@ if not FRED_KEY:
 
 MARGINAL_TAX_RATE = 0.26
 GROWTH_PERIOD = 5  # high-growth years; override with --growth N
+TRANSITION_PERIOD = 5
+# Years, after the explicit high-growth period, over which growth and
+# reinvestment rate fade linearly toward their stable-phase values instead
+# of jumping straight from the explicit rate to STABLE_GROWTH -- the
+# standard Damodaran 3-stage structure. Fixed 2026-09-11 (external DCF
+# review, finding #6: see docs/known_errors.md). Not CLI-configurable
+# (unlike GROWTH_PERIOD) -- keeping this fixed avoids compounding an
+# already-large change with a second new knob; revisit if a real need
+# for a different transition length surfaces.
 
 # AV->Intrinio migration Phase 3 (2026-08-24): "intrinio" is now the
 # production default for the 5 fetch wrappers below, with automatic
@@ -1301,22 +1310,65 @@ def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, e
 
 
 def calc_expected_fcff(
-    adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period
+    adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period,
+    transition_period=0, stable_growth=None, stable_reinvestment_rate=None,
 ):
-    # Grow EBIT each year, then derive EBIAT and FCFF.
-    # Applying growth to EBIT (not EBIAT or FCFF) avoids sign errors when
-    # the current FCFF is negative due to high reinvestment.
+    """
+    Projects EBIT/EBIAT/FCFF year by year. Applying growth to EBIT (not
+    EBIAT or FCFF) avoids sign errors when the current FCFF is negative due
+    to high reinvestment.
+
+    Three-stage fade (2026-09-11, external DCF review finding #6: see
+    docs/known_errors.md) -- when transition_period > 0, growth_period
+    years of constant explicit growth_rate/reinvestment_rate are followed
+    by transition_period years where both fade LINEARLY toward
+    stable_growth/stable_reinvestment_rate, reaching those targets exactly
+    at the last transition year. This replaces the prior abrupt jump
+    straight from the explicit rate to STABLE_GROWTH at the terminal
+    boundary -- worst for tickers hitting the 30% growth cap (a 30%->3%
+    overnight drop) -- with a gradual deceleration, the standard Damodaran
+    3-stage structure. Default transition_period=0 preserves the exact
+    prior two-stage behavior (the `else` branch below is never reached).
+
+    Returns (fcff_n, ebit_n, ebiat_n, reinv_n, growth_n) -- reinv_n and
+    growth_n are the per-year RATES actually used (constant for the first
+    growth_period years, fading thereafter) -- not dollar amounts. Callers
+    needing the terminal-year EBIT (for calc_terminal_value()) or the full
+    trajectory for display don't need their own separate projection loop.
+    Consolidates what used to be two independent implementations of this
+    same math (the batch path via this function, the detail path via its
+    own inline loop) -- see docs/known_errors.md 2026-07-31's rule on
+    duplicated valuation-path math.
+    """
     ebit_n = []
+    ebiat_n = []
     fcff_n = []
-    for year in range(growth_period):
-        if year == 0:
-            ebit_n.append(adjusted_ebit * (1 + growth_rate))
+    reinv_n = []
+    growth_n = []
+    total_years = growth_period + transition_period
+    for year in range(total_years):
+        if year < growth_period:
+            g = growth_rate
+            rr = reinvestment_rate
         else:
-            ebit_n.append(ebit_n[year - 1] * (1 + growth_rate))
+            fade_year = year - growth_period + 1  # 1..transition_period
+            fraction = fade_year / transition_period
+            g = growth_rate + (stable_growth - growth_rate) * fraction
+            rr = reinvestment_rate + (stable_reinvestment_rate - reinvestment_rate) * fraction
+        if year == 0:
+            ebit_n.append(adjusted_ebit * (1 + g))
+        else:
+            ebit_n.append(ebit_n[year - 1] * (1 + g))
         ebiat = ebit_n[year] * (1 - eff_tax_rate)
-        fcff_n.append(ebiat * (1 - reinvestment_rate))
-        logger.info(f"Expected FCFF year {year + 1} = {fcff_n[year]:,.2f}")
-    return fcff_n
+        ebiat_n.append(ebiat)
+        reinv_n.append(rr)
+        growth_n.append(g)
+        fcff_n.append(ebiat * (1 - rr))
+        logger.info(
+            f"Expected FCFF year {year + 1} = {fcff_n[year]:,.2f} "
+            f"(growth={g:.4f}, reinvestment={rr:.4f})"
+        )
+    return fcff_n, ebit_n, ebiat_n, reinv_n, growth_n
 
 
 def calc_fcff_value(fcff_table, discount_rate, growth_period):
@@ -1338,6 +1390,26 @@ def calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital):
     if stable_cost_of_capital <= 0:
         return 0.0
     return min(max(stable_growth / stable_cost_of_capital, 0.0), 1.0)
+
+
+def calc_stable_phase_reinvestment_rate(
+    stable_cost_of_capital, stable_growth, moat_weight=0.0, explicit_roic=None
+):
+    """
+    The stable-phase reinvestment rate -- shared by calc_terminal_value()
+    (the terminal Gordon-growth FCFF) and calc_expected_fcff()'s 3-stage
+    fade (the target the transition years fade toward), single source of
+    truth so the two can't drift apart. Extracted 2026-09-11 (finding #6)
+    from what used to be an if/else duplicated inline in
+    calc_terminal_value() alone; logic itself unchanged from 2026-08-01's
+    moat-gated blend.
+    """
+    if moat_weight and explicit_roic is not None:
+        assumed_stable_roic = stable_cost_of_capital + moat_weight * (explicit_roic - stable_cost_of_capital)
+        if assumed_stable_roic > 0:
+            return min(max(stable_growth / assumed_stable_roic, 0.0), 1.0)
+        return 1.0
+    return calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
 
 
 def calc_terminal_value(
@@ -1378,14 +1450,9 @@ def calc_terminal_value(
     a marginal-tax regime while the terminal cash flow it discounted did
     not. See docs/known_errors.md 2026-09-10.
     """
-    if moat_weight and explicit_roic is not None:
-        assumed_stable_roic = stable_cost_of_capital + moat_weight * (explicit_roic - stable_cost_of_capital)
-        if assumed_stable_roic > 0:
-            stable_reinv_rate = min(max(stable_growth / assumed_stable_roic, 0.0), 1.0)
-        else:
-            stable_reinv_rate = 1.0
-    else:
-        stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
+    stable_reinv_rate = calc_stable_phase_reinvestment_rate(
+        stable_cost_of_capital, stable_growth, moat_weight, explicit_roic
+    )
     terminal_ebit = ebit_last * (1 + stable_growth)
     terminal_ebiat = terminal_ebit * (1 - MARGINAL_TAX_RATE)
     fcff_terminal = terminal_ebiat * (1 - stable_reinv_rate)
@@ -1952,23 +2019,33 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         )
         logger.info(f"disc rate {discount_rate:,.4f}")
 
-        fcff_table = calc_expected_fcff(
-            adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period
-        )
-        fcff_pv = calc_fcff_value(fcff_table, discount_rate, growth_period)
-
         terminal_cost_of_capital = calc_discount_rate(
             inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM,
             de_cap=hg_dcflib.get_industry_de(industry),
         )
-        ebit_last = adjusted_ebit * (1 + growth_rate) ** growth_period
         moat_weight = get_moat_weight(ticker, db_path)
+        # 3-stage fade target (2026-09-11, finding #6) -- growth/reinvestment
+        # fade toward this over TRANSITION_PERIOD years instead of jumping
+        # straight to it at the terminal boundary. See calc_expected_fcff()
+        # and calc_stable_phase_reinvestment_rate()'s docstrings.
+        stable_reinv_rate_target = calc_stable_phase_reinvestment_rate(
+            terminal_cost_of_capital, STABLE_GROWTH, moat_weight, return_on_capital
+        )
+        total_explicit_years = growth_period + TRANSITION_PERIOD
+        fcff_table, ebit_n, _, _, _ = calc_expected_fcff(
+            adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period,
+            transition_period=TRANSITION_PERIOD, stable_growth=STABLE_GROWTH,
+            stable_reinvestment_rate=stable_reinv_rate_target,
+        )
+        fcff_pv = calc_fcff_value(fcff_table, discount_rate, total_explicit_years)
+
+        ebit_last = ebit_n[-1]
         terminal_value_pv = calc_terminal_value(
             ebit_last,
             terminal_cost_of_capital,
             discount_rate,
             STABLE_GROWTH,
-            growth_period,
+            total_explicit_years,
             moat_weight=moat_weight,
             explicit_roic=return_on_capital,
         )
@@ -2642,43 +2719,48 @@ def _value_stock_detail_fcff(
         )
         stable_growth = STABLE_GROWTH
         moat_weight = get_moat_weight(ticker, db_path)
-        if moat_weight:
-            assumed_stable_roic = stable_cost_of_capital + moat_weight * (return_on_capital - stable_cost_of_capital)
-            stable_reinv_rate = (
-                min(max(stable_growth / assumed_stable_roic, 0.0), 1.0)
-                if assumed_stable_roic > 0 else 1.0
-            )
-        else:
-            stable_reinv_rate = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_capital)
+        stable_reinv_rate = calc_stable_phase_reinvestment_rate(
+            stable_cost_of_capital, stable_growth, moat_weight, return_on_capital
+        )
 
-        # Year-by-year FCFF projections
-        ebit_n, ebiat_n, reinv_n, fcff_n = [], [], [], []
-        for year in range(growth_period):
-            e = adjusted_ebit * (1 + growth_rate) ** (year + 1)
-            eb = e * (1 - eff_tax_rate)
-            r = eb * reinvestment_rate
-            ebit_n.append(e)
-            ebiat_n.append(eb)
-            reinv_n.append(r)
-            fcff_n.append(eb - r)
+        # Year-by-year FCFF projections -- 3-stage fade (2026-09-11, external
+        # DCF review finding #6: see docs/known_errors.md). growth_period
+        # years of constant growth_rate/reinvestment_rate, then
+        # TRANSITION_PERIOD years fading linearly toward
+        # stable_growth/stable_reinv_rate, replacing the prior abrupt jump
+        # straight to STABLE_GROWTH at the terminal boundary. See
+        # calc_expected_fcff()'s docstring.
+        total_explicit_years = growth_period + TRANSITION_PERIOD
+        fcff_n, ebit_n, ebiat_n, reinv_rate_n, growth_n = calc_expected_fcff(
+            adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period,
+            transition_period=TRANSITION_PERIOD, stable_growth=stable_growth,
+            stable_reinvestment_rate=stable_reinv_rate,
+        )
+        # Dollar reinvestment per year (ebiat * rate) -- the Excel report's
+        # capex/WC breakdown rows split this proportionally; kept as a
+        # separate dollar-amount array from reinv_rate_n (the rate) since
+        # the two aren't interchangeable.
+        reinv_n = [ebiat_n[y] * reinv_rate_n[y] for y in range(total_explicit_years)]
 
         fcff_pv = sum(
-            fcff_n[y] / (1 + discount_rate) ** (y + 1) for y in range(growth_period)
+            fcff_n[y] / (1 + discount_rate) ** (y + 1) for y in range(total_explicit_years)
         )
 
         # Terminal-year FCFF is recomputed at the stable-phase reinvestment
         # rate rather than carrying forward the explicit period's (typically
         # much higher) reinvestment rate — see calc_terminal_value() and
         # docs/known_errors.md 2026-07-31.
-        # Display-only intermediates for the Excel report (stable_reinv_rate,
-        # stable_fcff, terminal_value_undiscounted) — the authoritative
-        # terminal_value_pv below comes from the shared calc_terminal_value(),
-        # which recomputes the same values internally. See
-        # docs/known_errors.md 2026-08-01 "FCFF terminal-value consolidation".
+        # Display-only intermediates for the Excel report (stable_fcff,
+        # terminal_value_undiscounted) — the authoritative terminal_value_pv
+        # below comes from the shared calc_terminal_value(), which
+        # recomputes the same values internally. See docs/known_errors.md
+        # 2026-08-01 "FCFF terminal-value consolidation".
         # Taxed at MARGINAL_TAX_RATE, not eff_tax_rate -- matches the
         # authoritative calc_terminal_value() call below (2026-09-10 fix,
         # see its docstring); kept in sync here since this block is
-        # display-only but must show the same figures.
+        # display-only but must show the same figures. By construction the
+        # fade above lands exactly on stable_growth/stable_reinv_rate at
+        # ebit_n[-1], so this is now a seamless continuation, not a jump.
         terminal_ebit = ebit_n[-1] * (1 + stable_growth)
         terminal_ebiat = terminal_ebit * (1 - MARGINAL_TAX_RATE)
         stable_fcff = terminal_ebiat * (1 - stable_reinv_rate)
@@ -2698,7 +2780,7 @@ def _value_stock_detail_fcff(
         )
         terminal_value_pv = calc_terminal_value(
             ebit_n[-1], stable_cost_of_capital, discount_rate,
-            stable_growth, growth_period, moat_weight=moat_weight,
+            stable_growth, total_explicit_years, moat_weight=moat_weight,
             explicit_roic=return_on_capital,
         )
 
@@ -2753,15 +2835,24 @@ def _value_stock_detail_fcff(
                     norm_growth_rate = min(
                         calc_growth_rate(norm_reinv_rate, norm_return_on_capital), 0.30
                     )
-                    norm_fcff_table = calc_expected_fcff(
-                        norm_adjusted_ebit, eff_tax_rate, norm_growth_rate,
-                        norm_reinv_rate, growth_period
+                    # 3-stage fade applied here too (2026-09-11, finding #6),
+                    # matching the main GAAP path -- own fade target since
+                    # norm_return_on_capital can differ from the GAAP
+                    # return_on_capital used above.
+                    norm_stable_reinv_rate = calc_stable_phase_reinvestment_rate(
+                        stable_cost_of_capital, stable_growth, moat_weight, norm_return_on_capital
                     )
-                    norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, growth_period)
-                    norm_ebit_last = norm_adjusted_ebit * (1 + norm_growth_rate) ** growth_period
+                    norm_fcff_table, norm_ebit_n, _, _, _ = calc_expected_fcff(
+                        norm_adjusted_ebit, eff_tax_rate, norm_growth_rate,
+                        norm_reinv_rate, growth_period,
+                        transition_period=TRANSITION_PERIOD, stable_growth=stable_growth,
+                        stable_reinvestment_rate=norm_stable_reinv_rate,
+                    )
+                    norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, total_explicit_years)
+                    norm_ebit_last = norm_ebit_n[-1]
                     norm_tv_pv = calc_terminal_value(
                         norm_ebit_last, stable_cost_of_capital,
-                        discount_rate, stable_growth, growth_period,
+                        discount_rate, stable_growth, total_explicit_years,
                         moat_weight=moat_weight, explicit_roic=norm_return_on_capital,
                     )
                     norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
@@ -2788,7 +2879,7 @@ def _value_stock_detail_fcff(
             "adjusted_bv_equity": adjusted_bv_equity,
             "cash": cash,
             # --- Growth phase parameters ---
-            "growth_period": growth_period,
+            "growth_period": total_explicit_years,
             "growth_rate": growth_rate,
             "reinvestment_rate": reinvestment_rate,
             "return_on_capital": return_on_capital,
@@ -2817,6 +2908,8 @@ def _value_stock_detail_fcff(
             "ebit_n": ebit_n,
             "ebiat_n": ebiat_n,
             "reinv_n": reinv_n,
+            "reinvestment_rate_n": reinv_rate_n,
+            "growth_n": growth_n,
             "fcff_n": fcff_n,
             # --- Valuation ---
             "fcff_pv": fcff_pv,
@@ -3353,8 +3446,11 @@ def _generate_xlsx_fcff(
     r += 1
 
     params = [
-        ("Length of High Growth Period", d["growth_period"], "int", "Forever"),
-        ("Growth Rate", d["growth_rate"], "pct", d["stable_growth"]),
+        (
+            "Length of Explicit Period (high-growth + fade)",
+            d["growth_period"], "int", "Forever",
+        ),
+        ("Growth Rate (initial / at fade start)", d["growth_rate"], "pct", d["stable_growth"]),
         ("Beta used for stock", d["beta"], "num", d["stable_beta"]),
         ("Risk-free Rate", d["risk_free"], "pct", d["risk_free"]),
         ("Equity Risk Premium", d["eq_prem"], "pct", d["eq_prem"]),
@@ -3427,7 +3523,7 @@ def _generate_xlsx_fcff(
     # ====================================================================
     # SECTION 4 — YEAR-BY-YEAR FCFF TABLE
     # ====================================================================
-    section_header(r, 1, f"Projected FCFF  (growth period = {gp} years)")
+    section_header(r, 1, f"Projected FCFF  (explicit period = {gp} years, incl. {TRANSITION_PERIOD}yr fade to stable growth)")
     year_cols = list(range(1, gp + 1))
     for i, yr in enumerate(year_cols):
         ws.cell(row=r, column=2 + i, value=f"Year {yr}").font = HEADER_FONT
@@ -3441,14 +3537,20 @@ def _generate_xlsx_fcff(
     capex_frac = net_capex / total_reinv0
     wc_frac = d["chng_nc_wc"] / total_reinv0
 
+    # Per-year growth/reinvestment rate -- was a single flat rate repeated
+    # across every column; now varies during the 3-stage fade's transition
+    # years (2026-09-11, finding #6), so this reads the actual per-year
+    # arrays instead of assuming one constant rate for the whole period.
+    _cumulated_growth = []
+    _acc = 1.0
+    for _g in d["growth_n"]:
+        _acc *= (1 + _g)
+        _cumulated_growth.append(_acc - 1)
+
     table_rows = [
-        ("Expected Growth Rate", [d["growth_rate"]] * gp, "pct"),
-        (
-            "Cumulated Growth",
-            [(1 + d["growth_rate"]) ** (y + 1) - 1 for y in range(gp)],
-            "pct",
-        ),
-        ("Reinvestment Rate", [d["reinvestment_rate"]] * gp, "pct"),
+        ("Expected Growth Rate", d["growth_n"], "pct"),
+        ("Cumulated Growth", _cumulated_growth, "pct"),
+        ("Reinvestment Rate", d["reinvestment_rate_n"], "pct"),
         ("EBIT", d["ebit_n"], "dollar"),
         ("Tax Rate (cash flow)", [d["eff_tax_rate"]] * gp, "pct"),
         ("EBIT × (1 − tax rate)", d["ebiat_n"], "dollar"),
