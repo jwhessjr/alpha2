@@ -849,33 +849,42 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
 def calc_reinvestment(capex, depreciation, chng_nc_wc, amort_schedule):
     """
     Net new capitalized R&D investment (rAndDExpense - amortization, the R&D
-    equivalent of capex - depreciation) now averages rAndDExpense over the
-    same up-to-5-year window as capex/depreciation/chng_nc_wc -- changed
-    2026-09-10 (external review, finding #4: see docs/known_errors.md), for
-    the same reason those three were changed: this formula combines several
-    reinvestment components that should share one consistent averaging
-    window, not mix a smoothed figure with raw single-year ones.
+    equivalent of capex - depreciation) uses the CURRENT YEAR's R&D expense
+    only -- matching Damodaran's own Ginzu FCFF spreadsheet, which is
+    literally where this codebase's whole R&D-capitalization methodology
+    came from (see docs/ginzu_comparison_procedure.md): Ginzu's R&D
+    converter feeds current-year R&D expense (its F7 cell) directly into
+    the reinvestment-rate numerator, never an average.
 
-    Current_Year_Amortization is deliberately NOT averaged here -- it's
-    already a schedule-based figure built from a multi-year straight-line
-    amortization of the capitalized R&D asset (see capitalizerAndD()), not a
-    raw single-year snapshot like rAndDExpense -- it's smoothed by
-    construction already.
+    2026-09-11 revert (external DCF review finding #4 had averaged this
+    over 5 years, 2026-09-10, on internal-consistency grounds -- matching
+    the newly-averaged capex/depreciation/chng_nc_wc in the same formula).
+    A live 3-ticker Ginzu comparison (AAPL/GOOG/MSFT) traced and quantified
+    this specific averaging as the dominant driver of a ~21-23% IV gap
+    against Ginzu for R&D-heavy companies whose R&D spend is trending up
+    (AAPL's 5yr R&D history: $25.3B -> $29.4B -> $30.9B -> $33.4B ->
+    $42.9B -- the average sits well below the current year, materially
+    understating reinvestment/growth for exactly this common case). Jim's
+    call: if it isn't part of Ginzu, it isn't part of Damodaran's
+    philosophy -- revert. See docs/known_errors.md 2026-09-11.
 
-    calc_adj_ebit() intentionally keeps using amort_schedule["rAndDExpense"][0]
-    (this year's actual R&D expense only) -- that function restates THIS
-    YEAR's income statement onto an R&D-capitalized basis, so it needs this
-    year's actual figure, not a multi-year average; only the reinvestment
-    calculation (a genuinely lumpy, multi-year-smoothed quantity) changes
-    here.
+    Current_Year_Amortization is NOT averaged -- it's already a
+    schedule-based figure built from a multi-year straight-line
+    amortization of the capitalized R&D asset (see capitalizerAndD()), not
+    a raw single-year snapshot -- smoothed by construction already, and
+    this is exactly how Ginzu's own R&D converter computes its
+    amortization too.
+
+    calc_adj_ebit() also uses amort_schedule["rAndDExpense"][0] (this
+    year's actual R&D expense) -- that function restates THIS YEAR's
+    income statement onto an R&D-capitalized basis, so it needs this
+    year's actual figure regardless of what this function does.
     """
-    rd_years = amort_schedule["rAndDExpense"][:5]
-    avg_rd_expense = sum(rd_years) / len(rd_years)
     firm_reinvestment = (
         capex
         - depreciation
         + chng_nc_wc
-        + avg_rd_expense
+        + amort_schedule["rAndDExpense"][0]
         - amort_schedule["Current_Year_Amortization"]
     )
     logger.info(f"Firm Reinvestment {firm_reinvestment:,.2f}")
