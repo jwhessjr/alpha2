@@ -1194,9 +1194,39 @@ def get_bal_sheet_intrinio(company: str, apiKey: str, is_financial_or_reit: bool
     quarters = [_intrinio_standardized(p["id"], apiKey) for p in selected_periods]
 
     def _cash(q: dict) -> float:
-        v = safe_float(q.get("cashandequivalents"))
-        if v > 0:
-            return v
+        """
+        Cash + short-term investments for one Intrinio balance-sheet period.
+
+        Fixed 2026-09-13: previously read only 'cashandequivalents', missing
+        'shortterminvestments' entirely -- a regression of the exact bug
+        _q_cash_and_sti() (this file, AV path) already fixed for GOOG on
+        2026-07-31, reintroduced here because get_bal_sheet_intrinio()'s own
+        cash helper was written fresh during the 2026-08-24 AV->Intrinio
+        migration and never carried the granular-sum fix over. Confirmed via
+        Damodaran's own published NVDA valuation (NvidiaJan2025.xlsx): his
+        "Cash and Marketable Securities" input ($38,487M) is exactly
+        cashandequivalents ($9,107M) + shortterminvestments ($29,380M) --
+        this project's whole DCF methodology is built on his convention, so
+        this is the correct definition, not a judgment call.
+
+        Missing short-term investments hits the model twice: (1) understates
+        cash added back in the enterprise-value bridge, and (2) leaves the
+        missing amount trapped inside non-cash working capital (never
+        subtracted out), inflating curr_nc_wc/chng_nc_wc and therefore the
+        computed reinvestment rate -- confirmed live on GOOG (curr_nc_wc
+        overstated by ~$161B, an implausible figure exceeding total current
+        assets) and NVDA (curr_nc_wc overstated by exactly the missing
+        $29.38B).
+
+        Not yet verified whether Intrinio's shortterminvestments tag has the
+        same financial-firm reliability problem AV's did (see
+        _q_cash_and_sti()'s docstring) -- applied uniformly here since no
+        evidence of an Intrinio-specific version of that problem has been
+        found yet.
+        """
+        granular = safe_float(q.get("cashandequivalents")) + safe_float(q.get("shortterminvestments"))
+        if granular > 0:
+            return granular
         return safe_float(q.get("restrictedcash"))
 
     # Cash-sanity check ported from get_bal_sheet(), but LOG-ONLY here rather

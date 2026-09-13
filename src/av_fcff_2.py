@@ -718,24 +718,38 @@ def calc_stable_beta(unlevered_beta):
 
 
 def calc_capital_expenditures(cash_flw):
-    capex_years = cash_flw["capex"][:5]
-    return sum(capex_years) / len(capex_years)
+    """
+    Current-year (TTM) capex only.
+
+    Reverted 2026-09-13 (same reasoning, and same precedent, as the R&D-
+    expense averaging revert in calc_reinvestment() on 2026-09-11): Ginzu's
+    own Master Inputs sheet takes capex (B14) as a single raw fed-in figure,
+    never averaged -- confirmed by reading its formulas directly, same
+    procedure used for the R&D revert. 5-year averaging was added 2026-09-10
+    (external review, finding #4) on internal-consistency grounds, but a
+    live GOOG comparison (independent-data Ginzu run vs. our engine, 2026-
+    09-11/13) found it was diluting a real, structural capex ramp: GOOG's
+    TTM capex was $132.4B, but the 5-year average our engine fed Ginzu was
+    only $60.3B (blended against 4-year-old figures as low as $28B) --
+    exactly the same averaging-masks-a-real-trend failure mode already found
+    and reverted for R&D on AAPL. This directly explained most of the gap
+    between our engine's growth rate (10.6%) and Ginzu's own native growth
+    rate on identical data (23.9%) for GOOG.
+    """
+    return cash_flw["capex"][0]
 
 
 def calc_depreciation(cash_flw):
     """
-    5-year average depreciation, mirroring calc_capital_expenditures() --
-    added 2026-09-10 (external review, finding #4: see docs/known_errors.md).
-    get_cash_flow()/get_cash_flow_intrinio() build 'depreciation' with the
-    exact same up-to-5-year annual-block shape as 'capex' (confirmed by
-    reading both fetchers directly), so the single-current-year figure
-    previously used here (cash_flw["depreciation"][0]) was discarding
-    available history for no data-availability reason -- it just wasn't
-    averaged like capex was, despite being combined with capex in the same
-    reinvestment formula one line apart.
+    Current-year (TTM) depreciation only.
+
+    Reverted 2026-09-13, same reasoning as calc_capital_expenditures() above
+    -- added 2026-09-10 (external review, finding #4) as a 5-year average to
+    mirror capex, but Ginzu feeds depreciation (B15) as a single raw current-
+    year figure too, and the same GOOG capex investigation found
+    depreciation similarly diluted (TTM $25.2B vs. 5-year average $16.2B).
     """
-    depreciation_years = cash_flw["depreciation"][:5]
-    return sum(depreciation_years) / len(depreciation_years)
+    return cash_flw["depreciation"][0]
 
 
 def calc_chng_wc(bal_sht):
