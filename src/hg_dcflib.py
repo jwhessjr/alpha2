@@ -655,6 +655,7 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
     depreciation = []
     capex = []
     dividends_paid = []
+    buybacks = []
 
     # Step through the list in blocks of four quarters.
     for i in range(0, max_quarters, 4):
@@ -667,15 +668,28 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
             safe_float(q["depreciationDepletionAndAmortization"]) for q in block
         )
         yearly_divs = sum(safe_float(q["dividendPayout"]) for q in block)
+        # Net buybacks (repurchases minus offsetting employee-plan issuance) --
+        # added 2026-09-13, mirrors get_cash_flow_intrinio()'s equivalent
+        # field, same reasoning (see that function's docstring). AV fallback
+        # path, not live-verified against a real ticker this session --
+        # spot-check before trusting for a buyback-heavy financial firm that
+        # falls back to AV.
+        yearly_buybacks = sum(
+            safe_float(q.get("paymentsForRepurchaseOfCommonStock", 0))
+            - safe_float(q.get("proceedsFromIssuanceOfCommonStock", 0))
+            for q in block
+        )
 
         capex.append(yearly_capex)
         depreciation.append(yearly_depr)
         dividends_paid.append(yearly_divs)
+        buybacks.append(yearly_buybacks)
 
     return {
         "capex": capex,
         "depreciation": depreciation,
         "dividends_paid": dividends_paid,
+        "buybacks": buybacks,
     }
 
 
@@ -1308,6 +1322,21 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
                           as AV only reporting what the filer discloses.)
       dividends_paid   -> paymentofdividends. Sign doesn't matter — every
                           call site in av_fcff_2.py wraps this in abs().
+      buybacks         -> repurchaseofcommonequity + issuanceofcommonequity
+                          (net of any offsetting employee-plan issuance),
+                          same raw-signed convention as dividends_paid.
+                          Added 2026-09-13: found while checking whether our
+                          bank/FCFE model matches Damodaran's own framework
+                          for financial firms -- _bank_payout_ratio()'s
+                          preferred method previously used dividends alone
+                          as the total-cash-returned-to-shareholders proxy,
+                          missing buybacks entirely (no field existed to
+                          read them from). Confirmed live on RJF: TTM
+                          buybacks $1,672M vs. dividends $428M -- true total
+                          payout ~91% vs. the dividends-only 18.6% the old
+                          code computed, understating FCFE by roughly 5x in
+                          the explicit period. See docs/known_errors.md
+                          2026-09-13.
     """
     period_ids = _intrinio_period_ids(company, "cash_flow_statement", apiKey)
     quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
@@ -1319,6 +1348,7 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
     depreciation = []
     capex = []
     dividends_paid = []
+    buybacks = []
 
     for i in range(0, max_quarters, 4):
         block = quarters[i : i + 4]
@@ -1330,15 +1360,21 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
             for q in block
         )
         yearly_divs = sum(safe_float(q.get("paymentofdividends")) for q in block)
+        yearly_buybacks = sum(
+            safe_float(q.get("repurchaseofcommonequity")) + safe_float(q.get("issuanceofcommonequity"))
+            for q in block
+        )
 
         capex.append(yearly_capex)
         depreciation.append(yearly_depr)
         dividends_paid.append(yearly_divs)
+        buybacks.append(yearly_buybacks)
 
     return {
         "capex": capex,
         "depreciation": depreciation,
         "dividends_paid": dividends_paid,
+        "buybacks": buybacks,
     }
 
 

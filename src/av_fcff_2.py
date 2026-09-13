@@ -1742,9 +1742,23 @@ def _bank_payout_ratio(
     Determine payout ratio for a bank using the most reliable source available.
 
     Priority:
-      1. Dividends paid from cash flow (most direct; sum of quarterly outflows)
+      1. Dividends + buybacks from cash flow (most direct; sum of quarterly outflows)
       2. Equity-change method (net income minus equity retained on balance sheet)
       3. Fallback: 40% payout (typical for well-run regional bank)
+
+    Method 1 fixed 2026-09-13 to include buybacks, not just dividends --
+    found while checking whether the bank/FCFE model matches Damodaran's own
+    framework for financial firms, which treats total cash returned to
+    shareholders (dividends + repurchases) as the FCFE proxy, not dividends
+    alone. Dividends-only silently passed this method's own [0.05, 0.95]
+    sanity check even for companies returning most of their capital via
+    buybacks instead, so Method 2 (which would have implicitly captured
+    buybacks via the balance-sheet equity change) never got a chance to run.
+    Confirmed live on RJF: dividends-only payout 18.6% vs. true total payout
+    ~91% (TTM buybacks $1,672M vs. dividends $428M against $2,306M net
+    income) -- understated FCFE by roughly 5x in the explicit period,
+    IV $44.47 vs. a corrected $111.52 (Morningstar: $187). See
+    docs/known_errors.md 2026-09-13.
 
     AOCI swings (unrealized bond gains/losses) inflate the equity-change figure,
     so if that method would imply retention > 80% we prefer the dividend method.
@@ -1771,14 +1785,20 @@ def _bank_payout_ratio(
     """
     payout = None
 
-    # --- Method 1: actual dividends paid (most recent year only) ---
+    # --- Method 1: actual dividends + buybacks paid (most recent year only) ---
     div_history = cash_flw.get("dividends_paid", [])
     divs = abs(div_history[0]) if div_history and div_history[0] else 0.0
-    if net_income > 0 and divs > 0:
-        payout_from_divs = divs / net_income
-        if 0.05 <= payout_from_divs <= 0.95:
-            payout = payout_from_divs
-            logger.info(f"Payout ratio from dividends paid: {payout:.4f}")
+    buyback_history = cash_flw.get("buybacks", [])
+    buybacks = abs(buyback_history[0]) if buyback_history and buyback_history[0] else 0.0
+    total_returned = divs + buybacks
+    if net_income > 0 and total_returned > 0:
+        payout_from_total = total_returned / net_income
+        if 0.05 <= payout_from_total <= 0.95:
+            payout = payout_from_total
+            logger.info(
+                f"Payout ratio from dividends+buybacks: {payout:.4f} "
+                f"(dividends {divs:,.0f}, buybacks {buybacks:,.0f})"
+            )
 
     # --- Method 2: equity-change (only use if dividends unavailable/unreliable) ---
     if payout is None and net_income > 0:
