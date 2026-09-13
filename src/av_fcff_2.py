@@ -1434,11 +1434,69 @@ def calc_expected_fcff(
     return fcff_n, ebit_n, ebiat_n, reinv_n, growth_n
 
 
-def calc_fcff_value(fcff_table, discount_rate, growth_period):
-    fcff_value = 0
-    for year in range(growth_period):
-        fcff_pv = fcff_table[year] / ((1 + discount_rate) ** (year + 1))
-        fcff_value += fcff_pv
+def calc_fading_discount_rates(discount_rate, stable_cost_of_capital, growth_period, transition_period):
+    """
+    Per-year discount rate: flat `discount_rate` for growth_period years,
+    then fades LINEARLY toward stable_cost_of_capital over transition_period
+    years, reaching it exactly at the last year -- same shape as
+    calc_expected_fcff()'s growth/reinvestment 3-stage fade.
+
+    Added 2026-09-13: read Ginzu's own 'Valuation Model'!D47 formula
+    directly (`=IF(year<B58/2, D31, D58+((D31-D58)/(B58/2))*(B58-year))`)
+    and confirmed it fades the discount rate the same way, over the same
+    transition window, that finding #6 (2026-09-11) already fades growth/
+    reinvestment -- our engine deliberately left the discount rate flat at
+    the time, a documented scope decision, not an oversight, but a real,
+    identified divergence from Ginzu flagged as the leading suspect for
+    MSFT's unexplained residual gap in the 2026-09-11 Ginzu comparison. See
+    docs/known_errors.md 2026-09-13.
+
+    transition_period=0 returns a flat list (identical to every call site's
+    prior behavior) -- this is a strict extension, not a behavior change,
+    for any caller not using the 3-stage fade.
+    """
+    rates = []
+    total_years = growth_period + transition_period
+    for year in range(total_years):
+        if year < growth_period:
+            rates.append(discount_rate)
+        else:
+            fade_year = year - growth_period + 1  # 1..transition_period
+            fraction = fade_year / transition_period
+            rates.append(discount_rate + (stable_cost_of_capital - discount_rate) * fraction)
+    return rates
+
+
+def _cumulative_discount_factors(discount_rates):
+    """
+    Cumulative product of (1+rate) through each year -- the correct
+    multi-year discount factor when the rate varies by year, matching
+    Ginzu's own 'Cumulated Cost of Capital' row (D48:R48). Takes a per-year
+    list (see calc_fading_discount_rates()); callers handle the flat-rate
+    case themselves (a simple (1+rate)**year, no list needed).
+    """
+    factors = []
+    running = 1.0
+    for rate in discount_rates:
+        running *= 1 + rate
+        factors.append(running)
+    return factors
+
+
+def calc_fcff_value(fcff_table, discount_rates, growth_period=None):
+    """
+    discount_rates: a single flat rate (float) applied to every year --
+    preserves every existing caller's exact prior behavior -- or a per-year
+    list (see calc_fading_discount_rates()), one entry per fcff_table year.
+    growth_period is accepted for backward compatibility but ignored --
+    len(fcff_table) is always the authoritative year count.
+    """
+    n = len(fcff_table)
+    if isinstance(discount_rates, (int, float)):
+        fcff_value = sum(fcff_table[year] / ((1 + discount_rates) ** (year + 1)) for year in range(n))
+    else:
+        factors = _cumulative_discount_factors(discount_rates)
+        fcff_value = sum(fcff_table[year] / factors[year] for year in range(n))
     logger.info(f"FCFF Value = {fcff_value:,.2f}")
     return fcff_value
 
@@ -1482,6 +1540,12 @@ def calc_terminal_value(
     """
     Terminal value at the end of the explicit high-growth period, discounted
     back to present.
+
+    growth_cost_of_capital: a single flat rate (float, discounted as
+    (1+rate)**growth_period -- every caller's behavior before 2026-09-13) or
+    a per-year list (see calc_fading_discount_rates()), discounted by the
+    cumulative product of (1+rate) through the last year -- matching
+    Ginzu's own terminal-value formula, `=D59/MAX(D48:R48)`.
 
     Terminal-year FCFF is recomputed at the stable-phase reinvestment rate
     (see calc_stable_reinvestment_rate()) rather than carrying forward the
@@ -1530,7 +1594,11 @@ def calc_terminal_value(
             f"is undefined (requires cost of capital > growth)."
         )
     terminal_value = fcff_terminal / (stable_cost_of_capital - stable_growth)
-    terminal_value_pv = terminal_value / ((1 + growth_cost_of_capital) ** growth_period)
+    if isinstance(growth_cost_of_capital, (int, float)):
+        cumulative_factor = (1 + growth_cost_of_capital) ** growth_period
+    else:
+        cumulative_factor = _cumulative_discount_factors(growth_cost_of_capital)[-1]
+    terminal_value_pv = terminal_value / cumulative_factor
     logger.info(f"Stable reinvestment rate = {stable_reinv_rate:,.4f}")
     logger.info(f"Terminal Value = {terminal_value_pv:,.2f}")
     return terminal_value_pv
@@ -2120,13 +2188,19 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
             transition_period=TRANSITION_PERIOD, stable_growth=STABLE_GROWTH,
             stable_reinvestment_rate=stable_reinv_rate_target,
         )
-        fcff_pv = calc_fcff_value(fcff_table, discount_rate, total_explicit_years)
+        # Discount-rate fade (2026-09-13, see calc_fading_discount_rates()
+        # docstring) -- same transition window as the growth/reinvestment
+        # fade above, replacing the prior flat discount_rate throughout.
+        discount_rates = calc_fading_discount_rates(
+            discount_rate, terminal_cost_of_capital, growth_period, TRANSITION_PERIOD
+        )
+        fcff_pv = calc_fcff_value(fcff_table, discount_rates)
 
         ebit_last = ebit_n[-1]
         terminal_value_pv = calc_terminal_value(
             ebit_last,
             terminal_cost_of_capital,
-            discount_rate,
+            discount_rates,
             STABLE_GROWTH,
             total_explicit_years,
             moat_weight=moat_weight,
@@ -2825,9 +2899,14 @@ def _value_stock_detail_fcff(
         # the two aren't interchangeable.
         reinv_n = [ebiat_n[y] * reinv_rate_n[y] for y in range(total_explicit_years)]
 
-        fcff_pv = sum(
-            fcff_n[y] / (1 + discount_rate) ** (y + 1) for y in range(total_explicit_years)
+        # Discount-rate fade (2026-09-13, see calc_fading_discount_rates()
+        # docstring) -- same transition window as the growth/reinvestment
+        # fade above, replacing the prior flat discount_rate throughout.
+        discount_rates = calc_fading_discount_rates(
+            discount_rate, stable_cost_of_capital, growth_period, TRANSITION_PERIOD
         )
+        discount_factors = _cumulative_discount_factors(discount_rates)
+        fcff_pv = sum(fcff_n[y] / discount_factors[y] for y in range(total_explicit_years))
 
         # Terminal-year FCFF is recomputed at the stable-phase reinvestment
         # rate rather than carrying forward the explicit period's (typically
@@ -2862,7 +2941,7 @@ def _value_stock_detail_fcff(
             stable_cost_of_capital - stable_growth
         )
         terminal_value_pv = calc_terminal_value(
-            ebit_n[-1], stable_cost_of_capital, discount_rate,
+            ebit_n[-1], stable_cost_of_capital, discount_rates,
             stable_growth, total_explicit_years, moat_weight=moat_weight,
             explicit_roic=return_on_capital,
         )
@@ -2931,11 +3010,15 @@ def _value_stock_detail_fcff(
                         transition_period=TRANSITION_PERIOD, stable_growth=stable_growth,
                         stable_reinvestment_rate=norm_stable_reinv_rate,
                     )
-                    norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rate, total_explicit_years)
+                    # Reuses the same discount_rates fade computed above --
+                    # it depends only on discount_rate/stable_cost_of_capital/
+                    # growth_period/TRANSITION_PERIOD, none of which differ
+                    # between the GAAP and normalized paths.
+                    norm_fcff_pv = calc_fcff_value(norm_fcff_table, discount_rates)
                     norm_ebit_last = norm_ebit_n[-1]
                     norm_tv_pv = calc_terminal_value(
                         norm_ebit_last, stable_cost_of_capital,
-                        discount_rate, stable_growth, total_explicit_years,
+                        discount_rates, stable_growth, total_explicit_years,
                         moat_weight=moat_weight, explicit_roic=norm_return_on_capital,
                     )
                     norm_ev = norm_fcff_pv + norm_tv_pv + cash - bv_debt
