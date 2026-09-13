@@ -752,33 +752,47 @@ def calc_depreciation(cash_flw):
     return cash_flw["depreciation"][0]
 
 
-def calc_chng_wc(bal_sht):
+def calc_chng_wc(bal_sht, inc_stmnt=None):
     """
-    Average year-over-year change in non-cash working capital, over up to
-    the same 5-year window calc_capital_expenditures() uses -- changed from
-    a single current-year delta 2026-09-10 (external review, finding #4:
-    see docs/known_errors.md). A single year's working-capital swing can be
-    driven by one-off timing (a large receivable collected late, inventory
-    build ahead of a launch) that reverses the next year; averaging several
-    years' deltas is the same smoothing rationale already applied to capex,
-    now applied consistently to the other reinvestment components combined
-    with it in calc_reinvestment().
+    Current-year (TTM) change in non-cash working capital only.
 
-    Degrades gracefully: with only 2 years of balance-sheet history (the
-    prior minimum), this produces exactly 1 delta -- identical to the old
-    single-year behavior -- rather than requiring 5 years to run at all.
+    Reverted 2026-09-13 to current-year-only -- was a 5-year average of
+    deltas, added 2026-09-10 (external review, finding #4). Same reasoning
+    and precedent as calc_capital_expenditures()/calc_depreciation()'s
+    2026-09-13 revert: read Ginzu's own Valuation Model formula directly
+    ('Valuation Model'!D10) and confirmed it never averages working-capital
+    change either -- always a single current-year figure, same as every
+    other reinvestment component.
+
+    Negative-value override, matching Ginzu's D10 formula exactly:
+    `=IF(B20<0, (B18-C18)*(B19/B18), B20)`. If the raw current-year delta is
+    negative (working capital released, which would otherwise add to cash
+    flow), Ginzu doesn't trust the isolated swing at face value -- it
+    re-derives the change as (dollar revenue growth) x (current non-cash-
+    WC-to-revenue ratio), i.e. assumes working capital scales
+    proportionally with revenue growth rather than accepting a one-off
+    release. Requires inc_stmnt (totalRevenue[0]/[1]) to apply -- degrades
+    to the raw (negative) delta, unadjusted, if inc_stmnt is omitted or
+    lacks a prior-year revenue figure, rather than guessing.
     """
     n = len(bal_sht["total_current_assets"])
     if n < 2:
         raise ValueError("Insufficient balance sheet history (need 2 years) to compute working capital change")
-    n = min(n, 5)
-    nc_wc = [
-        (bal_sht["total_current_assets"][i] - bal_sht["cash_and_equivalents"][i])
-        - (bal_sht["total_current_liabilities"][i] - bal_sht["short_term_debt"][i])
-        for i in range(n)
-    ]
-    deltas = [nc_wc[i] - nc_wc[i + 1] for i in range(len(nc_wc) - 1)]
-    return sum(deltas) / len(deltas)
+
+    def _nc_wc(i):
+        return (bal_sht["total_current_assets"][i] - bal_sht["cash_and_equivalents"][i]) - (
+            bal_sht["total_current_liabilities"][i] - bal_sht["short_term_debt"][i]
+        )
+
+    curr_nc_wc = _nc_wc(0)
+    chng_nc_wc = curr_nc_wc - _nc_wc(1)
+
+    if chng_nc_wc < 0 and inc_stmnt is not None:
+        revenue = inc_stmnt.get("totalRevenue", [])
+        if len(revenue) >= 2 and revenue[0] != 0:
+            chng_nc_wc = (revenue[0] - revenue[1]) * (curr_nc_wc / revenue[0])
+
+    return chng_nc_wc
 
 
 def capitalizerAndD(ticker, rd_years, api_key):
@@ -877,7 +891,7 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
     logger.info(f"ebiat {ebiat:,.2f}")
     capex = calc_capital_expenditures(cash_flw)
     logger.info(f"Capex {capex:,.2f}")
-    chng_nc_wc = calc_chng_wc(bal_sht)
+    chng_nc_wc = calc_chng_wc(bal_sht, inc_stmnt)
     logger.info(f"Change WC {chng_nc_wc:,.2f}")
     depreciation = calc_depreciation(cash_flw)
     logger.info(f"Depreciation {depreciation:,.2f}")
