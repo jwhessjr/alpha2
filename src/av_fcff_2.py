@@ -1269,10 +1269,12 @@ def extreme_reinvestment_rate_note(reinvestment_rate: float) -> str:
     different growth story. Same "flag, don't filter" pattern as
     terminal_value_dominance_note()/low_growth_rate_note(): the raw ratio
     now flows through unmodified into growth_rate and the FCFF projections
-    (which still have their own separate safety nets -- the 30% growth-rate
-    cap, the adjusted_ebiat==0 raise above this call -- neither touched by
-    this change), and this note just surfaces the unusual case for review
-    rather than silently distorting the number to look "normal."
+    (which still have their own separate safety net -- the adjusted_ebiat==0
+    raise above this call, untouched by this change), and this note just
+    surfaces the unusual case for review rather than silently distorting
+    the number to look "normal." The 30% growth-rate cap referenced here
+    originally was itself converted from a hard clamp to a flag on
+    2026-09-13 -- see high_growth_rate_note() below, same reasoning.
 
     Deliberately NOT applied to calc_stable_reinvestment_rate() (the
     terminal/stable-phase rate) -- that's a separate formula
@@ -1291,6 +1293,46 @@ def extreme_reinvestment_rate_note(reinvestment_rate: float) -> str:
         "growth funded beyond NOPAT (negative FCFF) or a mature business "
         "releasing capital (negative reinvestment); verify this is a "
         "genuine read before trusting the resulting growth rate and FCFF."
+    )
+
+
+def high_growth_rate_note(growth_rate: float, cap: float = 0.30) -> str:
+    """
+    Flag (never cap) when the explicit-period growth rate exceeds `cap`.
+
+    Changed 2026-09-13 from a hard `min(growth_rate, 0.30)` clamp to a flag
+    -- Ginzu's own growth-rate formula (`Valuation Model!D15`) has no cap at
+    all, confirmed by reading it directly. Same "flag, don't filter/
+    silently correct" pattern as terminal_value_dominance_note() and
+    low_growth_rate_note() (this is the ceiling to that function's floor --
+    low_growth_rate_note()'s own docstring already anticipated this
+    symmetry before this note existed).
+
+    The unattended, ~2,300-ticker automated-screening context this system
+    runs in is a real difference from Ginzu's interactive, one-company-at-
+    a-time use case, where a human filling out the spreadsheet would
+    immediately notice and reject an absurd growth rate. Silently capping
+    masked that signal entirely (an implied 80% growth rate and a 31% one
+    looked identical downstream); silently removing the cap with no flag
+    would let a data-anomaly-driven number flow straight into a screen or
+    replacement-candidate report with nobody watching. This flag is the
+    middle path: pass the real number through, but make it visible.
+
+    Only wired into the batch path (_value_stock_fcff()) -- the detail path
+    (_value_stock_detail_fcff(), used for the single-ticker Excel report a
+    human already reviews directly) has no `notes` field to flag through;
+    removing its cap without a flag is correct there, the report itself is
+    the review step. See docs/known_errors.md 2026-09-13.
+    """
+    if growth_rate is None or growth_rate <= cap:
+        return ""
+    return (
+        f"Growth rate ({growth_rate:.1%}) exceeds {cap:.0%} -- Damodaran's "
+        "own Ginzu model has no cap here, so this is passed through "
+        "uncapped, but a rate this high usually reflects either a genuinely "
+        "extraordinary competitive advantage or a data anomaly (a single "
+        "distorted quarter feeding the reinvestment-rate/ROC inputs); "
+        "verify before trusting it."
     )
 
 
@@ -2162,7 +2204,9 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 notes=roc_notes,
                 analyst_count=analyst_count,
             )
-        growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
+        # Uncapped 2026-09-13 -- Ginzu has no cap here either; see
+        # high_growth_rate_note(), wired into `notes` below instead.
+        growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
 
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         discount_rate = calc_discount_rate(
@@ -2249,6 +2293,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 terminal_value_dominance_note(terminal_value_pv, market_cap),
                 low_growth_rate_note(growth_rate, RISK_FREE),
                 extreme_reinvestment_rate_note(reinvestment_rate),
+                high_growth_rate_note(growth_rate),
             ) if n
         )
 
@@ -2842,7 +2887,10 @@ def _value_stock_detail_fcff(
             raise ValueError(roc_notes)
         if roc_notes:
             logger.warning(f"{ticker}: {roc_notes}")
-        growth_rate = min(calc_growth_rate(reinvestment_rate, return_on_capital), 0.30)
+        # Uncapped 2026-09-13 -- Ginzu has no cap here either; this path has
+        # no `notes` field (it's the single-ticker Excel report, already
+        # human-reviewed directly), see high_growth_rate_note()'s docstring.
+        growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
 
         # Compute discount rate components inline to capture intermediates
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
@@ -2994,9 +3042,9 @@ def _value_stock_detail_fcff(
                 else:
                     if norm_roc_notes:
                         logger.warning(f"{ticker}: normalized valuation -- {norm_roc_notes}")
-                    norm_growth_rate = min(
-                        calc_growth_rate(norm_reinv_rate, norm_return_on_capital), 0.30
-                    )
+                    # Uncapped 2026-09-13, same reasoning as the GAAP
+                    # growth_rate above.
+                    norm_growth_rate = calc_growth_rate(norm_reinv_rate, norm_return_on_capital)
                     # 3-stage fade applied here too (2026-09-11, finding #6),
                     # matching the main GAAP path -- own fade target since
                     # norm_return_on_capital can differ from the GAAP
