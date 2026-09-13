@@ -1362,6 +1362,42 @@ def _reit_growth_rate(roe: float, retention_ratio: float, subtype_floor: float):
     return max(retained_growth, subtype_floor), retained_growth
 
 
+def calc_reit_effective_retention_ratio(retention_ratio, affo, net_equity_issued, net_new_debt):
+    """
+    Extends the AFFO-retention ratio to include capital raised externally
+    (net new equity + net new debt), matching Damodaran's own REIT-specific
+    growth framework rather than the plain retention x ROE formula this
+    system originally used unmodified for REITs.
+
+    Added 2026-09-13, found comparing our REIT/AFFO model against
+    Damodaran's own methodology: because REITs must distribute 90%+ of
+    taxable income, real REIT growth overwhelmingly comes from acquisitions
+    funded by newly issued equity/debt, not retained earnings -- a plain
+    retention-ratio formula misses that channel entirely. Confirmed live on
+    O (Realty Income, a REIT famous for exactly this growth-via-capital-
+    markets model): the old formula alone produced a growth rate stuck at
+    its 1.5% net-lease-escalator floor, well below O's long, well-
+    documented mid-single-digit AFFO/share growth track record.
+
+    net_equity_issued/net_new_debt: positive = net capital raised (adds to
+    reinvestment), negative = net capital returned/repaid (reduces it) --
+    same signed convention as get_cash_flow_intrinio()'s buybacks/
+    net_new_debt fields (buybacks is reused directly here: for a REIT, a
+    positive value means net equity issuance, not net repurchase).
+    net_new_debt already nets issuance against repayment, so routine debt
+    refinancing (REITs continuously roll maturing debt) doesn't get
+    mistaken for real balance-sheet growth.
+
+    Existing guardrails (the 15% cap and subtype-floor max() in
+    _reit_growth_rate(), called with this function's output) are
+    unchanged and still apply -- a REIT doing an unusually large one-year
+    capital raise doesn't produce an unbounded growth rate.
+    """
+    if affo <= 0:
+        return retention_ratio
+    return retention_ratio + (net_equity_issued + net_new_debt) / affo
+
+
 def calc_levered_beta(unlevered_beta, bv_debt, market_cap_equity, tax_rate, de_cap=None):
     """
     de_cap (optional): caps the D/E ratio used for re-levering at this value if
@@ -2389,13 +2425,22 @@ def value_reit_stock(ticker: str, growth_period: int):
         retention_ratio = 1.0 - payout_ratio
 
         roe             = net_income / bv_equity if bv_equity > 0 else 0.0
+        # Growth from external capital raised (net new equity + net new
+        # debt), on top of AFFO retention -- see
+        # calc_reit_effective_retention_ratio()'s docstring, 2026-09-13.
+        net_equity_issued = cash_flw["buybacks"][0] if cash_flw.get("buybacks") else 0.0
+        net_new_debt_val  = cash_flw["net_new_debt"][0] if cash_flw.get("net_new_debt") else 0.0
+        effective_retention_ratio = calc_reit_effective_retention_ratio(
+            retention_ratio, affo, net_equity_issued, net_new_debt_val
+        )
         # Use the higher of the retention-based rate and the sub-type floor.
         # The floor captures contractual lease escalators and structural growth
         # that exists independent of retained earnings (e.g. CPI escalators on
         # tower leases, 5G colocation, biological timber growth).
-        growth_rate, retained_growth = _reit_growth_rate(roe, retention_ratio, subtype_floor)
+        growth_rate, retained_growth = _reit_growth_rate(roe, effective_retention_ratio, subtype_floor)
         logger.info(
             f"AFFO={affo:,.0f}  payout={payout_ratio:.3f}  ROE={roe:.4f}  "
+            f"effective_retention={effective_retention_ratio:.4f}  "
             f"retained_g={retained_growth:.4f}  subtype_floor={subtype_floor:.4f}  "
             f"g={growth_rate:.4f}"
         )
@@ -2734,7 +2779,14 @@ def _value_reit_stock_detail(
         if subtype_floor is None:
             logger.warning(f"Skipping {ticker}: Mortgage REIT — AFFO DDM not applicable")
             return None
-        growth_rate, retained_growth = _reit_growth_rate(roe, retention_ratio, subtype_floor)
+        # Growth from external capital raised, on top of AFFO retention --
+        # see calc_reit_effective_retention_ratio()'s docstring, 2026-09-13.
+        net_equity_issued = cash_flw["buybacks"][0] if cash_flw.get("buybacks") else 0.0
+        net_new_debt_val  = cash_flw["net_new_debt"][0] if cash_flw.get("net_new_debt") else 0.0
+        effective_retention_ratio = calc_reit_effective_retention_ratio(
+            retention_ratio, affo, net_equity_issued, net_new_debt_val
+        )
+        growth_rate, retained_growth = _reit_growth_rate(roe, effective_retention_ratio, subtype_floor)
         bv_debt         = calc_bv_debt(bal_sht)
         levered_beta    = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         cost_of_equity  = RISK_FREE + (levered_beta * EQ_PREM)

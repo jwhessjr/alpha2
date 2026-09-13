@@ -656,6 +656,7 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
     capex = []
     dividends_paid = []
     buybacks = []
+    net_new_debt = []
 
     # Step through the list in blocks of four quarters.
     for i in range(0, max_quarters, 4):
@@ -668,15 +669,25 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
             safe_float(q["depreciationDepletionAndAmortization"]) for q in block
         )
         yearly_divs = sum(safe_float(q["dividendPayout"]) for q in block)
-        # Net buybacks (repurchases minus offsetting employee-plan issuance) --
-        # added 2026-09-13, mirrors get_cash_flow_intrinio()'s equivalent
-        # field, same reasoning (see that function's docstring). AV fallback
-        # path, not live-verified against a real ticker this session --
-        # spot-check before trusting for a buyback-heavy financial firm that
-        # falls back to AV.
+        # Net buybacks (issuance minus repurchases) -- added 2026-09-13,
+        # mirrors get_cash_flow_intrinio()'s equivalent field. Sign fixed
+        # 2026-09-13 (same day, caught before ever shipping): AV reports
+        # both tags as positive magnitudes, unlike Intrinio's already-
+        # signed repurchaseofcommonequity/issuanceofcommonequity -- must be
+        # issuance MINUS repurchase to match Intrinio's convention
+        # (positive = net issuance, negative = net repurchase), not
+        # repurchase minus issuance which would invert the sign for every
+        # AV-fallback ticker. AV fallback path, not live-verified against a
+        # real ticker this session -- spot-check before trusting for a
+        # buyback-heavy financial firm or REIT that falls back to AV.
         yearly_buybacks = sum(
-            safe_float(q.get("paymentsForRepurchaseOfCommonStock", 0))
-            - safe_float(q.get("proceedsFromIssuanceOfCommonStock", 0))
+            safe_float(q.get("proceedsFromIssuanceOfCommonStock", 0))
+            - safe_float(q.get("paymentsForRepurchaseOfCommonStock", 0))
+            for q in block
+        )
+        yearly_net_new_debt = sum(
+            safe_float(q.get("proceedsFromIssuanceOfLongTermDebt", 0))
+            - safe_float(q.get("repaymentsOfLongTermDebt", 0))
             for q in block
         )
 
@@ -684,12 +695,14 @@ def get_cash_flow(company: str, apiKey: str) -> dict:
         depreciation.append(yearly_depr)
         dividends_paid.append(yearly_divs)
         buybacks.append(yearly_buybacks)
+        net_new_debt.append(yearly_net_new_debt)
 
     return {
         "capex": capex,
         "depreciation": depreciation,
         "dividends_paid": dividends_paid,
         "buybacks": buybacks,
+        "net_new_debt": net_new_debt,
     }
 
 
@@ -1337,6 +1350,16 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
                           code computed, understating FCFE by roughly 5x in
                           the explicit period. See docs/known_errors.md
                           2026-09-13.
+      net_new_debt     -> issuanceofdebt + repaymentofdebt (repayment
+                          already negative -- net of routine refinancing,
+                          not gross issuance, since REITs continuously roll
+                          maturing debt without that representing real
+                          balance-sheet growth). Added 2026-09-13 alongside
+                          `buybacks` (reused here as "net new equity issued"
+                          for REITs -- a positive value means net issuance,
+                          not net repurchase) for value_reit_stock()'s
+                          capital-raising growth term -- see that function's
+                          docstring and docs/known_errors.md 2026-09-13.
     """
     period_ids = _intrinio_period_ids(company, "cash_flow_statement", apiKey)
     quarters = [_intrinio_standardized(pid, apiKey) for pid in period_ids]
@@ -1349,6 +1372,7 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
     capex = []
     dividends_paid = []
     buybacks = []
+    net_new_debt = []
 
     for i in range(0, max_quarters, 4):
         block = quarters[i : i + 4]
@@ -1364,17 +1388,22 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
             safe_float(q.get("repurchaseofcommonequity")) + safe_float(q.get("issuanceofcommonequity"))
             for q in block
         )
+        yearly_net_new_debt = sum(
+            safe_float(q.get("issuanceofdebt")) + safe_float(q.get("repaymentofdebt")) for q in block
+        )
 
         capex.append(yearly_capex)
         depreciation.append(yearly_depr)
         dividends_paid.append(yearly_divs)
         buybacks.append(yearly_buybacks)
+        net_new_debt.append(yearly_net_new_debt)
 
     return {
         "capex": capex,
         "depreciation": depreciation,
         "dividends_paid": dividends_paid,
         "buybacks": buybacks,
+        "net_new_debt": net_new_debt,
     }
 
 
