@@ -1418,6 +1418,63 @@ def calc_levered_beta(unlevered_beta, bv_debt, market_cap_equity, tax_rate, de_c
     return levered_beta
 
 
+def calc_interest_coverage(raw_ebit, interest_expense, bv_debt, risk_free):
+    """
+    Interest coverage ratio for the synthetic-rating cost-of-debt lookup
+    (hg_dcflib.get_default_spread()).
+
+    Added 2026-09-14. Replaces the old `try: ebit/interest_expense except
+    ZeroDivisionError: int_cover = 25` pattern, which had two real problems:
+
+    1. interest_expense == 0 doesn't always mean "no debt burden" -- it's
+       also what a company with genuinely no disclosed gross interest
+       expense line produces (confirmed live for AAPL; already documented
+       for APA/PYPL in _intrinio_quarter_interest_expense()'s docstring --
+       "a genuine filer-presentation gap... folded into Other income
+       (expense), net"). A flat `int_cover = 25` fallback assumes top-tier
+       (Aaa/AAA) credit regardless of the company's actual debt load.
+       Damodaran's own prescribed remedy (his stated practice for companies
+       that don't cleanly disclose interest expense): don't treat this as
+       infinite/assumed coverage, IMPUTE a gross interest expense as
+       `bv_debt x an assumed cost of debt`, bootstrapped from the same
+       top-tier spread the old fallback assumed, then compute real coverage
+       from that. Live-verified 2026-09-14: no-op for AAPL and APA (both
+       independently strong enough to land in the same top bucket either
+       way), but a real, correctly-directional effect for PYPL (imputed
+       coverage 8.7x lands in the A1/A+ bucket instead of Aaa/AAA, IV
+       -1.13%) -- confirms the fix only moves cases that actually need
+       moving.
+
+    2. A NEGATIVE interest_expense (the sign-flipped net-interest-income
+       fallback in _intrinio_quarter_interest_expense(), used when a filer
+       only reports one combined net interest line, e.g. AZO) previously
+       divided straight through with no guard -- a negative numerator/
+       denominator combination can produce a coverage ratio that looks
+       superficially plausible while being computed from two wrong-signed
+       inputs (confirmed live: INTC, currently negative EBIT / negative
+       interest_expense = a coincidentally positive-looking 5.9x that means
+       nothing), or for a positive-EBIT company, a genuinely negative
+       coverage ratio that would fall into defaultSpread's worst bucket
+       (GT=-100000, 19% spread) regardless of the company's real credit
+       quality. Any non-positive interest_expense now routes to the same
+       imputed-interest-expense path as the zero case.
+
+    If bv_debt is also non-positive (genuinely no debt, not just unreported
+    interest), this correctly degrades to the same `25` sentinel the old
+    fallback always used -- a debt-free company legitimately deserves the
+    top-tier bucket, no imputation needed or possible.
+
+    See docs/known_errors.md 2026-09-14.
+    """
+    if interest_expense and interest_expense > 0:
+        return raw_ebit / interest_expense
+    if bv_debt <= 0:
+        return 25
+    bootstrap_cost_of_debt = risk_free + hg_dcflib.get_default_spread(25)
+    imputed_interest_expense = bv_debt * bootstrap_cost_of_debt
+    return raw_ebit / imputed_interest_expense
+
+
 def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, eq_prem, de_cap=None):
     # Re-lever the industry (unlevered) beta to this company's own capital
     # structure before computing cost of equity — see docs/known_errors.md
@@ -1430,10 +1487,9 @@ def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, e
     cost_of_equity = risk_free + (levered_beta * eq_prem)
     logger.info(f"COE = {cost_of_equity:,.4f}")
 
-    try:
-        int_cover = inc_stmnt["ebit"][0] / inc_stmnt["interest_expense"][0]
-    except ZeroDivisionError:
-        int_cover = 25
+    int_cover = calc_interest_coverage(
+        inc_stmnt["ebit"][0], inc_stmnt["interest_expense"][0], bv_debt, risk_free
+    )
 
     logger.info(f"Interest Coverage = {int_cover}")
     def_spread = hg_dcflib.get_default_spread(int_cover)
@@ -2947,10 +3003,9 @@ def _value_stock_detail_fcff(
         # Compute discount rate components inline to capture intermediates
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
-        try:
-            int_cover = inc_stmnt["ebit"][0] / inc_stmnt["interest_expense"][0]
-        except ZeroDivisionError:
-            int_cover = 25
+        int_cover = calc_interest_coverage(
+            inc_stmnt["ebit"][0], inc_stmnt["interest_expense"][0], bv_debt, RISK_FREE
+        )
         def_spread = hg_dcflib.get_default_spread(int_cover)
         cost_of_debt_pretax = RISK_FREE + def_spread
         cost_of_debt_aftertax = cost_of_debt_pretax * (1 - MARGINAL_TAX_RATE)
