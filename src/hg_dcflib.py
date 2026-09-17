@@ -353,18 +353,38 @@ def _q_ebit(q: dict) -> float:
     Fall back to 'ebit' when:
       - operatingIncome is absent or zero, OR
       - operatingIncome and ebit have opposite signs (AV data error indicator —
-        e.g., AV NHC Q1 2026: operatingIncome = -$104M, ebit = +$45M, SEC = +$32M)
+        e.g., AV NHC Q1 2026: operatingIncome = -$104M, ebit = +$45M, SEC = +$32M
+        — since corrected on AV's side to operatingIncome = +$32M, matching SEC)
+
+    When falling back to 'ebit', subtract whichever non-operating-income fields
+    AV happens to itemize for this quarter (interestIncome, otherNonOperatingIncome,
+    nonInterestIncome, investmentIncomeNet) before returning it — narrows the
+    inflation instead of accepting it wholesale. This is a partial fix, not a
+    full one: confirmed live on NHC Q1 2026 (2026-09-17) that AV does not
+    itemize 100% of non-operating income for every company — subtracting
+    interestIncome alone closed the gap from $45.08M down to $42.89M, still
+    $10.6M above the true $32.25M operating income, with no remaining AV field
+    to account for the rest. The adjusted value is a better upper bound, not a
+    guarantee of correctness — 'operatingIncome' remains the trusted primary.
     """
     ebit_val = safe_float(q.get("ebit", 0) or 0)
+    non_operating_income = (
+        safe_float(q.get("interestIncome"))
+        + safe_float(q.get("otherNonOperatingIncome"))
+        + safe_float(q.get("nonInterestIncome"))
+        + safe_float(q.get("investmentIncomeNet"))
+    )
+    adjusted_ebit_val = ebit_val - non_operating_income
+
     oi = q.get("operatingIncome")
     if oi not in (None, "None", ""):
         val = safe_float(oi)
         if val is not None and val != 0.0:
-            # If signs differ, one of them is wrong — trust ebit as the lesser evil
+            # If signs differ, one of them is wrong — trust (adjusted) ebit as the lesser evil
             if ebit_val != 0 and (val > 0) != (ebit_val > 0):
-                return ebit_val
+                return adjusted_ebit_val
             return val
-    return ebit_val
+    return adjusted_ebit_val
 
 
 def get_inc_stmnt(company: str, apiKey: str) -> dict:
