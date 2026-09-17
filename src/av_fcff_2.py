@@ -2020,16 +2020,20 @@ def _bank_payout_ratio(
 
 def value_bank_stock(ticker: str, growth_period: int):
     """
-    FCFE-based equity DCF for banks and financial firms.
+    Excess Return model for banks and financial firms (Damodaran, "Valuing
+    Financial Service Firms", April 2009) — replaces the FCFE/dividend-
+    discount model 2026-09-17. See docs/known_errors.md 2026-09-17.
 
     Key differences from FCFF:
-    - Starts with Net Income, not EBIT
-    - Reinvestment = equity retained to support asset growth (g / ROE)
+    - Value = book equity + PV(excess returns), not a discounted cash-flow stream
+    - Excess return = (ROE − Cost of Equity) × book equity
+    - Reinvestment (g / ROE) still grows book equity, not a payout stream
     - Discounts at Cost of Equity, not WACC
     - No debt/cash adjustment — we work at the equity level throughout
     - No R&D capitalisation (not applicable to financials)
+    - Terminal value is zero by construction (no Gordon Growth term)
     """
-    logger.info(f"Valuing {ticker} as financial firm (FCFE)")
+    logger.info(f"Valuing {ticker} as financial firm (Excess Return)")
     try:
         industry = hg_dcflib.get_industry(ticker)
         unlevered_beta = hg_dcflib.get_beta(industry)
@@ -2050,7 +2054,7 @@ def value_bank_stock(ticker: str, growth_period: int):
 
         reported_net_income = inc_stmnt["netIncome"][0]
         if len(bal_sht["total_stockholders_equity"]) < 2:
-            raise ValueError("Insufficient balance sheet history (need 2 years) for bank FCFE model")
+            raise ValueError("Insufficient balance sheet history (need 2 years) for bank Excess Return model")
         bv_equity_curr = bal_sht["total_stockholders_equity"][0]
         bv_equity_prior = bal_sht["total_stockholders_equity"][1]
 
@@ -2084,46 +2088,46 @@ def value_bank_stock(ticker: str, growth_period: int):
         cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
         logger.info(f"Cost of Equity = {cost_of_equity:.4f}")
 
-        # --- Project FCFE ---
-        # Grow net income; FCFE = net income retained as dividends (payout fraction)
-        payout_ratio = 1.0 - retention_ratio
-        ni_n = []
-        fcfe_n = []
+        # --- Excess Return model (Damodaran, "Valuing Financial Service
+        # Firms", April 2009) — replaces the FCFE/dividend-discount model,
+        # 2026-09-17. Book equity is a more meaningful anchor for a financial
+        # firm than a payout-ratio-driven cash flow stream: dividend payout
+        # for a regulated financial firm is set by regulatory capital
+        # requirements, not reinvestment needs — exactly why
+        # _bank_payout_ratio() produced two real bugs this month (multi-year
+        # dividend summing, 2026-09-09; PYPL payout fragility). growth_rate
+        # (still ROE × retention, via _bank_growth_rate()/_bank_payout_ratio()
+        # above) now only grows book equity, not a cash-flow stream. ROE and
+        # cost of equity are held flat through the explicit period — same
+        # treatment the old model already gave growth_rate/cost_of_equity. A
+        # 3-stage Ginzu-style fade is deliberately out of scope here — see
+        # docs/known_errors.md 2026-09-17.
+        #
+        #   value of equity = book value of equity + PV(excess returns)
+        #   excess_return_t = (ROE − cost of equity) × book equity_(t-1)
+        #
+        # Terminal value is zero BY CONSTRUCTION: ROE is assumed to converge
+        # to cost of equity beyond the explicit period (the same "competitive
+        # equilibrium" philosophy the old stable phase used, reached directly
+        # here instead of via a Gordon Growth formula) — no terminal-value
+        # division, no CLMB/OSW/RCKY-class division-by-zero risk
+        # (docs/known_errors.md 2026-08-03) for this model.
+        bv_equity_n = []
+        excess_return_n = []
+        bv_equity_prev = bv_equity_curr
         for year in range(growth_period):
-            ni = net_income * (1 + growth_rate) ** (year + 1)
-            ni_n.append(ni)
-            fcfe_n.append(ni * payout_ratio)
-            logger.info(f"FCFE year {year + 1} = {fcfe_n[-1]:,.2f}")
+            bv_equity_t = bv_equity_prev * (1 + growth_rate)
+            excess_return_t = (roe - cost_of_equity) * bv_equity_prev
+            bv_equity_n.append(bv_equity_t)
+            excess_return_n.append(excess_return_t)
+            logger.info(f"Excess return year {year + 1} = {excess_return_t:,.2f}")
+            bv_equity_prev = bv_equity_t
 
-        fcfe_pv = sum(
-            fcfe_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period)
+        excess_return_pv = sum(
+            excess_return_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period)
         )
 
-        # --- Stable phase ---
-        # In stable phase ROE converges to cost of equity (competitive equilibrium)
-        stable_beta = calc_stable_beta(unlevered_beta)
-        stable_levered_beta = calc_levered_beta(
-            stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE,
-            de_cap=hg_dcflib.get_industry_de(industry),
-        )
-        stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
-        stable_growth = STABLE_GROWTH
-        # stable ROE = stable CoE; shared helper guards non-positive denominators
-        # and clamps to [0,1] — see docs/known_errors.md 2026-08-01.
-        stable_reinv = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
-        stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
-        # Gordon Growth requires cost of equity > growth rate — see
-        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
-        if stable_cost_of_equity <= stable_growth:
-            raise ValueError(
-                f"Stable-phase cost of equity ({stable_cost_of_equity:.4f}) is at or "
-                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
-                f"is undefined (requires cost of equity > growth)."
-            )
-        terminal_value = stable_fcfe / (stable_cost_of_equity - stable_growth)
-        terminal_value_pv = terminal_value / (1 + cost_of_equity) ** growth_period
-
-        equity_value = fcfe_pv + terminal_value_pv
+        equity_value = bv_equity_curr + excess_return_pv
         intrinsic_value = equity_value / shares_outstanding  # both in consistent units
 
         safety_margin = float(intrinsic_value - price)
@@ -2150,19 +2154,19 @@ def value_bank_stock(ticker: str, growth_period: int):
             growth_rate=growth_rate,
             cost_of_capital=cost_of_equity,  # equity rate, not WACC
             wealth_pc=wealth_pc,
-            fcff_value=fcfe_pv,  # PV of FCFE
-            terminal_value=terminal_value_pv,
+            fcff_value=excess_return_pv,  # PV of excess returns
+            terminal_value=0.0,  # zero by construction — see comment above
             share_value=intrinsic_value,
             margin_of_safety=safety_margin,
             margin_of_safety_pc=safety_margin_pc,
             notes=" | ".join(
                 n for n in (
-                    terminal_value_dominance_note(terminal_value_pv, market_cap),
+                    terminal_value_dominance_note(0.0, market_cap),
                     low_growth_rate_note(growth_rate, RISK_FREE),
                 ) if n
             ),
             target_price=target_price,
-            earnings_yield=0.0,  # FCFE model — EBIT/EV not applicable for banks
+            earnings_yield=0.0,  # Excess Return model — EBIT/EV not applicable for banks
             dividend_yield=dividend_yield,
             analyst_count=analyst_count,
         )
@@ -2599,10 +2603,10 @@ def value_reit_stock(ticker: str, growth_period: int):
 
 def _stock_value_from_detail(d: dict) -> Stock_Value:
     """Build a Stock_Value dataclass from a value_stock_detail dict for DB insertion."""
-    if d["model"] == "FCFE":
+    if d["model"] == "ExcessReturn":
         cost_of_capital = d["cost_of_equity"]
         wealth_pc = d["roe"] - d["cost_of_equity"]
-        fcff_value = d["fcfe_pv"]
+        fcff_value = d["excess_return_pv"]
     elif d["model"] == "AFFO":
         cost_of_capital = d["cost_of_equity"]
         wealth_pc = d["roe"] - d["cost_of_equity"]
@@ -2667,7 +2671,8 @@ def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = No
 def _value_bank_stock_detail(
     ticker: str, growth_period: int, industry: str
 ) -> dict | None:
-    """FCFE detail dict for bank/financial firms (used for Excel output)."""
+    """Excess Return detail dict for bank/financial firms (used for Excel output).
+    See value_bank_stock()'s docstring / docs/known_errors.md 2026-09-17."""
     try:
         unlevered_beta = hg_dcflib.get_beta(industry)
 
@@ -2708,40 +2713,24 @@ def _value_bank_stock_detail(
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         cost_of_equity = RISK_FREE + (levered_beta * EQ_PREM)
 
-        ni_n, fcfe_n = [], []
+        # Excess Return model — see value_bank_stock()'s docstring /
+        # docs/known_errors.md 2026-09-17 for the full rationale. Terminal
+        # value is zero by construction (ROE converges to cost of equity
+        # beyond the explicit period) — no Gordon Growth term needed.
+        bv_equity_n, excess_return_n = [], []
+        bv_equity_prev = bv_equity_curr
         for year in range(growth_period):
-            ni = net_income * (1 + growth_rate) ** (year + 1)
-            ni_n.append(ni)
-            fcfe_n.append(ni * payout_ratio)
+            bv_equity_t = bv_equity_prev * (1 + growth_rate)
+            excess_return_t = (roe - cost_of_equity) * bv_equity_prev
+            bv_equity_n.append(bv_equity_t)
+            excess_return_n.append(excess_return_t)
+            bv_equity_prev = bv_equity_t
 
-        fcfe_pv = sum(
-            fcfe_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period)
+        excess_return_pv = sum(
+            excess_return_n[y] / (1 + cost_of_equity) ** (y + 1) for y in range(growth_period)
         )
 
-        stable_beta = calc_stable_beta(unlevered_beta)
-        stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
-        stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
-        stable_growth = STABLE_GROWTH
-        # shared helper guards non-positive denominators and clamps to [0,1] —
-        # see docs/known_errors.md 2026-08-01.
-        stable_reinv = calc_stable_reinvestment_rate(stable_growth, stable_cost_of_equity)
-        stable_fcfe = fcfe_n[-1] * (1 + stable_growth) * (1 - stable_reinv)
-        # Gordon Growth requires cost of equity > growth rate — see
-        # docs/known_errors.md 2026-08-03 (CLMB/OSW/RCKY division-by-zero fix).
-        if stable_cost_of_equity <= stable_growth:
-            raise ValueError(
-                f"Stable-phase cost of equity ({stable_cost_of_equity:.4f}) is at or "
-                f"below the stable growth rate ({stable_growth:.4f}) — terminal value "
-                f"is undefined (requires cost of equity > growth)."
-            )
-        terminal_value_undiscounted = stable_fcfe / (
-            stable_cost_of_equity - stable_growth
-        )
-        terminal_value_pv = (
-            terminal_value_undiscounted / (1 + cost_of_equity) ** growth_period
-        )
-
-        equity_value = fcfe_pv + terminal_value_pv
+        equity_value = bv_equity_curr + excess_return_pv
         intrinsic_value = equity_value / shares_outstanding
         margin_of_safety = float(intrinsic_value - price)
         margin_of_safety_pc = (
@@ -2749,7 +2738,7 @@ def _value_bank_stock_detail(
         )
 
         return {
-            "model": "FCFE",
+            "model": "ExcessReturn",
             "ticker": ticker,
             "ent_name": ent_name,
             "industry": industry,
@@ -2769,22 +2758,15 @@ def _value_bank_stock_detail(
             "growth_period": growth_period,
             "growth_rate": growth_rate,
             "beta": levered_beta,
-            "stable_beta": stable_beta,
             "risk_free": RISK_FREE,
             "eq_prem": EQ_PREM,
             "cost_of_equity": cost_of_equity,
             # --- Year-by-year projections ---
-            "ni_n": ni_n,
-            "fcfe_n": fcfe_n,
-            # --- Stable phase ---
-            "stable_growth": stable_growth,
-            "stable_reinv": stable_reinv,
-            "stable_fcfe": stable_fcfe,
-            "stable_cost_of_equity": stable_cost_of_equity,
-            "terminal_value_undiscounted": terminal_value_undiscounted,
-            "terminal_value_pv": terminal_value_pv,
+            "bv_equity_n": bv_equity_n,
+            "excess_return_n": excess_return_n,
             # --- Valuation ---
-            "fcfe_pv": fcfe_pv,
+            "excess_return_pv": excess_return_pv,
+            "terminal_value_pv": 0.0,  # zero by construction — see comment above
             "equity_value": equity_value,
             "price": price,
             "shares_outstanding": shares_outstanding,
@@ -3274,12 +3256,12 @@ def _generate_xlsx_bank(
     YELLOW_FILL,
     GREEN_FILL,
 ):
-    """Populate the worksheet for a bank / financial firm (FCFE model)."""
+    """Populate the worksheet for a bank / financial firm (Excess Return model)."""
     from openpyxl.styles import Font
 
     r = 1
     ws.cell(
-        row=r, column=1, value=f"{d['ent_name']} ({d['ticker']}) — FCFE Valuation"
+        row=r, column=1, value=f"{d['ent_name']} ({d['ticker']}) — Excess Return Valuation"
     ).font = Font(bold=True, size=13)
     r += 1
     ws.cell(
@@ -3319,12 +3301,12 @@ def _generate_xlsx_bank(
         ("Book Value of Equity (prior yr)", d["bv_equity_prior"], "dollar"),
         ("Change in Book Equity", d["equity_change"], "dollar"),
         ("Return on Equity (ROE)", d["roe"], "pct"),
-        ("Equity Retention Ratio", d["retention_ratio"], "pct"),
-        ("Payout Ratio (FCFE / Net Income)", d["payout_ratio"], "pct"),
+        ("Equity Retention Ratio (drives book-equity growth)", d["retention_ratio"], "pct"),
         ("Risk-free Rate", d["risk_free"], "pct"),
         ("Equity Risk Premium", d["eq_prem"], "pct"),
         ("Beta", d["beta"], "num"),
         ("Cost of Equity", d["cost_of_equity"], "pct"),
+        ("Excess Return Spread (ROE − Cost of Equity)", d["roe"] - d["cost_of_equity"], "pct"),
     ]
     for lbl, v, fmt in inputs:
         label(r, 1, lbl)
@@ -3340,51 +3322,30 @@ def _generate_xlsx_bank(
 
     r += 1
 
-    # ---- Parameters: High Growth vs Stable ----------------------------
-    section_header(r, 1, "Parameters")
-    label(r, 2, "High Growth", bold=True)
-    label(r, 3, "Stable", bold=True)
-    r += 1
-    params = [
-        ("Growth Rate", d["growth_rate"], "pct", d["stable_growth"]),
-        ("Payout Ratio", d["payout_ratio"], "pct", 1 - d["stable_reinv"]),
-        ("Beta", d["beta"], "num", d["stable_beta"]),
-        ("Cost of Equity", d["cost_of_equity"], "pct", d["stable_cost_of_equity"]),
-    ]
-    for lbl, hg, fmt, st in params:
-        label(r, 1, lbl)
-        if fmt == "pct":
-            val_pct(r, 2, hg, YELLOW_FILL)
-            val_pct(r, 3, st, YELLOW_FILL)
-        else:
-            c = ws.cell(row=r, column=2, value=hg)
-            c.number_format = "0.00"
-            c.fill = YELLOW_FILL
-            c2 = ws.cell(row=r, column=3, value=st)
-            c2.number_format = "0.00"
-        r += 1
-
-    r += 1
-
-    # ---- Year-by-year FCFE table --------------------------------------
-    section_header(r, 1, f"Projected FCFE  (growth period = {gp} years)")
+    # ---- Year-by-year Excess Return table ------------------------------
+    # ROE and Cost of Equity are held flat through the explicit period
+    # (same treatment growth_rate/cost_of_equity got under the old FCFE
+    # model) -- terminal value is zero by construction (ROE assumed to
+    # converge to cost of equity beyond this window), so there is no
+    # separate stable-phase section. See docs/known_errors.md 2026-09-17.
+    section_header(r, 1, f"Projected Excess Returns  (growth period = {gp} years)")
     for i in range(gp):
         ws.cell(row=r, column=2 + i, value=f"Year {i + 1}").font = Font(bold=True)
     r += 1
 
     table = [
-        ("Expected Growth Rate", [d["growth_rate"]] * gp, "pct"),
-        ("Net Income", d["ni_n"], "dollar"),
-        ("FCFE (= NI × payout)", d["fcfe_n"], "dollar"),
+        ("Book Value of Equity (start of year)", [d["bv_equity"]] + d["bv_equity_n"][:-1], "dollar"),
+        ("Return on Equity (ROE)", [d["roe"]] * gp, "pct"),
         ("Cost of Equity", [d["cost_of_equity"]] * gp, "pct"),
+        ("Excess Return (= (ROE − CoE) × BVE)", d["excess_return_n"], "dollar"),
         (
             "Cumulated CoE",
             [(1 + d["cost_of_equity"]) ** (y + 1) for y in range(gp)],
             "num",
         ),
         (
-            "Present Value of FCFE",
-            [d["fcfe_n"][y] / (1 + d["cost_of_equity"]) ** (y + 1) for y in range(gp)],
+            "Present Value of Excess Return",
+            [d["excess_return_n"][y] / (1 + d["cost_of_equity"]) ** (y + 1) for y in range(gp)],
             "dollar",
         ),
     ]
@@ -3402,33 +3363,12 @@ def _generate_xlsx_bank(
 
     r += 1
 
-    # ---- Stable phase -------------------------------------------------
-    section_header(r, 1, "Stable Phase")
-    r += 1
-    stable = [
-        ("Growth Rate in Stable Phase", d["stable_growth"], "pct"),
-        ("Reinvestment Rate in Stable Phase", d["stable_reinv"], "pct"),
-        ("FCFE in Stable Phase", d["stable_fcfe"], "dollar"),
-        ("Cost of Equity in Stable Phase", d["stable_cost_of_equity"], "pct"),
-        ("Terminal Value (undiscounted)", d["terminal_value_undiscounted"], "dollar"),
-        ("PV of Terminal Value", d["terminal_value_pv"], "dollar"),
-    ]
-    for lbl, v, fmt in stable:
-        label(r, 1, lbl)
-        if fmt == "dollar":
-            val_dollar(r, 2, v, YELLOW_FILL)
-        else:
-            val_pct(r, 2, v, YELLOW_FILL)
-        r += 1
-
-    r += 1
-
     # ---- Valuation summary --------------------------------------------
     section_header(r, 1, "Valuation")
     r += 1
     valuation = [
-        ("PV of FCFE in High Growth Phase", d["fcfe_pv"], "dollar"),
-        ("PV of Terminal Value", d["terminal_value_pv"], "dollar"),
+        ("Book Value of Equity (today)", d["bv_equity"], "dollar"),
+        ("PV of Excess Returns", d["excess_return_pv"], "dollar"),
         ("Equity Value", d["equity_value"], "dollar"),
         ("÷ Shares Outstanding", d["shares_outstanding"], "num"),
         ("Value of Equity per Share", d["intrinsic_value"], "dollar"),
@@ -3670,7 +3610,7 @@ def generate_xlsx(d: dict, output_path: str) -> None:
         print(f"Saved: {output_path}")
         return
 
-    if d.get("model") == "FCFE":
+    if d.get("model") == "ExcessReturn":
         _generate_xlsx_bank(
             ws,
             d,
