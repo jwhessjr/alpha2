@@ -352,9 +352,24 @@ def _q_ebit(q: dict) -> float:
 
     Fall back to 'ebit' when:
       - operatingIncome is absent or zero, OR
-      - operatingIncome and ebit have opposite signs (AV data error indicator —
+      - operatingIncome is NEGATIVE and ebit is POSITIVE (AV data error indicator —
         e.g., AV NHC Q1 2026: operatingIncome = -$104M, ebit = +$45M, SEC = +$32M
         — since corrected on AV's side to operatingIncome = +$32M, matching SEC)
+
+    Deliberately NOT symmetric: when operatingIncome is POSITIVE and ebit is
+    NEGATIVE, operatingIncome is trusted regardless — added 2026-09-17 after
+    confirming this direction has the opposite risk profile. A positive
+    operatingIncome with a negative ebit typically means a large one-time
+    non-operating charge (impairment, litigation, write-down) dragged
+    incomeBeforeTax deeply negative while the business itself stayed
+    profitable — trusting ebit there would inject a fake operating loss for
+    a genuinely healthy business. Confirmed live: INTC Q2 2026 (AV
+    operatingIncome=+$1.98B, ebit=-$10.48B; SEC OperatingIncomeLoss=+$1.80B,
+    confirming operatingIncome was correct) and VFC Q1 2026 (operatingIncome=
+    +$61.5M, ebit=-$129.6M). The single confirmed real-world case for the
+    original sign-mismatch rule (NHC) only ever ran in the opposite
+    direction (operatingIncome negative, ebit positive) — there was never
+    evidence the rule should apply symmetrically.
 
     When falling back to 'ebit', subtract whichever non-operating-income fields
     AV happens to itemize for this quarter (interestIncome, otherNonOperatingIncome,
@@ -380,8 +395,11 @@ def _q_ebit(q: dict) -> float:
     if oi not in (None, "None", ""):
         val = safe_float(oi)
         if val is not None and val != 0.0:
-            # If signs differ, one of them is wrong — trust (adjusted) ebit as the lesser evil
-            if ebit_val != 0 and (val > 0) != (ebit_val > 0):
+            # Only override with (adjusted) ebit when operatingIncome is
+            # negative and ebit is positive — the one confirmed real
+            # direction (NHC). A positive operatingIncome is trusted even
+            # when ebit is negative (see docstring: INTC/VFC).
+            if val < 0 and ebit_val > 0:
                 return adjusted_ebit_val
             return val
     return adjusted_ebit_val
