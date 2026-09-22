@@ -435,6 +435,46 @@ def annual_income_statement(ticker, api_key, years: int = CYCLICAL_MARGIN_MAX_YE
     )
 
 
+def annual_cash_flow_statement(ticker, api_key, years: int = CYCLICAL_MARGIN_MAX_YEARS):
+    """Up to `years` years of annual capex history, most-recent-first,
+    POSITIVE-magnitude sign convention (matches calc_capital_expenditures()'s
+    existing contract -- the current-year figure calc_reinvestment() already
+    expects). Feeds calc_cyclical_normalized_reinvestment() -- see its
+    docstring. 2026-09-22 follow-up to annual_income_statement() (same
+    fetch/fallback template).
+
+    SIGN FLIP, explicit and isolated to this one function: Intrinio's
+    get_cash_flow_intrinio_annual() deliberately returns capitalExpenditures
+    RAW/NEGATIVE (see its own docstring) -- that's the correct convention
+    for its other consumer, moat_score.py, but the OPPOSITE of what every
+    capex figure in THIS file expects (calc_capital_expenditures(),
+    calc_reinvestment()'s capex parameter). The flip happens once, here,
+    at the vendor boundary -- never inside the calc functions themselves.
+    AV's own annual capitalExpenditures is already positive (matches AV's
+    quarterly convention, summed with no flip by calc_capital_expenditures()
+    today) -- the AV branch below does NOT flip."""
+    def _av_annual():
+        raw = av_fetch("CASH_FLOW", symbol=ticker).get("annualReports", [])
+        return [
+            {"capitalExpenditures": hg_dcflib.safe_float(row.get("capitalExpenditures"))}
+            for row in raw[:years]
+        ]
+
+    def _intrinio_annual():
+        raw = hg_dcflib.get_cash_flow_intrinio_annual(ticker, INTRINIO_KEY, years=years)
+        return [
+            {"capitalExpenditures": -hg_dcflib.safe_float(row.get("capitalExpenditures"))}
+            for row in raw
+        ]
+
+    return _fetch_with_fallback(
+        ticker,
+        _intrinio_annual,
+        _av_annual,
+        "annual cash flow (cyclical reinvestment normalization)",
+    )
+
+
 def balance_sheet(ticker, api_key, is_financial_or_reit: bool = False):
     return _fetch_with_fallback(
         ticker,
@@ -1082,8 +1122,8 @@ def calc_cyclical_normalized_ebit(
     note, low_growth_rate_note, extreme_reinvestment_rate_note,
     high_growth_rate_note, calc_gated_return_on_capital's ROIC
     corroboration), this is not flag-only -- when triggered, the returned
-    ebit_to_use actually replaces what feeds calc_adj_ebit() downstream.
-    Deliberate: those guards ask "is this correctly-computed result
+    ebit_to_use (normalized_ebit) becomes the TARGET the model is steered
+    toward. Deliberate: those guards ask "is this correctly-computed result
     unusual?"; this asks "is the EBIT input itself even the right number to
     feed in?" -- the same category calc_adj_ebit()'s own R&D adjustment
     already occupies (an input correction, not a result flag). Every
@@ -1091,6 +1131,18 @@ def calc_cyclical_normalized_ebit(
     (cyclical_ebit_normalization_note()) and via detail-dict keys in the
     Excel report -- so it is never a SILENT correction, only a
     non-flag-gated one.
+
+    2026-09-22 update: the caller no longer instantly substitutes this
+    return value as the explicit period's starting EBIT by default --
+    calc_adaptive_growth_rate() (Damodaran's own named alternative,
+    "Adaptive Growth") steers the real, current EBIT toward this target via
+    a solved growth rate instead, so the trajectory doesn't jump straight
+    to the average on day one. Instant substitution (what this function's
+    return value used to feed directly) is now only the FALLBACK, used
+    when no real growth rate can bridge the two (sign mismatch -- see
+    calc_adaptive_growth_rate()'s docstring). See docs/known_errors.md
+    2026-09-22 for why (PARR's overcorrection to a negative IV under pure
+    instant substitution) and docs/decisions.md for the full decision.
 
     A real, accepted limitation: this cannot distinguish a genuine temporary
     cyclical spike (PARR/DHT/CSTM) from a genuine permanent structural
@@ -1148,6 +1200,225 @@ def calc_cyclical_normalized_ebit(
         "raw_ebit": raw_ebit,
         "normalized_ebit": normalized_ebit,
     }
+
+
+def calc_cyclical_normalized_reinvestment(
+    ticker: str,
+    current_capex: float,
+    current_revenue: float,
+    capex_annual_reports: list,
+    ebit_annual_reports: list,
+    cyclical_diag: dict,
+) -> tuple[float, dict]:
+    """
+    Returns (capex_to_use, reinvest_diag). Extends Damodaran's cyclical-
+    normalization method ("Ups and Downs: Valuing Cyclical and Commodity
+    Companies", Sept 2009 -- *"we also have to normalize return on
+    capital, reinvestment and cost of financing"*) from EBIT alone to
+    capex, the reinvestment-side analogue -- fixes an "incomplete
+    normalization" gap found live 2026-09-22: DHT/CSTM's reinvestment_rate
+    was still built from today's real, unnormalized capex, which for a
+    company at a cyclical peak is very likely also elevated, exactly
+    parallel to the EBIT distortion calc_cyclical_normalized_ebit() fixes.
+
+    STRICTLY GATED behind cyclical_diag["applied"] -- the EBIT-margin
+    trigger calc_cyclical_normalized_ebit() already computed for THIS
+    ticker, THIS run. Never has its own independent trigger logic. This is
+    deliberate: a UNIVERSAL version of this exact technique (average
+    capex/depreciation/working-capital-change over a multi-year window,
+    applied to every ticker) was already tried in this codebase and
+    reverted (docs/known_errors.md, introduced 2026-09-10, reverted
+    2026-09-11 to 13) -- GOOG's real TTM capex was $132.4B, a 5yr average
+    was $60.3B, a 54% understatement that masked GOOG's real, structural
+    AI-infrastructure capex ramp, not a cyclical blip. Gating on the SAME
+    calibrated test already used for EBIT (rather than a separately-
+    derived capex trigger) means a structurally-scaling company can only
+    reach this function if it ALSO independently trips the EBIT margin
+    test -- confirmed live GOOG/AAPL/MSFT never do.
+
+    Gating alone is necessary but not fully sufficient, though --
+    calc_cyclical_normalized_ebit()'s own docstring already admits it
+    "cannot distinguish a genuine temporary cyclical spike... from a
+    genuine permanent structural margin improvement." A ticker that trips
+    the EBIT gate for a STRUCTURAL reason (real scale-up, not a cyclical
+    peak) would also get its capex wrongly normalized here -- the GOOG
+    story again, just entered through a different door. Mitigated by a
+    same-direction corroboration check, mirroring calc_gated_return_on_
+    capital()'s existing ROIC-corroboration pattern (flag, don't silently
+    exclude -- no ground truth exists to auto-decide this): if the capex
+    margin ratio and the EBIT margin ratio move in the SAME direction
+    relative to 1.0 (both compressed together, or both elevated together
+    -- the genuine cyclical-peak signature, e.g. PARR/DHT/CSTM), normalize.
+    If they move in OPPOSITE directions (EBIT compressed while capex
+    margin EXPANDED -- real capacity build-out ahead of earnings catching
+    up, the GOOG/META signature), do NOT normalize capex -- capex_to_use
+    stays current_capex UNCHANGED, but reinvest_diag carries the
+    disagreement so it's visible in notes/Excel, never silent. This never
+    blocks the (already-verified-sound) EBIT normalization itself.
+
+    Reuses cyclical_diag["years_used"] rather than an independently-
+    derived capex window -- the EBIT gate's own verdict and window are
+    what justified triggering at all; a separately-computed capex window
+    could silently decouple the normalization from the trigger that
+    justified it. capex_annual_reports/ebit_annual_reports are paired by
+    index (both come from the same years_used-bounded window, revenue
+    for the margin ratio always taken from ebit_annual_reports -- the
+    exact series calc_cyclical_normalized_ebit() already used) -- degrades
+    to a no-op (not partial-credit) if capex history is shorter than
+    years_used, same "insufficient data -> skip, don't guess" philosophy
+    calc_cyclical_normalized_ebit() already uses for its own min_years
+    floor.
+
+    Scope: capex only. Working-capital-change normalization is deferred
+    (get_bal_sheet_intrinio_annual() doesn't currently expose the
+    totalCurrentAssets/totalCurrentLiabilities fields calc_chng_wc() would
+    need -- a real, unreviewed fetcher gap, not wired here) -- see
+    docs/decisions.md. Depreciation is never normalized -- it reflects
+    PAST capex already amortized over a useful life, smoothed by
+    construction; normalizing it again would double-smooth.
+    """
+    if not cyclical_diag or not cyclical_diag.get("applied"):
+        return current_capex, {"applied": False, "reason": "ebit_gate_not_triggered"}
+
+    years_used = cyclical_diag.get("years_used", 0)
+    paired = list(zip(capex_annual_reports[:years_used], ebit_annual_reports[:years_used]))
+    capex_margins = []
+    for capex_row, ebit_row in paired:
+        capex = capex_row.get("capitalExpenditures")
+        rev = ebit_row.get("totalRevenue")
+        if capex is not None and rev and rev > 0:
+            capex_margins.append(capex / rev)
+
+    if len(capex_margins) < years_used or not current_revenue or current_revenue <= 0:
+        return current_capex, {
+            "applied": False,
+            "reason": "insufficient_capex_history",
+            "years_used": len(capex_margins),
+        }
+
+    avg_capex_margin = sum(capex_margins) / len(capex_margins)
+    current_capex_margin = current_capex / current_revenue
+    normalized_capex = avg_capex_margin * current_revenue
+
+    ebit_avg_margin = cyclical_diag.get("avg_margin")
+    ebit_current_margin = cyclical_diag.get("current_margin")
+    ebit_ratio = (ebit_current_margin - ebit_avg_margin) if ebit_avg_margin is not None else 0.0
+    capex_ratio = current_capex_margin - avg_capex_margin
+    same_direction = (ebit_ratio >= 0) == (capex_ratio >= 0)
+
+    if not same_direction:
+        return current_capex, {
+            "applied": False,
+            "reason": "direction_mismatch_possible_structural_change",
+            "years_used": years_used,
+            "avg_capex_margin": avg_capex_margin,
+            "current_capex_margin": current_capex_margin,
+            "normalized_capex": normalized_capex,
+        }
+
+    logger.info(
+        f"{ticker}: cyclical reinvestment normalization applied -- current "
+        f"capex margin {current_capex_margin:.1%} vs. {years_used}yr avg "
+        f"{avg_capex_margin:.1%}, using ${normalized_capex:,.0f} instead of "
+        f"raw capex ${current_capex:,.0f}"
+    )
+    return normalized_capex, {
+        "applied": True,
+        "years_used": years_used,
+        "avg_capex_margin": avg_capex_margin,
+        "current_capex_margin": current_capex_margin,
+        "raw_capex": current_capex,
+        "normalized_capex": normalized_capex,
+    }
+
+
+def calc_adaptive_growth_rate(
+    raw_ebit: float,
+    normalized_ebit: float,
+    growth_period: int,
+    transition_period: int,
+    stable_growth: float,
+    tolerance: float = 1.0,
+    max_iterations: int = 100,
+) -> float | None:
+    """
+    Damodaran's "Adaptive Growth" compromise ("Ups and Downs: Valuing
+    Cyclical and Commodity Companies", Sept 2009, NYU Stern) -- his own
+    stated alternative to instant substitution (calc_cyclical_normalized_
+    ebit()'s default behavior): *"allow earnings to follow the current
+    cycle for the short term, and use the growth rate as a mechanism to
+    bring us back to normalcy."* Rather than replacing the explicit
+    period's starting EBIT outright, solve for a single flat growth_rate
+    that -- fed through calc_expected_fcff()'s existing, UNMODIFIED 3-stage
+    fade -- carries raw_ebit (today's real, current earnings) to
+    normalized_ebit (the long-run target) by the time the model actually
+    enters stable phase.
+
+    Solves for ebit_n[-1] == normalized_ebit at the END of growth_period +
+    transition_period, NOT at the end of growth_period alone. This
+    distinction matters and was verified by hand, not assumed: a
+    closed-form CAGR targeting growth_period alone overshoots once fed
+    through the transition fade (which interpolates the RATE, not the
+    EBIT LEVEL) -- for PARR's real numbers, targeting growth_period alone
+    gives g=-31.9%, which then keeps dragging EBIT down through the
+    transition years to a trough ~47% BELOW the normalized target before
+    recovering. Targeting the true stable-phase entry point (g=-25.4% for
+    PARR) produces a monotonic path landing within ~3% of the target
+    throughout the tail. See docs/known_errors.md 2026-09-22 for the full
+    hand-verification.
+
+    Returns None when no real bridging rate exists: raw_ebit and
+    normalized_ebit must share the same sign (and both be non-zero). Proof:
+    every year's effective rate is a convex combination of growth_rate and
+    stable_growth, both > -1 by construction, so (1+rate) never crosses
+    zero -- sign is preserved through the entire trajectory, meaning a real
+    geometric bridge between the two endpoints can only exist when they
+    already share a sign. Callers must fall back to instant substitution
+    in this case (a genuine trough -- current EBIT negative, reverting to a
+    positive historical average -- is exactly Damodaran's own Toyota-shaped
+    example, but the fallback, not this solver, is the right tool for it;
+    instant substitution is itself one of Damodaran's three named methods,
+    not a workaround).
+
+    Implemented as bisection over calc_expected_fcff() itself (called with
+    placeholder eff_tax_rate=0.0/reinvestment_rate=0.0 -- ebit_n depends
+    only on growth_rate/growth_period/transition_period/stable_growth,
+    confirmed by reading calc_expected_fcff() directly), not a closed-form
+    CAGR -- the mixed flat-then-fading rate makes this genuinely non-
+    closed-form once transition_period > 0.
+    """
+    if raw_ebit == 0 or normalized_ebit == 0 or (raw_ebit > 0) != (normalized_ebit > 0):
+        return None
+
+    def trajectory_end(g: float) -> float:
+        _, ebit_n, _, _, _ = calc_expected_fcff(
+            raw_ebit, 0.0, g, 0.0, growth_period,
+            transition_period=transition_period, stable_growth=stable_growth,
+            stable_reinvestment_rate=0.0,
+        )
+        return ebit_n[-1]
+
+    lo, hi = -0.999, 20.0
+    f_lo = trajectory_end(lo) - normalized_ebit
+    f_hi = trajectory_end(hi) - normalized_ebit
+    if f_lo == 0.0:
+        return lo
+    if f_hi == 0.0:
+        return hi
+    if (f_lo > 0) == (f_hi > 0):
+        return None  # bracket failed to span the target -- degenerate, fall back
+
+    mid = lo
+    for _ in range(max_iterations):
+        mid = (lo + hi) / 2
+        f_mid = trajectory_end(mid) - normalized_ebit
+        if abs(f_mid) < tolerance:
+            return mid
+        if (f_mid > 0) == (f_lo > 0):
+            lo, f_lo = mid, f_mid
+        else:
+            hi = mid
+    return mid
 
 
 def calc_adj_bv_equity(bal_sht, amort_schedule):
@@ -1513,11 +1784,22 @@ def high_growth_rate_note(growth_rate: float, cap: float = 0.30) -> str:
 
 
 def cyclical_ebit_normalization_note(diag: dict) -> str:
-    """Flag when calc_cyclical_normalized_ebit() actually swapped in the
-    margin-normalized EBIT -- unlike the other *_note() functions in this
-    file, this documents a correction that already happened (see
-    calc_cyclical_normalized_ebit()'s docstring for why this one input swap
-    is not flag-only), not a result to independently verify.
+    """Flag when cyclical EBIT normalization actually fired -- unlike the
+    other *_note() functions in this file, this documents a correction
+    that already happened (see calc_cyclical_normalized_ebit()'s and
+    calc_adaptive_growth_rate()'s docstrings for why this is not flag-
+    only), not a result to independently verify.
+
+    Two distinct modes, branched on here (2026-09-22): the primary path is
+    Damodaran's "Adaptive Growth" (calc_adaptive_growth_rate() found a real
+    bridging growth rate -- explicit period starts from real current EBIT,
+    tapers to the normalized target by stable phase); the fallback is his
+    other named method, instant substitution (used only when no real
+    bridging rate exists -- raw/normalized EBIT don't share a sign, a
+    genuine trough case). growth_rate is explicitly called out in both
+    messages since this is the first place in this file it can diverge
+    from reinvestment_rate x return_on_capital -- never a silent
+    divergence.
 
     Only wired into the batch path (_value_stock_fcff()) -- the detail path
     has no `notes` field; it gets the same information as new detail-dict
@@ -1525,15 +1807,71 @@ def cyclical_ebit_normalization_note(diag: dict) -> str:
     high_growth_rate_note()'s own batch-only wiring (see its docstring)."""
     if not diag or not diag.get("applied"):
         return ""
+    if diag.get("adaptive_growth_fallback") == "instant_substitution":
+        return (
+            f"EBIT normalized using Damodaran's relative-margin method: TTM "
+            f"operating margin ({diag['current_margin']:.1%}) diverges from the "
+            f"{diag['years_used']}yr average margin ({diag['avg_margin']:.1%}) "
+            f"beyond the cyclical-normalization threshold -- used the average "
+            f"margin applied to current revenue (${diag['normalized_ebit']:,.0f}) "
+            f"instead of raw TTM EBIT (${diag['raw_ebit']:,.0f}) via instant "
+            "substitution (Damodaran's Adaptive Growth method was not usable here "
+            "-- current and normalized EBIT don't share a sign); verify this "
+            "reflects genuine cyclical mean reversion, not a real structural "
+            "change in the business, before trusting the resulting growth rate."
+        )
     return (
-        f"EBIT normalized using Damodaran's relative-margin method: TTM "
+        f"EBIT normalized using Damodaran's Adaptive Growth method: TTM "
         f"operating margin ({diag['current_margin']:.1%}) diverges from the "
         f"{diag['years_used']}yr average margin ({diag['avg_margin']:.1%}) "
-        f"beyond the cyclical-normalization threshold -- used the average "
-        f"margin applied to current revenue (${diag['normalized_ebit']:,.0f}) "
-        f"instead of raw TTM EBIT (${diag['raw_ebit']:,.0f}); verify this "
-        "reflects genuine cyclical mean reversion, not a real structural "
-        "change in the business, before trusting the resulting growth rate."
+        f"beyond the cyclical-normalization threshold -- the explicit period "
+        f"starts from the real, current EBIT (${diag['raw_ebit']:,.0f}) and "
+        f"tapers via a solved growth rate ({diag.get('adaptive_growth_rate', 0):.1%}/yr) "
+        f"to the normalized target (${diag['normalized_ebit']:,.0f}) by the time "
+        "the model enters stable phase, rather than substituting the normalized "
+        "figure outright -- growth_rate no longer equals reinvestment_rate x "
+        "return_on_capital for this ticker as a result; verify this reflects "
+        "genuine cyclical mean reversion, not a real structural change in the "
+        "business, before trusting the resulting valuation."
+    )
+
+
+def cyclical_reinvestment_normalization_note(diag: dict) -> str:
+    """Flag when calc_cyclical_normalized_reinvestment() actually swapped
+    in the margin-normalized capex -- see its docstring for the gating/
+    same-direction-guard design (2026-09-22). Like
+    cyclical_ebit_normalization_note(), this documents a correction that
+    already happened, not a result to independently verify. Also surfaces
+    the direction-mismatch case (flag, no correction applied) so a
+    reviewer can see the guard fired, not just silence.
+
+    Only wired into the batch path -- same precedent as
+    cyclical_ebit_normalization_note()'s own batch-only wiring."""
+    if not diag:
+        return ""
+    if diag.get("reason") == "direction_mismatch_possible_structural_change":
+        return (
+            f"Reinvestment normalization NOT applied despite the EBIT gate "
+            f"firing: capex margin ({diag['current_capex_margin']:.1%} vs. "
+            f"{diag['years_used']}yr avg {diag['avg_capex_margin']:.1%}) moved "
+            "in the OPPOSITE direction from the EBIT margin -- capex expanding "
+            "while earnings compress is the signature of a real structural "
+            "change (capacity build-out ahead of earnings), not a cyclical "
+            "peak; using raw current capex, verify this ticker's reinvestment "
+            "story directly before trusting the reinvestment rate."
+        )
+    if not diag.get("applied"):
+        return ""
+    return (
+        f"Reinvestment normalized using Damodaran's relative-margin method "
+        f"(same technique as the EBIT normalization above, gated on the same "
+        f"trigger): capex margin ({diag['current_capex_margin']:.1%}) vs. the "
+        f"{diag['years_used']}yr average ({diag['avg_capex_margin']:.1%}) -- "
+        f"used the average margin applied to current revenue "
+        f"(${diag['normalized_capex']:,.0f}) instead of raw capex "
+        f"(${diag['raw_capex']:,.0f}); verify this reflects genuine cyclical "
+        "mean reversion, not a real structural change, before trusting the "
+        "resulting reinvestment rate."
     )
 
 
@@ -2471,10 +2809,50 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         # growth is applied to EBIT rather than EBIAT or FCFF. Adjust at the
         # EBIT level (2026-09-10 fix), then derive EBIAT from it — not the
         # other way around. See calc_adj_ebit()'s docstring.
-        adjusted_ebit = calc_adj_ebit(cyclical_ebit, amort_schedule)
+        #
+        # Adaptive Growth (Damodaran's own named alternative to instant
+        # substitution, 2026-09-22 — see calc_adaptive_growth_rate()'s
+        # docstring): when cyclical normalization triggers, the explicit
+        # period starts from the REAL, current EBIT (not the normalized
+        # figure) and instead solves for a growth rate that carries it to
+        # the normalized target by the time the model enters stable phase.
+        # Falls back to instant substitution only when no real bridging
+        # rate exists (raw/normalized EBIT don't share a sign — a genuine
+        # trough case).
+        adaptive_growth_rate = None
+        adjusted_ebit = calc_adj_ebit(inc_stmnt["ebit"][0], amort_schedule)
+        if cyclical_diag.get("applied"):
+            adjusted_normalized_ebit = calc_adj_ebit(cyclical_diag["normalized_ebit"], amort_schedule)
+            adaptive_growth_rate = calc_adaptive_growth_rate(
+                adjusted_ebit, adjusted_normalized_ebit, growth_period, TRANSITION_PERIOD, STABLE_GROWTH
+            )
+            cyclical_diag["adaptive_growth_rate"] = adaptive_growth_rate
+            if adaptive_growth_rate is None:
+                adjusted_ebit = adjusted_normalized_ebit
+                cyclical_diag["adaptive_growth_fallback"] = "instant_substitution"
         adjusted_ebiat = adjusted_ebit * (1 - eff_tax_rate)
+
+        # Cyclical reinvestment (capex) normalization (2026-09-22 follow-up
+        # to the EBIT fix above) — gated behind the SAME cyclical_diag the
+        # EBIT normalization already computed; never an independent
+        # trigger. See calc_cyclical_normalized_reinvestment()'s docstring
+        # for the gating design and the same-direction guard.
+        reinvest_capex = capex
+        reinvest_diag = {"applied": False, "reason": "ebit_gate_not_triggered"}
+        if cyclical_diag.get("applied"):
+            try:
+                capex_annual = annual_cash_flow_statement(
+                    ticker, MY_API_KEY, years=cyclical_diag["years_used"]
+                )
+                reinvest_capex, reinvest_diag = calc_cyclical_normalized_reinvestment(
+                    ticker, capex, inc_stmnt["totalRevenue"][0],
+                    capex_annual, annual_reports, cyclical_diag,
+                )
+            except Exception as exc:
+                logger.warning(f"{ticker}: cyclical reinvestment normalization skipped ({exc}) — using raw capex.")
+
         firm_reinvestment = calc_reinvestment(
-            capex, depreciation, chng_nc_wc, amort_schedule
+            reinvest_capex, depreciation, chng_nc_wc, amort_schedule
         )
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
@@ -2520,6 +2898,14 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         # Uncapped 2026-09-13 -- Ginzu has no cap here either; see
         # high_growth_rate_note(), wired into `notes` below instead.
         growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
+        # Adaptive Growth override (2026-09-22): the first place in this
+        # file growth_rate deliberately diverges from reinvestment_rate x
+        # return_on_capital -- see calc_adaptive_growth_rate()'s docstring
+        # and docs/decisions.md for why this is safe (return_on_capital,
+        # wealth_pc, and calc_terminal_value()'s moat blending never read
+        # growth_rate, confirmed by reading every call site).
+        if adaptive_growth_rate is not None:
+            growth_rate = adaptive_growth_rate
 
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         discount_rate = calc_discount_rate(
@@ -2608,6 +2994,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 extreme_reinvestment_rate_note(reinvestment_rate),
                 high_growth_rate_note(growth_rate),
                 cyclical_ebit_normalization_note(cyclical_diag),
+                cyclical_reinvestment_normalization_note(reinvest_diag),
             ) if n
         )
 
@@ -3174,10 +3561,40 @@ def _value_stock_detail_fcff(
             logger.warning(f"{ticker}: cyclical EBIT normalization skipped ({exc}) — using raw TTM EBIT.")
             cyclical_ebit, cyclical_diag = inc_stmnt["ebit"][0], {"applied": False, "reason": f"fetch_failed: {exc}"}
 
-        adjusted_ebit = calc_adj_ebit(cyclical_ebit, amort_schedule)
+        # Adaptive Growth (2026-09-22) -- see the matching batch-path
+        # comment and calc_adaptive_growth_rate()'s docstring.
+        adaptive_growth_rate = None
+        adjusted_ebit = calc_adj_ebit(inc_stmnt["ebit"][0], amort_schedule)
+        if cyclical_diag.get("applied"):
+            adjusted_normalized_ebit = calc_adj_ebit(cyclical_diag["normalized_ebit"], amort_schedule)
+            adaptive_growth_rate = calc_adaptive_growth_rate(
+                adjusted_ebit, adjusted_normalized_ebit, growth_period, TRANSITION_PERIOD, STABLE_GROWTH
+            )
+            cyclical_diag["adaptive_growth_rate"] = adaptive_growth_rate
+            if adaptive_growth_rate is None:
+                adjusted_ebit = adjusted_normalized_ebit
+                cyclical_diag["adaptive_growth_fallback"] = "instant_substitution"
         adjusted_ebiat = adjusted_ebit * (1 - eff_tax_rate)
+
+        # Cyclical reinvestment (capex) normalization (2026-09-22 follow-up)
+        # -- see the matching batch-path comment and
+        # calc_cyclical_normalized_reinvestment()'s docstring.
+        reinvest_capex = capex
+        reinvest_diag = {"applied": False, "reason": "ebit_gate_not_triggered"}
+        if cyclical_diag.get("applied"):
+            try:
+                capex_annual = annual_cash_flow_statement(
+                    ticker, MY_API_KEY, years=cyclical_diag["years_used"]
+                )
+                reinvest_capex, reinvest_diag = calc_cyclical_normalized_reinvestment(
+                    ticker, capex, inc_stmnt["totalRevenue"][0],
+                    capex_annual, annual_reports, cyclical_diag,
+                )
+            except Exception as exc:
+                logger.warning(f"{ticker}: cyclical reinvestment normalization skipped ({exc}) — using raw capex.")
+
         firm_reinvestment = calc_reinvestment(
-            capex, depreciation, chng_nc_wc, amort_schedule
+            reinvest_capex, depreciation, chng_nc_wc, amort_schedule
         )
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
@@ -3209,6 +3626,10 @@ def _value_stock_detail_fcff(
         # no `notes` field (it's the single-ticker Excel report, already
         # human-reviewed directly), see high_growth_rate_note()'s docstring.
         growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
+        # Adaptive Growth override (2026-09-22) -- see the matching
+        # batch-path comment and calc_adaptive_growth_rate()'s docstring.
+        if adaptive_growth_rate is not None:
+            growth_rate = adaptive_growth_rate
 
         # Compute discount rate components inline to capture intermediates
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
@@ -3403,9 +3824,23 @@ def _value_stock_detail_fcff(
             "cyclical_current_margin": cyclical_diag.get("current_margin"),
             "cyclical_years_used": cyclical_diag.get("years_used"),
             "cyclical_normalized_ebit": cyclical_diag.get("normalized_ebit"),
+            "adaptive_growth_rate": cyclical_diag.get("adaptive_growth_rate"),
+            "cyclical_normalization_mode": (
+                "instant_substitution" if cyclical_diag.get("adaptive_growth_fallback")
+                else "adaptive_growth" if cyclical_diag.get("applied")
+                else None
+            ),
+            "cyclical_reinvestment_normalization_applied": reinvest_diag.get("applied", False),
+            "cyclical_avg_capex_margin": reinvest_diag.get("avg_capex_margin"),
+            "cyclical_current_capex_margin": reinvest_diag.get("current_capex_margin"),
+            "cyclical_normalized_capex": reinvest_diag.get("normalized_capex"),
+            "cyclical_reinvestment_direction_mismatch": (
+                reinvest_diag.get("reason") == "direction_mismatch_possible_structural_change"
+            ),
             "adjusted_ebit": adjusted_ebit,
             "interest_expense": inc_stmnt["interest_expense"][0],
             "capex": capex,
+            "reinvest_capex_used": reinvest_capex,
             "depreciation": depreciation,
             "eff_tax_rate": eff_tax_rate,
             "revenue": revenue,
@@ -3916,7 +4351,12 @@ def _generate_xlsx_fcff(
         ("Cyclically Normalized EBIT", d["cyclical_normalized_ebit"], "dollar"),
         ("Adjusted EBIT", d["adjusted_ebit"], "dollar"),
         ("Adjusted Interest Expense", d["interest_expense"], "dollar"),
-        ("Adjusted Capital Spending (avg 5yr)", d["capex"], "dollar"),
+        ("Raw Capital Spending (current year)", d["capex"], "dollar"),
+        ("Cyclical Nyr Avg Capex Margin", d["cyclical_avg_capex_margin"], "percent"),
+        ("Cyclical Current Capex Margin", d["cyclical_current_capex_margin"], "percent"),
+        ("Cyclical Reinvestment Normalization Applied?", "Yes" if d["cyclical_reinvestment_normalization_applied"] else "No", "text"),
+        ("Cyclically Normalized Capex", d["cyclical_normalized_capex"], "dollar"),
+        ("Capex Used in Reinvestment Calc", d["reinvest_capex_used"], "dollar"),
         ("Adjusted Depreciation & Amort'n", d["depreciation"], "dollar"),
         ("Tax Rate on Income", d["eff_tax_rate"], "pct"),
         ("Current Revenues", d["revenue"], "dollar"),
