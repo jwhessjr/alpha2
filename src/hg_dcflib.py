@@ -405,6 +405,17 @@ def _q_ebit(q: dict) -> float:
     return adjusted_ebit_val
 
 
+def annual_ebit_proxy(report: dict) -> float:
+    """Public wrapper around _q_ebit() for use on annual (not just
+    quarterly) report rows -- same field shape, same operatingIncome-vs-ebit
+    correctness logic. Added 2026-09-22 for av_fcff_2.py's
+    annual_income_statement() AV-fallback path (cyclical EBIT normalization,
+    Damodaran's "relative average over time" method), so that path doesn't
+    reach into a leading-underscore "private" function from outside this
+    module."""
+    return _q_ebit(report)
+
+
 def get_inc_stmnt(company: str, apiKey: str) -> dict:
     """Return annualized ebit, tax expense and interest expense
        from the quarterly reports of a ticker.

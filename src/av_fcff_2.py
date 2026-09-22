@@ -27,6 +27,7 @@ from pathlib import Path as _Path
 # in HessGrp/lib), without shadowing a same-directory hg_dcflib.py copy.
 _sys.path.append(str(_Path.home() / "HessGrp" / "lib"))
 import hg_dcflib
+from av_fetcher import av_fetch
 from config import INTRINIO_KEY
 import json
 import logging
@@ -144,6 +145,39 @@ ROIC_CORROBORATION_MIN_DATA_YEARS = 3   # avg_roic needs enough history to be a 
 # including why this deliberately self-clears on every revaluation rather
 # than needing a manual reset.
 TV_MARKET_CAP_MAX_RATIO = 5.0
+
+# Cyclical EBIT normalization -- Damodaran's "relative average over time"
+# method ("Ups and Downs: Valuing Cyclical and Commodity Companies", Sept
+# 2009, NYU Stern -- verified against the primary-source PDF, decided
+# 2026-09-22, see docs/decisions.md). Found live on PARR/DHT/CSTM: a single
+# strong quarter/year drives TTM EBIT 2-3x above the company's own long-run
+# ROIC average, then compounds through 5-10yr growth. Unlike every other
+# guard in this file (flag-only), this one actually replaces the EBIT
+# feeding calc_adj_ebit() -- see calc_cyclical_normalized_ebit()'s docstring
+# for why that departure from the "flag, never correct" house pattern is
+# deliberate here. No industry-level cyclical/commodity gate is used --
+# investigated reference_data/betas.xlsx's "Standard deviation in operating
+# income (last 10 years)" column and found it fails to flag 2 of 3
+# confirmed-bad tickers (DHT/CSTM score below the 94-industry p75), since
+# industry-group averages smooth out individual small-cap volatility.
+# Applied per-ticker instead, universally -- a no-op by construction for any
+# company whose current margin already tracks its own history.
+CYCLICAL_MARGIN_MIN_YEARS = 5      # Damodaran's stated window floor -- deliberately above this file's usual 3yr floor (WEALTH_GATE_MIN_YEARS/ROIC_CORROBORATION_MIN_DATA_YEARS), since 3 years can't be trusted to span a full cycle
+CYCLICAL_MARGIN_MAX_YEARS = 10     # Damodaran's stated ceiling
+# Calibrated 2026-09-22 against a live 65-ticker sample of the real
+# universe, comparing each ticker's live TTM margin to its own 10yr FY-
+# history average (same inputs this function actually receives). General
+# population: p50=1.10x, p75=1.39x, p90=1.91x, p95=3.39x, p99=8.23x. The 3
+# confirmed-bad tickers: PARR 6.83x (between p95-p99, unambiguous), DHT
+# 1.81x, CSTM 1.75x (both between p75-p90). Controls: AAPL 1.17x, MSFT
+# 1.18x, KO 1.19x, PG 1.09x, META 0.97x (all near/below 1.0x -- META's
+# multi-year structural margin recovery is old enough that its own 10yr
+# average already reflects it, so the mechanism correctly does not fire).
+# K=1.6 sits between the general population's p75/p90, catches all 3
+# confirmed cases with room to spare, clears every control. See
+# docs/decisions.md.
+CYCLICAL_MARGIN_RATIO_K = 1.6
+CYCLICAL_MARGIN_ABSOLUTE_SPREAD = 0.15  # pp fallback when avg_margin's sign is unstable/near zero -- same reasoning as ROIC_CORROBORATION_MAX_SPREAD; between the small sign-mismatch sample's p50 (9.2%) and p75 (30.2%)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +407,31 @@ def income_statement(ticker, api_key, is_financial_or_reit: bool = False):
         lambda: hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit),
         lambda: hg_dcflib.get_inc_stmnt(ticker, api_key),
         "income statement",
+    )
+
+
+def annual_income_statement(ticker, api_key, years: int = CYCLICAL_MARGIN_MAX_YEARS):
+    """Up to `years` years of annual (revenue, ebit) pairs, most-recent-first.
+    Feeds calc_cyclical_normalized_ebit() -- see its docstring. Intrinio-
+    primary via hg_dcflib.get_inc_stmnt_intrinio_annual() (already returns
+    this exact shape); AV-fallback normalizes AV's raw annualReports through
+    hg_dcflib.annual_ebit_proxy() so the caller never needs to know which
+    provider served a given ticker."""
+    def _av_annual():
+        raw = av_fetch("INCOME_STATEMENT", symbol=ticker).get("annualReports", [])
+        return [
+            {
+                "totalRevenue": hg_dcflib.safe_float(row.get("totalRevenue")),
+                "ebit": hg_dcflib.annual_ebit_proxy(row),
+            }
+            for row in raw[:years]
+        ]
+
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_inc_stmnt_intrinio_annual(ticker, INTRINIO_KEY, years=years),
+        _av_annual,
+        "annual income statement (cyclical normalization)",
     )
 
 
@@ -974,6 +1033,123 @@ def calc_adj_ebit(raw_ebit, amort_schedule):
     return adjusted_ebit
 
 
+def calc_cyclical_normalized_ebit(
+    ticker: str,
+    raw_ebit: float,
+    current_revenue: float,
+    annual_reports: list,
+    min_years: int = CYCLICAL_MARGIN_MIN_YEARS,
+    max_years: int = CYCLICAL_MARGIN_MAX_YEARS,
+    k: float = CYCLICAL_MARGIN_RATIO_K,
+    absolute_spread: float = CYCLICAL_MARGIN_ABSOLUTE_SPREAD,
+) -> tuple:
+    """
+    Returns (ebit_to_use, diagnostics). Damodaran's "relative average over
+    time" method ("Ups and Downs: Valuing Cyclical and Commodity Companies",
+    Sept 2009) -- average this ticker's OWN operating margin (EBIT/revenue)
+    over up to max_years, apply that average margin to CURRENT revenue.
+    Demonstrated by Damodaran on Toyota (1998-2008 avg pre-tax margin
+    applied to 2009 revenue) rather than his rejected method #1 (average raw
+    earnings -- understates a firm that's grown in scale) or #3 (sector
+    average margin -- not used here, no reliable per-ticker industry
+    classification exists, see docs/decisions.md).
+
+    Deliberately NOT gated by industry (see docs/decisions.md) -- an
+    industry-volatility classification was investigated and rejected: it
+    fails to flag 2 of 3 confirmed-bad tickers (DHT, CSTM) whose
+    company-specific volatility is far higher than their broad industry
+    group's average. Applied per-ticker, universally, instead -- a no-op by
+    construction for stable-margin companies (current margin ~= own
+    average), so no gate is needed for the common case.
+
+    ebit_to_use is raw_ebit unchanged unless diagnostics["applied"] is True.
+    When years_used < min_years, normalization is skipped entirely (not
+    partially applied) -- not enough history to distinguish a real cycle
+    from noise; matches this file's existing MIN_YEARS-style floors
+    (ROIC_CORROBORATION_MIN_DATA_YEARS) rather than inventing a
+    partial-credit scheme. No flag fires in this case -- an unremarkable
+    young company shouldn't get a permanent "insufficient data" scar on
+    every valuation.
+
+    Ratio test used when avg_margin and current_margin share a sign (both
+    positive or both negative); falls back to an absolute percentage-point
+    spread when the sign is unstable or avg_margin is near zero -- same
+    reasoning as ROIC_CORROBORATION_MAX_SPREAD's own absolute-vs-ratio
+    choice (a ratio is undefined/meaningless when the denominator can flip
+    sign).
+
+    UNLIKE every other anomaly guard in this file (terminal_value_dominance_
+    note, low_growth_rate_note, extreme_reinvestment_rate_note,
+    high_growth_rate_note, calc_gated_return_on_capital's ROIC
+    corroboration), this is not flag-only -- when triggered, the returned
+    ebit_to_use actually replaces what feeds calc_adj_ebit() downstream.
+    Deliberate: those guards ask "is this correctly-computed result
+    unusual?"; this asks "is the EBIT input itself even the right number to
+    feed in?" -- the same category calc_adj_ebit()'s own R&D adjustment
+    already occupies (an input correction, not a result flag). Every
+    trigger is still surfaced -- via `notes` in the batch path
+    (cyclical_ebit_normalization_note()) and via detail-dict keys in the
+    Excel report -- so it is never a SILENT correction, only a
+    non-flag-gated one.
+
+    A real, accepted limitation: this cannot distinguish a genuine temporary
+    cyclical spike (PARR/DHT/CSTM) from a genuine permanent structural
+    margin improvement -- Damodaran's formula has no way to tell the two
+    apart, and neither does this implementation. Live-verified against META
+    (real, well-documented multi-year margin recovery, not a data anomaly)
+    rather than assumed safe -- see docs/known_errors.md 2026-09-22.
+    """
+    margins = []
+    for r in annual_reports[:max_years]:
+        rev = r.get("totalRevenue")
+        ebit = r.get("ebit")
+        if rev and rev > 0 and ebit is not None:
+            margins.append(ebit / rev)
+
+    years_used = len(margins)
+    if years_used < min_years or not current_revenue or current_revenue <= 0:
+        return raw_ebit, {
+            "applied": False,
+            "reason": "insufficient_history" if years_used < min_years else "no_current_revenue",
+            "years_used": years_used,
+        }
+
+    avg_margin = sum(margins) / years_used
+    current_margin = raw_ebit / current_revenue
+    same_sign = (avg_margin >= 0) == (current_margin >= 0)
+
+    triggered = False
+    if same_sign and abs(avg_margin) > 0.001:
+        ratio = current_margin / avg_margin
+        triggered = ratio > k or ratio < (1.0 / k)
+    else:
+        triggered = abs(current_margin - avg_margin) > absolute_spread
+
+    if not triggered:
+        return raw_ebit, {
+            "applied": False,
+            "reason": "within_normal_range",
+            "years_used": years_used,
+            "avg_margin": avg_margin,
+            "current_margin": current_margin,
+        }
+
+    normalized_ebit = avg_margin * current_revenue
+    logger.info(
+        f"{ticker}: cyclical EBIT normalization applied -- current margin "
+        f"{current_margin:.1%} vs. {years_used}yr avg {avg_margin:.1%}, "
+        f"using ${normalized_ebit:,.0f} instead of raw TTM ${raw_ebit:,.0f}"
+    )
+    return normalized_ebit, {
+        "applied": True,
+        "years_used": years_used,
+        "avg_margin": avg_margin,
+        "current_margin": current_margin,
+        "raw_ebit": raw_ebit,
+        "normalized_ebit": normalized_ebit,
+    }
+
+
 def calc_adj_bv_equity(bal_sht, amort_schedule):
     if EQUITY_OVERRIDE is not None:
         base_equity = EQUITY_OVERRIDE
@@ -1333,6 +1509,31 @@ def high_growth_rate_note(growth_rate: float, cap: float = 0.30) -> str:
         "extraordinary competitive advantage or a data anomaly (a single "
         "distorted quarter feeding the reinvestment-rate/ROC inputs); "
         "verify before trusting it."
+    )
+
+
+def cyclical_ebit_normalization_note(diag: dict) -> str:
+    """Flag when calc_cyclical_normalized_ebit() actually swapped in the
+    margin-normalized EBIT -- unlike the other *_note() functions in this
+    file, this documents a correction that already happened (see
+    calc_cyclical_normalized_ebit()'s docstring for why this one input swap
+    is not flag-only), not a result to independently verify.
+
+    Only wired into the batch path (_value_stock_fcff()) -- the detail path
+    has no `notes` field; it gets the same information as new detail-dict
+    keys in the Excel report instead, same precedent as
+    high_growth_rate_note()'s own batch-only wiring (see its docstring)."""
+    if not diag or not diag.get("applied"):
+        return ""
+    return (
+        f"EBIT normalized using Damodaran's relative-margin method: TTM "
+        f"operating margin ({diag['current_margin']:.1%}) diverges from the "
+        f"{diag['years_used']}yr average margin ({diag['avg_margin']:.1%}) "
+        f"beyond the cyclical-normalization threshold -- used the average "
+        f"margin applied to current revenue (${diag['normalized_ebit']:,.0f}) "
+        f"instead of raw TTM EBIT (${diag['raw_ebit']:,.0f}); verify this "
+        "reflects genuine cyclical mean reversion, not a real structural "
+        "change in the business, before trusting the resulting growth rate."
     )
 
 
@@ -2250,11 +2451,27 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         amort_schedule = capitalizerAndD(ticker, rd_years, MY_API_KEY)
         logger.info(f"Amortization Schedule {amort_schedule}")
 
+        # Cyclical EBIT normalization (Damodaran's "relative average over
+        # time" method, 2026-09-22) — must run BEFORE calc_adj_ebit(), on
+        # the raw TTM figure, same as the R&D adjustment that follows it.
+        # Wrapped in its own try/except that degrades to the raw TTM figure
+        # on any failure — a thin annual-history fetch failing must never
+        # add a new failure mode to the nightly ~2,300-ticker batch. See
+        # calc_cyclical_normalized_ebit()'s docstring.
+        try:
+            annual_reports = annual_income_statement(ticker, MY_API_KEY)
+            cyclical_ebit, cyclical_diag = calc_cyclical_normalized_ebit(
+                ticker, inc_stmnt["ebit"][0], inc_stmnt["totalRevenue"][0], annual_reports
+            )
+        except Exception as exc:
+            logger.warning(f"{ticker}: cyclical EBIT normalization skipped ({exc}) — using raw TTM EBIT.")
+            cyclical_ebit, cyclical_diag = inc_stmnt["ebit"][0], {"applied": False, "reason": f"fetch_failed: {exc}"}
+
         # Pre-tax adjusted EBIT — used as the base for projections so that
         # growth is applied to EBIT rather than EBIAT or FCFF. Adjust at the
         # EBIT level (2026-09-10 fix), then derive EBIAT from it — not the
         # other way around. See calc_adj_ebit()'s docstring.
-        adjusted_ebit = calc_adj_ebit(inc_stmnt["ebit"][0], amort_schedule)
+        adjusted_ebit = calc_adj_ebit(cyclical_ebit, amort_schedule)
         adjusted_ebiat = adjusted_ebit * (1 - eff_tax_rate)
         firm_reinvestment = calc_reinvestment(
             capex, depreciation, chng_nc_wc, amort_schedule
@@ -2390,6 +2607,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 low_growth_rate_note(growth_rate, RISK_FREE),
                 extreme_reinvestment_rate_note(reinvestment_rate),
                 high_growth_rate_note(growth_rate),
+                cyclical_ebit_normalization_note(cyclical_diag),
             ) if n
         )
 
@@ -2946,7 +3164,17 @@ def _value_stock_detail_fcff(
         depreciation = fcff_data[3]
 
         amort_schedule = capitalizerAndD(ticker, rd_years, MY_API_KEY)
-        adjusted_ebit = calc_adj_ebit(inc_stmnt["ebit"][0], amort_schedule)
+
+        try:
+            annual_reports = annual_income_statement(ticker, MY_API_KEY)
+            cyclical_ebit, cyclical_diag = calc_cyclical_normalized_ebit(
+                ticker, inc_stmnt["ebit"][0], inc_stmnt["totalRevenue"][0], annual_reports
+            )
+        except Exception as exc:
+            logger.warning(f"{ticker}: cyclical EBIT normalization skipped ({exc}) — using raw TTM EBIT.")
+            cyclical_ebit, cyclical_diag = inc_stmnt["ebit"][0], {"applied": False, "reason": f"fetch_failed: {exc}"}
+
+        adjusted_ebit = calc_adj_ebit(cyclical_ebit, amort_schedule)
         adjusted_ebiat = adjusted_ebit * (1 - eff_tax_rate)
         firm_reinvestment = calc_reinvestment(
             capex, depreciation, chng_nc_wc, amort_schedule
@@ -3169,7 +3397,12 @@ def _value_stock_detail_fcff(
             "cik": cik,
             "valuation_date": str(date.today()),
             # --- Inputs ---
-            "normalized_ebit": inc_stmnt["ebit"][0],
+            "raw_ttm_ebit": inc_stmnt["ebit"][0],
+            "cyclical_normalization_applied": cyclical_diag.get("applied", False),
+            "cyclical_avg_margin": cyclical_diag.get("avg_margin"),
+            "cyclical_current_margin": cyclical_diag.get("current_margin"),
+            "cyclical_years_used": cyclical_diag.get("years_used"),
+            "cyclical_normalized_ebit": cyclical_diag.get("normalized_ebit"),
             "adjusted_ebit": adjusted_ebit,
             "interest_expense": inc_stmnt["interest_expense"][0],
             "capex": capex,
@@ -3676,7 +3909,11 @@ def _generate_xlsx_fcff(
     r += 1
 
     inputs = [
-        ("Normalized EBIT (before adjustments)", d["normalized_ebit"], "dollar"),
+        ("Raw TTM EBIT (before adjustments)", d["raw_ttm_ebit"], "dollar"),
+        ("Cyclical Nyr Avg Operating Margin", d["cyclical_avg_margin"], "percent"),
+        ("Cyclical Current TTM Operating Margin", d["cyclical_current_margin"], "percent"),
+        ("Cyclical Normalization Applied?", "Yes" if d["cyclical_normalization_applied"] else "No", "text"),
+        ("Cyclically Normalized EBIT", d["cyclical_normalized_ebit"], "dollar"),
         ("Adjusted EBIT", d["adjusted_ebit"], "dollar"),
         ("Adjusted Interest Expense", d["interest_expense"], "dollar"),
         ("Adjusted Capital Spending (avg 5yr)", d["capex"], "dollar"),
