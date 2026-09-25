@@ -851,9 +851,10 @@ def calc_depreciation(cash_flw):
     return cash_flw["depreciation"][0]
 
 
-def calc_chng_wc(bal_sht, inc_stmnt=None):
+def calc_chng_wc(bal_sht):
     """
-    Current-year (TTM) change in non-cash working capital only.
+    Current-year (TTM) change in non-cash working capital -- the raw,
+    observed delta, unmodified regardless of sign.
 
     Reverted 2026-09-13 to current-year-only -- was a 5-year average of
     deltas, added 2026-09-10 (external review, finding #4). Same reasoning
@@ -863,16 +864,21 @@ def calc_chng_wc(bal_sht, inc_stmnt=None):
     change either -- always a single current-year figure, same as every
     other reinvestment component.
 
-    Negative-value override, matching Ginzu's D10 formula exactly:
-    `=IF(B20<0, (B18-C18)*(B19/B18), B20)`. If the raw current-year delta is
-    negative (working capital released, which would otherwise add to cash
-    flow), Ginzu doesn't trust the isolated swing at face value -- it
-    re-derives the change as (dollar revenue growth) x (current non-cash-
-    WC-to-revenue ratio), i.e. assumes working capital scales
-    proportionally with revenue growth rather than accepting a one-off
-    release. Requires inc_stmnt (totalRevenue[0]/[1]) to apply -- degrades
-    to the raw (negative) delta, unadjusted, if inc_stmnt is omitted or
-    lacks a prior-year revenue figure, rather than guessing.
+    2026-09-25: the negative-value override that used to sit here (Ginzu's
+    own `=IF(B20<0, (B18-C18)*(B19/B18), B20)` re-derivation, replacing an
+    observed negative delta with a revenue-growth-scaled modeled figure)
+    was removed -- see docs/known_errors.md 2026-09-25 for the full
+    empirical case. A negative change in non-cash working capital (capital
+    released back to the business) is economically legitimate on its own;
+    it is not evidence of a bad data point that needs correcting.
+    calc_chng_wc() belongs to the OBSERVED DATA layer -- it reports what
+    actually happened. Any future normalization of working capital belongs
+    in a separate, explicit normalization step (the same OBSERVED DATA !=
+    NORMALIZED ECONOMICS != FORECAST ASSUMPTION distinction this file
+    already draws for EBIT via calc_cyclical_normalized_ebit()), not
+    silently inside the raw fetch/calc path. The `inc_stmnt` parameter this
+    override used to need is gone with it -- nothing else in this function
+    ever needed the income statement.
     """
     n = len(bal_sht["total_current_assets"])
     if n < 2:
@@ -883,15 +889,7 @@ def calc_chng_wc(bal_sht, inc_stmnt=None):
             bal_sht["total_current_liabilities"][i] - bal_sht["short_term_debt"][i]
         )
 
-    curr_nc_wc = _nc_wc(0)
-    chng_nc_wc = curr_nc_wc - _nc_wc(1)
-
-    if chng_nc_wc < 0 and inc_stmnt is not None:
-        revenue = inc_stmnt.get("totalRevenue", [])
-        if len(revenue) >= 2 and revenue[0] != 0:
-            chng_nc_wc = (revenue[0] - revenue[1]) * (curr_nc_wc / revenue[0])
-
-    return chng_nc_wc
+    return _nc_wc(0) - _nc_wc(1)
 
 
 def capitalizerAndD(ticker, rd_years, api_key):
@@ -990,7 +988,7 @@ def calc_fcff(inc_stmnt, bal_sht, cash_flw, eff_tax_rate):
     logger.info(f"ebiat {ebiat:,.2f}")
     capex = calc_capital_expenditures(cash_flw)
     logger.info(f"Capex {capex:,.2f}")
-    chng_nc_wc = calc_chng_wc(bal_sht, inc_stmnt)
+    chng_nc_wc = calc_chng_wc(bal_sht)
     logger.info(f"Change WC {chng_nc_wc:,.2f}")
     depreciation = calc_depreciation(cash_flw)
     logger.info(f"Depreciation {depreciation:,.2f}")
