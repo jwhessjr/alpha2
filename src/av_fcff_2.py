@@ -31,6 +31,8 @@ from av_fetcher import av_fetch
 from config import INTRINIO_KEY
 import json
 import logging
+import math
+import statistics
 import os
 import sys
 import time
@@ -472,6 +474,27 @@ def annual_cash_flow_statement(ticker, api_key, years: int = CYCLICAL_MARGIN_MAX
         _intrinio_annual,
         _av_annual,
         "annual cash flow (cyclical reinvestment normalization)",
+    )
+
+
+
+def annual_balance_sheet(ticker, api_key, years: int = 4):
+    """Up to ``years`` annual balance sheets, most-recent-first.
+
+    Used only by the anomalous-reinvestment fallback.  The fallback needs a
+    multi-year *level* sales-to-capital ratio; it must not infer capital
+    efficiency from the same current-period reinvestment number that triggered
+    the anomaly.  Intrinio is primary and AV is the normal provider fallback.
+    """
+    def _av_annual():
+        raw = av_fetch("BALANCE_SHEET", symbol=ticker).get("annualReports", [])
+        return raw[:years]
+
+    return _fetch_with_fallback(
+        ticker,
+        lambda: hg_dcflib.get_bal_sheet_intrinio_annual(ticker, INTRINIO_KEY, years=years),
+        _av_annual,
+        "annual balance sheet (sales/capital reinvestment fallback)",
     )
 
 
@@ -1873,6 +1896,117 @@ def cyclical_reinvestment_normalization_note(diag: dict) -> str:
     )
 
 
+
+def calc_sales_capital_reinvestment_fallback(
+    ticker: str,
+    current_revenue: float,
+    adjusted_ebiat: float,
+    annual_income_reports: list,
+    annual_balance_reports: list,
+) -> tuple[float | None, float | None, dict]:
+    """Independent forward growth/reinvestment path for anomalous wealth creators.
+
+    This is deliberately *not* another smoothing of the observed accounting
+    reinvestment rate.  When a wealth creator (ROIC > WACC) has an observed
+    explicit-period RR outside [0, 1], the production RR can be dominated by
+    depreciation/capex timing or working-capital releases.  The fallback uses
+    two independent operating quantities tested on the 88-company anomaly set:
+
+      revenue growth = 3-year endpoint CAGR of annual revenue
+      sales/capital  = median annual level Revenue / Invested Capital
+      required reinvestment = expected Delta Revenue / sales-to-capital
+      forward RR = required reinvestment / current adjusted EBIAT
+
+    Historical invested capital here is book common equity + interest-bearing
+    debt - cash/short-term investments.  Only positive capital and positive
+    sales/capital observations are admitted.  R&D capitalization remains in
+    the authoritative current ROIC/EBIAT path; this fallback intentionally uses
+    a simple independently observable capital-efficiency measure rather than
+    reconstructing the same current accounting RR through another route.
+
+    Returns (forward_growth, forward_rr, diagnostic).  Any thin/bad history is
+    a no-op: callers retain the raw production growth and RR.
+    """
+    def sf(x):
+        try:
+            x = float(x)
+            return x if math.isfinite(x) else None
+        except (TypeError, ValueError):
+            return None
+
+    if adjusted_ebiat is None or adjusted_ebiat <= 0 or not current_revenue or current_revenue <= 0:
+        return None, None, {"applied": False, "reason": "nonpositive_current_base"}
+
+    revenues = []
+    for row in annual_income_reports[:4]:
+        rev = sf(row.get("totalRevenue"))
+        if rev is not None and rev > 0:
+            revenues.append(rev)
+        else:
+            revenues.append(None)
+
+    if len(revenues) < 4 or revenues[0] is None or revenues[3] is None:
+        return None, None, {"applied": False, "reason": "insufficient_revenue_history"}
+
+    revenue_growth = (revenues[0] / revenues[3]) ** (1.0 / 3.0) - 1.0
+
+    level_stc = []
+    for inc, bal in zip(annual_income_reports[:4], annual_balance_reports[:4]):
+        rev = sf(inc.get("totalRevenue"))
+        equity = sf(bal.get("totalShareholderEquity"))
+        ltd = sf(bal.get("longTermDebt"))
+        std = sf(bal.get("shortTermDebt"))
+        cash = sf(bal.get("cashAndShortTermInvestments"))
+        if cash is None:
+            c = sf(bal.get("cashAndCashEquivalentsAtCarryingValue")) or 0.0
+            sti = sf(bal.get("shortTermInvestments")) or 0.0
+            cash = c + sti
+        if None in (rev, equity, ltd, std) or rev <= 0:
+            continue
+        invested_capital = equity + ltd + std - cash
+        if invested_capital <= 0:
+            continue
+        ratio = rev / invested_capital
+        if math.isfinite(ratio) and ratio > 0:
+            level_stc.append(ratio)
+
+    if len(level_stc) < 2:
+        return None, None, {"applied": False, "reason": "insufficient_sales_capital_history"}
+
+    level_stc_median = statistics.median(level_stc)
+    delta_revenue = current_revenue * revenue_growth
+    required_reinvestment = delta_revenue / level_stc_median
+    forward_rr = required_reinvestment / adjusted_ebiat
+    if not (math.isfinite(revenue_growth) and math.isfinite(forward_rr)):
+        return None, None, {"applied": False, "reason": "nonfinite_fallback"}
+
+    diag = {
+        "applied": True,
+        "revenue_growth": revenue_growth,
+        "level_stc_median": level_stc_median,
+        "level_stc_n": len(level_stc),
+        "required_reinvestment": required_reinvestment,
+        "forward_rr": forward_rr,
+    }
+    logger.warning(
+        f"{ticker}: anomalous wealth-creator reinvestment fallback applied -- "
+        f"revenue CAGR={revenue_growth:.1%}, median sales/capital={level_stc_median:.2f}, "
+        f"forward RR={forward_rr:.1%}."
+    )
+    return revenue_growth, forward_rr, diag
+
+
+def sales_capital_reinvestment_fallback_note(diag: dict) -> str:
+    if not diag or not diag.get("applied"):
+        return ""
+    return (
+        "Anomalous wealth-creator reinvestment fallback applied: observed RR was outside "
+        "[0%,100%] while ROIC exceeded WACC; explicit growth uses 3yr revenue CAGR "
+        f"({diag['revenue_growth']:.1%}) and reinvestment uses median level sales/capital "
+        f"({diag['level_stc_median']:.2f}x), implying forward RR {diag['forward_rr']:.1%}."
+    )
+
+
 def calc_growth_rate(reinvestment_rate, return_on_capital):
     growth_rate = reinvestment_rate * return_on_capital
     logger.info(f"Growth Rate = {growth_rate:,.4f}")
@@ -2911,6 +3045,37 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         )
         logger.info(f"disc rate {discount_rate:,.4f}")
 
+        # Anomalous wealth-creator fallback (2026-09-29): keep the raw
+        # accounting RR for auditability, but do not let it drive the DCF
+        # when ROIC > WACC and RR is outside [0,1].  Use independent
+        # operating growth + level sales/capital economics instead.  A
+        # ticker already handled by the dedicated cyclical normalization
+        # path is left alone so the two normalization regimes never stack.
+        sales_capital_diag = {"applied": False, "reason": "gate_not_triggered"}
+        if (
+            return_on_capital > discount_rate
+            and (reinvestment_rate < 0.0 or reinvestment_rate > 1.0)
+            and not cyclical_diag.get("applied")
+        ):
+            try:
+                fallback_income = annual_income_statement(ticker, MY_API_KEY, years=4)
+                fallback_balance = annual_balance_sheet(ticker, MY_API_KEY, years=4)
+                fallback_growth, fallback_rr, sales_capital_diag = (
+                    calc_sales_capital_reinvestment_fallback(
+                        ticker, inc_stmnt["totalRevenue"][0], adjusted_ebiat,
+                        fallback_income, fallback_balance,
+                    )
+                )
+                if fallback_growth is not None and fallback_rr is not None:
+                    growth_rate = fallback_growth
+                    reinvestment_rate = fallback_rr
+            except Exception as exc:
+                sales_capital_diag = {"applied": False, "reason": f"fetch_failed: {exc}"}
+                logger.warning(
+                    f"{ticker}: anomalous wealth-creator reinvestment fallback skipped "
+                    f"({exc}) -- retaining production RR/growth."
+                )
+
         terminal_cost_of_capital = calc_discount_rate(
             inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM,
             de_cap=hg_dcflib.get_industry_de(industry),
@@ -2993,6 +3158,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 high_growth_rate_note(growth_rate),
                 cyclical_ebit_normalization_note(cyclical_diag),
                 cyclical_reinvestment_normalization_note(reinvest_diag),
+                sales_capital_reinvestment_fallback_note(sales_capital_diag),
             ) if n
         )
 
@@ -3651,6 +3817,34 @@ def _value_stock_detail_fcff(
             cost_of_equity * percent_equity
         )
 
+        # Same anomalous wealth-creator fallback as the batch path.  The
+        # detail/Excel route must use identical forecast assumptions or it
+        # ceases to be a diagnostic view of production.
+        sales_capital_diag = {"applied": False, "reason": "gate_not_triggered"}
+        if (
+            return_on_capital > discount_rate
+            and (reinvestment_rate < 0.0 or reinvestment_rate > 1.0)
+            and not cyclical_diag.get("applied")
+        ):
+            try:
+                fallback_income = annual_income_statement(ticker, MY_API_KEY, years=4)
+                fallback_balance = annual_balance_sheet(ticker, MY_API_KEY, years=4)
+                fallback_growth, fallback_rr, sales_capital_diag = (
+                    calc_sales_capital_reinvestment_fallback(
+                        ticker, inc_stmnt["totalRevenue"][0], adjusted_ebiat,
+                        fallback_income, fallback_balance,
+                    )
+                )
+                if fallback_growth is not None and fallback_rr is not None:
+                    growth_rate = fallback_growth
+                    reinvestment_rate = fallback_rr
+            except Exception as exc:
+                sales_capital_diag = {"applied": False, "reason": f"fetch_failed: {exc}"}
+                logger.warning(
+                    f"{ticker}: anomalous wealth-creator reinvestment fallback skipped "
+                    f"({exc}) -- retaining production RR/growth."
+                )
+
         # Stable phase
         stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
         stable_cost_of_equity = RISK_FREE + (stable_levered_beta * EQ_PREM)
@@ -3851,6 +4045,7 @@ def _value_stock_detail_fcff(
             "growth_period": total_explicit_years,
             "growth_rate": growth_rate,
             "reinvestment_rate": reinvestment_rate,
+            "sales_capital_fallback": sales_capital_diag,
             "return_on_capital": return_on_capital,
             "beta": levered_beta,
             "stable_beta": stable_beta,
