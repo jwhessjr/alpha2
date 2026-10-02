@@ -30,6 +30,8 @@ _indname_df: pd.DataFrame | None = None
 _betas_df: pd.DataFrame | None = None
 _default_spread_df: pd.DataFrame | None = None
 _rd_amort_df: pd.DataFrame | None = None
+_industry_growth_df: pd.DataFrame | None = None
+_industry_sales_to_capital_df: pd.DataFrame | None = None
 
 # Damodaran annual data files — downloaded once per calendar year and cached locally.
 # Filenames follow the pattern <name>_YYYY<ext> (e.g. indname_2025.xlsx, betas_2025.xls).
@@ -154,6 +156,33 @@ def _get_rd_amort() -> pd.DataFrame:
             _DATA_DIR / "RD_Amortization.xlsx", sheet_name="Amort Years"
         )
     return _rd_amort_df
+
+
+def _get_industry_growth() -> pd.DataFrame:
+    """Cached loader for Damodaran's industry-average revenue-growth table,
+    used by get_industry_revenue_growth(). Deliberately does NOT go through
+    _get_damodaran_file()'s yearly download/fallback pipeline — same
+    reasoning as _get_default_spread()/_get_rd_amort() above (git-tracked,
+    manually curated, no auto-refresh).
+
+    2026-10-01: betas.xlsx's "Industry Averages" sheet (already used by
+    get_beta()/get_industry_de()) does NOT carry a revenue-growth column —
+    confirmed by reading its actual columns directly before assuming a new
+    file was needed. This table ("Annual Average Revenue growth - Last 5
+    years") was exported from the same underlying Damodaran "Industry
+    Averages (US)" dataset via fcffsimpleginzu.xlsx (the Ginzu reference
+    workbook already validated against this project's standalone Ginzu
+    FCFF engine, ~/Desktop/HessGrp_RR_Work_2026-09/ginzu/) rather than
+    re-downloaded separately — same source Damodaran publishes, just the
+    growth column specifically, since that's all this lookup needs. See
+    docs/decisions.md 2026-10-01 for the HessGrp FCFF growth-forecast
+    methodology this feeds."""
+    global _industry_growth_df
+    if _industry_growth_df is None:
+        _industry_growth_df = pd.read_excel(
+            _DATA_DIR / "industry_revenue_growth.xlsx", sheet_name="US Industry Growth"
+        )
+    return _industry_growth_df
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Set the overall logger level
@@ -1697,6 +1726,126 @@ def get_rAndD_intrinio(company: str, rd_years: int, apiKey: str):
     return {"research_and_development": rd_amount}, years_to_process
 
 
+# ---------------------------------------------------------------------------
+# Quarterly-derived, age-tagged 12-month R&D history (2026-10-01, corrected)
+# -- Ginzu adapter path only
+# ---------------------------------------------------------------------------
+# get_rAndD_intrinio()/get_rAndD() above are UNCHANGED and still back the
+# OLD HessGrp FCFF path (research_and_development()/capitalizerAndD() in
+# scripts/av_fcff_2.py) exactly as before.
+#
+# CORRECTION (2026-10-01, same day): an earlier version of this section
+# switched the Ginzu adapter's R&D history source from HessGrp's
+# established quarterly-derived, valuation-date-aligned 12-month
+# construction to Intrinio's true fiscal-year ("FY") periods. Jim
+# explicitly rejected that period-basis change -- HessGrp's canonical flow-
+# variable methodology is quarterly-derived trailing-12-month periods, not
+# fiscal-year statements, even where FY data happen to be directly
+# available. That part is reversed here.
+#
+# What's KEPT from the earlier version: real period identity attached to
+# each constructed 12-month observation, so the adapter can determine each
+# observation's AGE correctly (never from list position alone) -- the
+# actual bug this whole effort target. The fix for the real root cause
+# (get_rAndD_intrinio() silently capping history at _intrinio_period_ids()'s
+# default n=20 quarters = 5 years, regardless of how many years were
+# requested) is corrected here too, by requesting enough quarters directly.
+#
+# Mechanics are otherwise IDENTICAL to get_rAndD_intrinio()/get_rAndD()
+# above: non-overlapping blocks of 4 consecutive quarters, most-recent
+# block first, each block's quarterly R&D summed into one trailing-12-
+# month figure -- the same construction, just not capped and not fiscal-
+# year-blind. "Age" for a given 12-month block is derived from its most
+# recent quarter's real (fiscal_year, fiscal_period) position in time (a
+# monotonic quarter-sequence index, divided by 4) -- never from the
+# block's position in the returned list -- so a genuine gap in the
+# vendor's underlying quarterly coverage correctly produces a larger age
+# jump instead of silently being absorbed into "the next position."
+
+
+def get_rAndD_ttm_periods_intrinio(company: str, max_years: int, apiKey: str) -> list[tuple[int, float]]:
+    """
+    HessGrp's established quarterly-derived, valuation-date-aligned 12-
+    month R&D history -- same construction as get_rAndD_intrinio() (non-
+    overlapping blocks of 4 consecutive quarters, most recent first, each
+    block's quarterly rdexpense summed), but (a) not capped at 5 years --
+    requests max_years*4 quarters directly, the actual root cause of the
+    history-depth problem found in the 12-company controlled validation --
+    and (b) tags each block with its anchor quarter's real fiscal_year
+    instead of returning a bare, position-ordered list.
+
+    Returns a list of (anchor_fiscal_year, rd_expense) tuples, most-recent-
+    first. anchor_fiscal_year is the REAL fiscal_year of each block's most
+    recent (anchor) quarter -- for a company with no gaps in its quarterly
+    coverage, consecutive blocks' anchor quarters are always exactly 4
+    quarters apart, so this label decreases by exactly 1 per block; a
+    genuine gap in the vendor's underlying quarterly series correctly
+    produces a larger jump instead of being silently absorbed into "the
+    next position." A block whose anchor quarter has no determinable
+    fiscal_year is skipped entirely -- never guessed.
+
+    Raises ValueError on no coverage at all, matching get_rAndD_intrinio()'s
+    convention (triggers the Ginzu adapter's AV fallback).
+    """
+    periods = _intrinio_periods(company, "income_statement", apiKey, n=max_years * 4, period_type="QTR")
+    if not periods:
+        raise ValueError(f"No quarterly income-statement periods found for {company} on Intrinio")
+
+    num_available_years = len(periods) // 4
+    years_to_process = min(max_years, num_available_years)
+
+    result = []
+    for i in range(years_to_process):
+        block = periods[i * 4 : i * 4 + 4]
+        anchor_fy = block[0].get("fiscal_year")  # most recent quarter in this 12-month block
+        if anchor_fy is None:
+            continue  # can't establish this block's age -- skip, don't guess
+        block_rd = 0.0
+        for p in block:
+            std = _intrinio_standardized(p["id"], apiKey)
+            block_rd += safe_float(std.get("rdexpense"))
+        result.append((int(anchor_fy), block_rd))
+    return result
+
+
+def get_rAndD_ttm_periods_av(company: str, max_years: int, apiKey: str) -> list[tuple[int, float]]:
+    """
+    AV fallback equivalent of get_rAndD_ttm_periods_intrinio() -- same
+    quarterly-block construction as get_rAndD() above (non-overlapping
+    blocks of 4 consecutive quarters from AV's quarterlyReports, most-
+    recent-first), not capped, each block tagged with its anchor quarter's
+    real calendar year (parsed from fiscalDateEnding). Length <= max_years.
+    Same no-raise-on-no-coverage convention as get_rAndD() (returns []
+    rather than raising, matching that function's own behavior for this
+    provider).
+    """
+    _sleep_with_jitter()
+    url = f"https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={company}&apikey={apiKey}"
+    data = _av_get(url)
+    quarters = data.get("quarterlyReports", [])
+    if not quarters:
+        return []
+
+    num_available_years = len(quarters) // 4
+    years_to_process = min(max_years, num_available_years)
+
+    result = []
+    for i in range(years_to_process):
+        block = quarters[i * 4 : i * 4 + 4]
+        fde = block[0].get("fiscalDateEnding")
+        if not fde:
+            continue  # can't establish this block's age -- skip, don't guess
+        try:
+            anchor_year = int(str(fde)[:4])
+        except (TypeError, ValueError):
+            continue
+        block_rd = 0.0
+        for q in block:
+            block_rd += safe_float(q.get("researchAndDevelopment", "0"))
+        result.append((anchor_year, block_rd))
+    return result
+
+
 def get_quote_intrinio(company: str, apiKey: str):
     """
     Intrinio-backed equivalent of get_quote() — same non-standard bare
@@ -2147,6 +2296,333 @@ def get_risk_free(FRED_KEY):
     return RISK_FREE
 
 
+# ---------------------------------------------------------------------------
+# DGS10 risk-free rate + Damodaran Implied ERP retrieval hierarchy (2026-10-01)
+# ---------------------------------------------------------------------------
+# New, additive market-input sourcing for the Ginzu FCFF adapter path only
+# (lib/hg_fcff_ginzu_adapter.py) -- see docs/decisions.md 2026-10-01
+# ("Canonical market inputs: DGS10 + Damodaran Implied ERP, Ginzu path
+# only"). get_risk_free() (GS10) and get_erp() above are UNCHANGED and
+# still back the old HessGrp FCFF path (scripts/av_fcff_2.py's RISK_FREE/
+# EQ_PREM/refresh_market_data()) exactly as before -- this section does
+# not touch them or anything the old path depends on.
+#
+# Methodology decision (already made, not re-litigated here):
+#   - RFR: FRED DGS10 (10-Year Treasury Constant Maturity Rate, daily),
+#     latest valid observation with observation_date <= valuation_date.
+#   - ERP: Damodaran's published "Implied ERP" (Trailing 12 month, with
+#     adjusted payout -- the same first-percentage-in-the-paragraph figure
+#     get_erp() above already extracts; this is NOT Country ERP, a
+#     structurally separate number sourced from a different workbook sheet
+#     entirely -- see get_industry_de()/the Ginzu adapter's
+#     MATURE_MARKET_ERP_CONSTANT, never derived from this function).
+#   - Hierarchy: current live retrieval -> latest valid cached observation
+#     (dated <= valuation_date) -> existing fallback constant, each
+#     explicitly labeled in the returned dict's "source" field.
+
+
+class MarketDataFailure:
+    """Failure-code taxonomy for get_risk_free_dgs10()/
+    get_erp_implied_damodaran() -- replaces the old get_risk_free()'s
+    single-bucket None-on-any-failure behavior (see docs/known_errors.md
+    2026-10-01 FRED retrieval diagnostic). RFR and ERP failures are always
+    reported independently -- never share or overwrite one another's
+    failure_code/failure_detail."""
+    TIMEOUT = "timeout"
+    NETWORK_ERROR = "network_error"
+    HTTP_ERROR = "http_error"
+    AUTH_ERROR = "auth_error"
+    MALFORMED_RESPONSE = "malformed_response"
+    PARSING_ERROR = "parsing_error"
+    MISSING_OBSERVATION = "missing_observation"
+    UNEXPECTED_EXCEPTION = "unexpected_exception"
+
+
+def get_risk_free_dgs10(FRED_KEY, valuation_date=None):
+    """
+    Fetch the latest valid FRED DGS10 (10-Year Treasury Constant Maturity
+    Rate, daily series) observation with observation_date <= valuation_date.
+    DGS10 has real gaps (weekends, federal holidays, occasional publication
+    gaps, marked "." by FRED) -- requests several recent observations and
+    walks backward from valuation_date to the first valid one, rather than
+    requiring an exact-date match or forward-filling from a future date.
+
+    Never raises. Always returns a dict:
+        {"value": float | None, "observation_date": str (ISO) | None,
+         "failure_code": str | None, "failure_detail": str | None}
+    value/observation_date are None iff failure_code is set, and vice versa.
+    """
+    if valuation_date is None:
+        valuation_date = datetime.date.today()
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": "DGS10",
+        "api_key": FRED_KEY,
+        "file_type": "json",
+        "sort_order": "desc",
+        "observation_end": valuation_date.isoformat(),
+        "limit": 10,  # a handful, in case the most recent are "." (missing)
+    }
+    try:
+        response = _get_with_retry(url, params=params)
+    except requests.exceptions.Timeout:
+        return {"value": None, "observation_date": None,
+                "failure_code": MarketDataFailure.TIMEOUT,
+                "failure_detail": "FRED DGS10 request timed out after retries"}
+    except requests.exceptions.ConnectionError as e:
+        return {"value": None, "observation_date": None,
+                "failure_code": MarketDataFailure.NETWORK_ERROR, "failure_detail": str(e)}
+    except requests.exceptions.RequestException as e:
+        return {"value": None, "observation_date": None,
+                "failure_code": MarketDataFailure.UNEXPECTED_EXCEPTION, "failure_detail": str(e)}
+
+    if response.status_code != 200:
+        detail = f"HTTP {response.status_code}"
+        code = MarketDataFailure.HTTP_ERROR
+        try:
+            body = response.json()
+            msg = body.get("error_message", "")
+            if msg:
+                detail = f"HTTP {response.status_code}: {msg}"
+                if "api_key" in msg.lower():
+                    code = MarketDataFailure.AUTH_ERROR
+        except Exception:
+            pass
+        return {"value": None, "observation_date": None, "failure_code": code, "failure_detail": detail}
+
+    try:
+        data = response.json()
+    except Exception as e:
+        return {"value": None, "observation_date": None,
+                "failure_code": MarketDataFailure.MALFORMED_RESPONSE,
+                "failure_detail": f"JSON parse failed: {e}"}
+
+    observations = data.get("observations", [])
+    if not observations:
+        return {"value": None, "observation_date": None,
+                "failure_code": MarketDataFailure.MISSING_OBSERVATION,
+                "failure_detail": "No observations returned for the requested window"}
+
+    for obs in observations:
+        raw_value = obs.get("value")
+        obs_date_str = obs.get("date")
+        if raw_value in (None, ".", ""):
+            continue  # FRED's own marker for a missing observation
+        try:
+            obs_date = datetime.date.fromisoformat(obs_date_str)
+        except Exception:
+            continue
+        if obs_date > valuation_date:
+            continue  # defensive -- observation_end should already enforce this
+        try:
+            value = safe_float(raw_value) / 100
+        except Exception:
+            return {"value": None, "observation_date": None,
+                    "failure_code": MarketDataFailure.PARSING_ERROR,
+                    "failure_detail": f"Could not parse observation value {raw_value!r}"}
+        logger.info(f"DGS10 {value} (observation_date={obs_date.isoformat()})")
+        return {"value": value, "observation_date": obs_date.isoformat(),
+                "failure_code": None, "failure_detail": None}
+
+    return {"value": None, "observation_date": None,
+            "failure_code": MarketDataFailure.MISSING_OBSERVATION,
+            "failure_detail": "All returned observations were missing ('.') or unparseable"}
+
+
+def get_erp_implied_damodaran():
+    """
+    Fetch Damodaran's currently published Implied ERP (Trailing 12 month,
+    with adjusted payout -- the same figure get_erp() above extracts) PLUS
+    its as-of/publication date, parsed directly from the page's own text
+    (confirmed live 2026-10-01: "Implied ERP on September 1, 2026 = 4.14%
+    (Trailing 12 month, with adjusted payout); ..."). This is the base
+    Damodaran Implied ERP -- structurally distinct from Country ERP/
+    "Mature Market ERP" (a different workbook sheet entirely; see the
+    Ginzu adapter's MATURE_MARKET_ERP_CONSTANT). This function has no
+    mechanism to read or return a Country ERP value, by construction --
+    it only ever parses the "Implied ERP on <date> = <pct>%" paragraph.
+
+    Never raises. Always returns a dict:
+        {"value": float | None, "as_of_date": str (ISO) | None,
+         "failure_code": str | None, "failure_detail": str | None}
+    as_of_date is None if the page's text doesn't match the expected
+    "Implied ERP on <Month> <Day>, <Year>" pattern -- a real possibility if
+    Damodaran changes the page's wording -- in which case value may still
+    be set (failure_code stays None) but as_of_date is explicitly null
+    rather than a guessed/fabricated date.
+    """
+    url = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/home.htm"
+    try:
+        response = _get_with_retry(url)
+    except requests.exceptions.Timeout:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.TIMEOUT,
+                "failure_detail": "Damodaran ERP page request timed out after retries"}
+    except requests.exceptions.ConnectionError as e:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.NETWORK_ERROR, "failure_detail": str(e)}
+    except requests.exceptions.RequestException as e:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.UNEXPECTED_EXCEPTION, "failure_detail": str(e)}
+
+    if response.status_code != 200:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.HTTP_ERROR,
+                "failure_detail": f"HTTP {response.status_code}"}
+
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+        text = None
+        for p in soup.find_all("p"):
+            t = p.get_text()
+            if "Implied ERP" in t:
+                text = t
+                break
+    except Exception as e:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.MALFORMED_RESPONSE,
+                "failure_detail": f"HTML parse failed: {e}"}
+
+    if text is None:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.MISSING_OBSERVATION,
+                "failure_detail": "No paragraph containing 'Implied ERP' found on the page"}
+
+    pct_match = re.search(r"(\d+\.\d+)%", text)
+    if not pct_match:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.PARSING_ERROR,
+                "failure_detail": f"No percentage found in Implied ERP paragraph: {text[:200]!r}"}
+    try:
+        value = safe_float(pct_match.group(1)) / 100
+    except Exception as e:
+        return {"value": None, "as_of_date": None,
+                "failure_code": MarketDataFailure.PARSING_ERROR,
+                "failure_detail": f"Could not convert matched percentage: {e}"}
+
+    as_of_date = None
+    date_match = re.search(r"Implied ERP on ([A-Za-z]+ \d{1,2},\s*\d{4})", text)
+    if date_match:
+        try:
+            as_of_date = datetime.datetime.strptime(date_match.group(1), "%B %d, %Y").date().isoformat()
+        except Exception:
+            as_of_date = None  # don't fabricate a date from an unparseable match
+
+    logger.info(f"Damodaran Implied ERP {value} (as_of_date={as_of_date})")
+    return {"value": value, "as_of_date": as_of_date, "failure_code": None, "failure_detail": None}
+
+
+_MARKET_DATA_CACHE_PATH = _DATA_DIR.parent / "data" / "market_data_cache.json"
+
+
+def _read_market_data_cache() -> dict:
+    """Best-effort read of the DGS10/Damodaran-ERP dated-observation cache
+    -- separate from av_fcff_2.py's data/market_data_fetch_status.json
+    (that file holds only the OLD path's most-recent-run ok/error status
+    for GS10/scraped-ERP, with no historical dated observations -- not a
+    cache in the sense Phase/CACHE REQUIREMENTS needs, and reusing it
+    would conflate two different series' provenance). Returns {} on any
+    read failure (missing file, corrupt JSON) rather than raising."""
+    try:
+        import json
+        return json.loads(_MARKET_DATA_CACHE_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _write_market_data_cache_entry(key: str, value: float, date_field: str, date_value: str) -> None:
+    """Best-effort cache write on a successful live retrieval. date_field
+    is "observation_date" (DGS10) or "as_of_date" (Damodaran ERP) -- kept
+    explicit rather than inferred from key, so a future third series
+    doesn't silently need a new special case here. Never raises -- a
+    failure to persist the cache must not block a valuation."""
+    try:
+        import json
+        cache = _read_market_data_cache()
+        cache[key] = {
+            "value": value,
+            date_field: date_value,
+            "retrieved_date": datetime.date.today().isoformat(),
+        }
+        _MARKET_DATA_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _MARKET_DATA_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+    except Exception as e:
+        logger.warning(f"Could not write market_data_cache.json entry {key!r}: {e}")
+
+
+def get_risk_free_with_hierarchy(FRED_KEY, valuation_date=None, fallback_constant=0.0425, attempt_live=True):
+    """
+    Current retrieval (DGS10) -> latest valid cached observation (dated <=
+    valuation_date) -> existing fallback constant. Always returns full
+    provenance, never raises.
+
+    Returns dict: {"value": float, "source": "live"|"cached"|"fallback",
+        "observation_date": str|None, "failure_code": str|None,
+        "failure_detail": str|None}
+    failure_code/failure_detail describe why the hierarchy advanced past
+    live retrieval (and past cache, if that also didn't apply) -- they are
+    only None when source == "live".
+    """
+    if valuation_date is None:
+        valuation_date = datetime.date.today()
+
+    if attempt_live:
+        live = get_risk_free_dgs10(FRED_KEY, valuation_date)
+        if live["failure_code"] is None:
+            _write_market_data_cache_entry("risk_free_dgs10", live["value"], "observation_date", live["observation_date"])
+            return {"value": live["value"], "source": "live",
+                    "observation_date": live["observation_date"],
+                    "failure_code": None, "failure_detail": None}
+        failure_code, failure_detail = live["failure_code"], live["failure_detail"]
+    else:
+        failure_code, failure_detail = "not_attempted", "attempt_live=False for this call"
+
+    cached = _read_market_data_cache().get("risk_free_dgs10")
+    if cached and cached.get("observation_date") and cached["observation_date"] <= valuation_date.isoformat():
+        return {"value": cached["value"], "source": "cached",
+                "observation_date": cached["observation_date"],
+                "failure_code": failure_code, "failure_detail": failure_detail}
+
+    return {"value": fallback_constant, "source": "fallback", "observation_date": None,
+            "failure_code": failure_code, "failure_detail": failure_detail}
+
+
+def get_erp_with_hierarchy(valuation_date=None, fallback_constant=0.0472, attempt_live=True):
+    """
+    Current retrieval (Damodaran Implied ERP) -> latest valid cached value
+    (as-of dated <= valuation_date) -> existing fallback constant. Never
+    interpolates and never substitutes Country ERP -- get_erp_implied_
+    damodaran() has no path to a Country ERP value at all. Always returns
+    full provenance, never raises.
+
+    Returns dict: {"value": float, "source": "live"|"cached"|"fallback",
+        "as_of_date": str|None, "failure_code": str|None, "failure_detail": str|None}
+    """
+    if valuation_date is None:
+        valuation_date = datetime.date.today()
+
+    if attempt_live:
+        live = get_erp_implied_damodaran()
+        if live["failure_code"] is None:
+            if live["as_of_date"] is not None:
+                _write_market_data_cache_entry("erp_implied_damodaran", live["value"], "as_of_date", live["as_of_date"])
+            return {"value": live["value"], "source": "live",
+                    "as_of_date": live["as_of_date"],
+                    "failure_code": None, "failure_detail": None}
+        failure_code, failure_detail = live["failure_code"], live["failure_detail"]
+    else:
+        failure_code, failure_detail = "not_attempted", "attempt_live=False for this call"
+
+    cached = _read_market_data_cache().get("erp_implied_damodaran")
+    if cached and cached.get("as_of_date") and cached["as_of_date"] <= valuation_date.isoformat():
+        return {"value": cached["value"], "source": "cached",
+                "as_of_date": cached["as_of_date"],
+                "failure_code": failure_code, "failure_detail": failure_detail}
+
+    return {"value": fallback_constant, "source": "fallback", "as_of_date": None,
+            "failure_code": failure_code, "failure_detail": failure_detail}
+
+
 _US_EXCHANGES = {
     "NYSE",
     "NasdaqGS",
@@ -2304,3 +2780,83 @@ def get_rAndD_years(industry):
             continue
 
     return rAndD_years
+
+
+def get_industry_revenue_growth(industry):
+    """
+    Damodaran US industry 5-year average revenue growth rate — the
+    industry anchor used by the HessGrp FCFF growth-forecast methodology
+    (docs/decisions.md 2026-10-01). Same substring-match convention as
+    _lookup_beta_row() (industry in row["Industry"], first match wins, per
+    row order) for consistency with every other industry lookup in this
+    file, rather than inventing a different matching rule for this one.
+
+    Defaults to the table's own "Total Market" row if industry isn't found
+    or is None/empty — a market-average fallback, same philosophy as
+    get_beta()'s 1.0 default, never raises.
+    """
+    growth_table = _get_industry_growth()
+
+    if industry:
+        for _, row in growth_table.iterrows():
+            try:
+                if industry in row["Industry"]:
+                    logger.info(f"Industry revenue growth ({row['Industry']}) = {row['Revenue Growth - Last 5 years']}")
+                    return row["Revenue Growth - Last 5 years"]
+            except TypeError:
+                continue
+
+    total_market = growth_table[growth_table["Industry"] == "Total Market"]
+    fallback = total_market["Revenue Growth - Last 5 years"].iloc[0] if len(total_market) else 0.0
+    logger.info(f"Industry revenue growth: no match for {industry!r} — using Total Market fallback {fallback}")
+    return fallback
+
+
+def _get_industry_sales_to_capital() -> pd.DataFrame:
+    """Cached loader for Damodaran's GLOBAL industry Sales/Capital table,
+    used by get_industry_sales_to_capital() -- the new HessGrp+Ginzu
+    parallel integration module's source for GinzuForecastAssumptions.
+    sales_to_capital_years1_5/years6_10 (lib/hg_fcff_ginzu_adapter.py,
+    2026-10-01). Same non-auto-refreshing, git-tracked convention as
+    _get_industry_growth()/_get_rd_amort() above.
+
+    Sourced from fcffsimpleginzu.xlsx's 'Industry Averages (Global)' sheet
+    (column 'Sales/Capital'), not the US sheet -- confirmed directly by
+    reading GinzuForecastAssumptions.sales_to_capital_years1_5's own
+    docstring in fcff_ginzu.py ("Ginzu default = Global industry avg S/C")
+    and by cross-checking CRCT's value (2.2730...) against the already-
+    locked sandbox constant used throughout the Ginzu CRCT experiments --
+    exact match. This is Ginzu's own literal default source, not a new
+    judgment call."""
+    global _industry_sales_to_capital_df
+    if _industry_sales_to_capital_df is None:
+        _industry_sales_to_capital_df = pd.read_excel(
+            _DATA_DIR / "industry_sales_to_capital.xlsx", sheet_name="Global Sales to Capital"
+        )
+    return _industry_sales_to_capital_df
+
+
+def get_industry_sales_to_capital(industry):
+    """
+    Damodaran GLOBAL industry Sales/Capital ratio -- Ginzu's own default
+    source for sales_to_capital_years1_5/years6_10 (see
+    GinzuForecastAssumptions's docstring in lib/hg_fcff_ginzu.py). Same
+    substring-match/first-match-wins/Total-Market-fallback convention as
+    get_industry_revenue_growth()/get_beta(), for consistency with every
+    other industry lookup in this codebase.
+    """
+    sc_table = _get_industry_sales_to_capital()
+
+    if industry:
+        for _, row in sc_table.iterrows():
+            try:
+                if industry in row["Industry"]:
+                    logger.info(f"Industry Sales/Capital ({row['Industry']}) = {row['Sales to Capital - Global']}")
+                    return row["Sales to Capital - Global"]
+            except TypeError:
+                continue
+
+    total_market = sc_table[sc_table["Industry"] == "Total Market"]
+    fallback = total_market["Sales to Capital - Global"].iloc[0] if len(total_market) else 1.0
+    logger.info(f"Industry Sales/Capital: no match for {industry!r} — using Total Market fallback {fallback}")
+    return fallback

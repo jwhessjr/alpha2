@@ -924,6 +924,32 @@ def capitalizerAndD(ticker, rd_years, api_key):
     prior years' R&D still has some unamortized balance, each contributing
     an equal 1/3 share to this year's Current_Year_Amortization.
 
+    rd_years here is the economic amortization LIFE (N), never the history
+    fetch count. Computing the schedule for an N-year life requires N+1
+    R&D observations (the current year plus N prior vintages still being
+    amortized) -- that N+1 "history_years" figure is derived internally,
+    below, purely to know how much history to fetch, and must never leak
+    into amort_percentage or any other divisor. Confirmed against
+    fcff_ginzu.py's validated R&D-converter port (section 2): Ginzu uses
+    amortization_years literally, both as the required prior-year count and
+    as the literal divisor -- never amortization_years + 1.
+
+    Fixed 2026-10-01 (Jim + ChatGPT reinvestment-rate work, CRCT live
+    comparison against fcff_ginzu.py): call sites were passing
+    get_rAndD_years(industry) + 1 straight into this function's rd_years
+    parameter, which this function then used BOTH as the fetch count (where
+    +1 is correct -- N+1 observations are genuinely required) AND as
+    amort_percentage's divisor (where +1 is wrong -- the divisor must be N,
+    the industry's actual amortization life). This understated
+    Current_Year_Amortization and overstated RD_Asset_Value (since both
+    share amort_percentage) by a factor of N/(N+1), overstating
+    adjusted_ebit, adjusted operating margin, and intrinsic value for every
+    R&D-capitalizing company in the universe. CRCT (rd_years=3): correct
+    amortization ~$65.8M vs. buggy ~$49.4M; correct adjusted EBIT ~$124.3M
+    vs. buggy ~$140.8M. See docs/known_errors.md 2026-10-01. The call sites
+    (_value_stock_fcff()/_value_stock_detail_fcff()) now pass
+    get_rAndD_years(industry) directly, with no +1.
+
     Fixed 2026-09-11 (external DCF review + a live Ginzu comparison, see
     docs/known_errors.md): amort_percentage was 1/(rd_years-1), not
     1/rd_years -- confirmed against Damodaran's own Ginzu R&D-converter
@@ -938,7 +964,7 @@ def capitalizerAndD(ticker, rd_years, api_key):
     AAPL (rd_years=5) ~8.9%.
     """
     rd_years = int(rd_years)
-    if rd_years <= 1:
+    if rd_years <= 0:
         # No R&D amortization for this industry — skip API call and return zeroed schedule
         return {
             "rAndDExpense": [0.0],
@@ -948,12 +974,17 @@ def capitalizerAndD(ticker, rd_years, api_key):
             "Current_Year_Amortization": 0.0,
         }
 
-    rdTable = research_and_development(ticker, rd_years, api_key)
+    # Observations required = current year + rd_years (N) prior vintages.
+    # This history_years figure is used ONLY for the fetch call and the
+    # current-year-amortization loop bound below -- never as a divisor.
+    history_years = rd_years + 1
+
+    rdTable = research_and_development(ticker, history_years, api_key)
     rd_dict, years_to_process = rdTable
     logger.info(f"rdTable = {rdTable}")
 
     if years_to_process == 0:
-        # Same zero-filled shape as the rd_years <= 1 branch above -- a
+        # Same zero-filled shape as the rd_years <= 0 branch above -- a
         # vendor returning fewer than 4 quarters of income-statement history
         # (thin data, not necessarily "no R&D") must degrade the same safe
         # way, not leave rAndDExpense as an empty list. calc_adj_ebit() and
@@ -977,13 +1008,13 @@ def capitalizerAndD(ticker, rd_years, api_key):
     unamort_amt = []
     amort_percentage = 1.0 / rd_years
 
-    # min(years_to_process, rd_years) never actually caps anything here --
-    # research_and_development()'s own fetchers already enforce
-    # years_to_process = min(rd_years, num_available_years), so
-    # years_to_process <= rd_years always holds. Kept for defensive clarity
-    # in case that invariant ever changes upstream.
+    # min(years_to_process, history_years) never actually caps anything here
+    # -- research_and_development()'s own fetchers already enforce
+    # years_to_process = min(history_years, num_available_years), so
+    # years_to_process <= history_years always holds. Kept for defensive
+    # clarity in case that invariant ever changes upstream.
     current_year_total_amortization = 0
-    for year in range(1, min(years_to_process, rd_years)):
+    for year in range(1, min(years_to_process, history_years)):
         current_year_total_amortization += (
             rd_dict["research_and_development"][year] * amort_percentage
         )
@@ -2007,6 +2038,184 @@ def sales_capital_reinvestment_fallback_note(diag: dict) -> str:
     )
 
 
+# HessGrp FCFF growth-forecast methodology (2026-10-01). Replaces
+# calc_growth_rate() (reinvestment_rate x return_on_capital) and the
+# 2026-09-29 anomalous-wealth-creator sales/capital fallback as the
+# DEFAULT Year 1-5 revenue-growth generator for the normal FCFF path.
+# Developed via a parallel, read-only Python reference implementation of
+# Damodaran's own fcffsimpleginzu.xlsx workbook, validated to an exact
+# (157/157 metric, $0.00 value/share) reconciliation against Excel, then
+# tested through a series of controlled single-company (CRCT) and
+# 12-company sensitivity/diagnostic experiments -- see
+# ~/Desktop/HessGrp_RR_Work_2026-09/ginzu/ (GINZU_FCFF_HANDOFF.md,
+# hessgrp_fcff_growth_spec.md) and docs/decisions.md 2026-10-01 for the
+# full history and economic reasoning this procedure rests on.
+#
+# Explicitly NOT touched or superseded by this methodology: the
+# 2026-09-22 cyclical-EBIT-normalization / Adaptive Growth mechanism
+# (calc_cyclical_normalized_ebit()/calc_adaptive_growth_rate()) --
+# per Jim's explicit instruction, that mechanism continues to override
+# growth_rate exactly as it did before, for the tickers it already
+# applies to. This methodology only replaces the DEFAULT growth source
+# used when cyclical normalization does NOT fire.
+GROWTH_DISTORTION_MAX_ABS_RATE = 0.50  # |growth| > 50%/yr treated as not mechanically trustworthy
+GROWTH_DISTORTION_MIN_DENOMINATOR_FRACTION = 0.01  # prior-period revenue < 1% of current revenue -- near-zero base, ratio is noise
+
+
+def _revenue_growth_rate_distorted(rate, base_period_revenue, current_revenue, revenues_in_window):
+    """True if `rate` (a latest-1yr growth or multi-year CAGR figure) should
+    NOT be trusted mechanically as the Year-1 growth-forecast starting
+    point. Three objective tests, matching hessgrp_fcff_growth_spec.md
+    Section 4 exactly -- deliberately small in number, each with a plain
+    economic reading:
+
+    1. |rate| > 50%/yr -- growth this extreme very rarely persists and
+       usually reflects a single distorted period (acquisition, divestiture,
+       COVID-era base effect, etc.), not a sustainable trend.
+    2. The revenue figure the rate is computed FROM is a near-zero base
+       (< 1% of current revenue) -- any ratio against a near-zero
+       denominator is numerically unstable noise, independent of how
+       plausible the resulting percentage happens to look.
+    3. Any revenue figure actually used in the window is zero/negative/
+       missing -- a growth rate computed across a sign change or a missing
+       data point is not economically meaningful.
+    """
+    if rate is None:
+        return True
+    if abs(rate) > GROWTH_DISTORTION_MAX_ABS_RATE:
+        return True
+    if (
+        current_revenue
+        and base_period_revenue is not None
+        and abs(base_period_revenue) < GROWTH_DISTORTION_MIN_DENOMINATOR_FRACTION * abs(current_revenue)
+    ):
+        return True
+    if any(r is None or r <= 0 for r in revenues_in_window):
+        return True
+    return False
+
+
+def calc_hessgrp_growth_path(ticker: str, industry: str, annual_reports: list, growth_period: int = 5) -> tuple[list, dict]:
+    """
+    Returns (growth_path, diag) -- growth_path is a growth_period-element
+    list (5 under the standard GROWTH_PERIOD), Years 1-N explicit revenue
+    growth, built per hessgrp_fcff_growth_spec.md's "PROPOSED HESSGRP
+    GROWTH ALGORITHM":
+
+    Step 1: gather latest 1yr revenue growth, 3yr revenue CAGR, and the US
+    Damodaran industry's 5yr average revenue growth
+    (hg_dcflib.get_industry_revenue_growth()) as the normalized anchor.
+
+    Step 2: pick the Year-1 starting rate as the first of
+    [latest 1yr growth, 3yr CAGR, industry anchor] that is NOT flagged
+    distorted by _revenue_growth_rate_distorted() -- the industry anchor
+    is always usable, the floor of the fallback chain.
+
+    Step 3: linearly interpolate Years 1-N (N=growth_period, 5 under the
+    standard GROWTH_PERIOD) from the Year-1 rate to the industry anchor:
+    growth[n] = year1_rate + (industry_rate - year1_rate) * n /
+    (growth_period - 1) for n = 0..growth_period-1 (Year 1 = 100% company
+    signal, Year N = 100% industry anchor).
+
+    annual_reports: most-recent-first list of {"totalRevenue": ..., "ebit":
+    ...} dicts, same shape annual_income_statement() already returns --
+    reuse that fetcher's output where the caller already has it rather
+    than re-fetching.
+
+    Deliberately does NOT use reinvestment_rate or return_on_capital
+    anywhere in this function -- see hessgrp_fcff_growth_spec.md Section
+    6/10 and docs/decisions.md 2026-10-01 for why growth and reinvestment
+    are now independent quantities in this file, not derived from each
+    other.
+    """
+    revenues = [r.get("totalRevenue") for r in annual_reports]
+    current_revenue = revenues[0] if revenues else None
+
+    latest_growth = None
+    if len(revenues) >= 2 and revenues[0] and revenues[1]:
+        latest_growth = revenues[0] / revenues[1] - 1.0
+    latest_distorted = _revenue_growth_rate_distorted(
+        latest_growth,
+        revenues[1] if len(revenues) >= 2 else None,
+        current_revenue,
+        revenues[:2],
+    )
+
+    cagr_3yr = None
+    if len(revenues) >= 4 and revenues[0] and revenues[3] and revenues[0] > 0 and revenues[3] > 0:
+        cagr_3yr = (revenues[0] / revenues[3]) ** (1.0 / 3.0) - 1.0
+    cagr_distorted = _revenue_growth_rate_distorted(
+        cagr_3yr,
+        revenues[3] if len(revenues) >= 4 else None,
+        current_revenue,
+        revenues[:4],
+    )
+
+    industry_rate = hg_dcflib.get_industry_revenue_growth(industry)
+
+    if latest_growth is not None and not latest_distorted:
+        year1_rate, source = latest_growth, "latest_1yr"
+    elif cagr_3yr is not None and not cagr_distorted:
+        year1_rate, source = cagr_3yr, "3yr_cagr"
+    else:
+        year1_rate, source = industry_rate, "industry_anchor"
+
+    growth_path = [
+        year1_rate + (industry_rate - year1_rate) * n / (growth_period - 1)
+        for n in range(growth_period)
+    ]
+
+    logger.info(
+        f"{ticker}: HessGrp growth path (source={source}) = "
+        f"{[f'{g:.1%}' for g in growth_path]}"
+    )
+
+    diag = {
+        "source": source,
+        "latest_growth": latest_growth,
+        "latest_distorted": latest_distorted,
+        "cagr_3yr": cagr_3yr,
+        "cagr_distorted": cagr_distorted,
+        "industry_rate": industry_rate,
+        "year1_rate": year1_rate,
+        "growth_path": growth_path,
+    }
+    return growth_path, diag
+
+
+def hessgrp_growth_forecast_note(diag: dict) -> str:
+    """Batch-path `notes` entry documenting which rung of the fallback
+    chain supplied the Year-1 growth rate -- always fires (this is the
+    new default mechanism, not a flag-only anomaly guard), mirroring
+    cyclical_ebit_normalization_note()'s "documents a correction/decision
+    that already happened" precedent rather than the flag-only guards
+    elsewhere in this file.
+
+    Deliberately an if/elif chain, not a dict literal keyed by source --
+    a dict literal's values are ALL evaluated eagerly at construction
+    time regardless of which key is ultimately selected, so an f-string
+    referencing a field that's legitimately None on a different branch
+    (e.g. diag['latest_growth'] when source == "industry_anchor") would
+    crash on `None.__format__`. Found live via the test suite, 2026-10-01
+    -- see docs/known_errors.md."""
+    if not diag or diag.get("source") == "fetch_failed":
+        return ""
+    source = diag.get("source")
+    if source == "latest_1yr":
+        source_text = f"latest-year revenue growth ({diag['latest_growth']:.1%})"
+    elif source == "3yr_cagr":
+        source_text = f"3yr revenue CAGR ({diag['cagr_3yr']:.1%}; latest-year growth was distorted)"
+    elif source == "industry_anchor":
+        source_text = f"the US industry growth anchor ({diag['industry_rate']:.1%}; both latest-year growth and 3yr CAGR were distorted)"
+    else:
+        return ""
+    return (
+        f"Year 1-5 revenue growth built from {source_text}, interpolating "
+        f"linearly to the US industry anchor ({diag['industry_rate']:.1%}) "
+        f"by Year 5 ({diag['growth_path'][-1]:.1%}); see docs/decisions.md 2026-10-01."
+    )
+
+
 def calc_growth_rate(reinvestment_rate, return_on_capital):
     growth_rate = reinvestment_rate * return_on_capital
     logger.info(f"Growth Rate = {growth_rate:,.4f}")
@@ -2180,6 +2389,7 @@ def calc_discount_rate(inc_stmnt, bv_debt, market_cap_equity, beta, risk_free, e
 def calc_expected_fcff(
     adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period,
     transition_period=0, stable_growth=None, stable_reinvestment_rate=None,
+    growth_rate_path=None,
 ):
     """
     Projects EBIT/EBIAT/FCFF year by year. Applying growth to EBIT (not
@@ -2198,6 +2408,21 @@ def calc_expected_fcff(
     3-stage structure. Default transition_period=0 preserves the exact
     prior two-stage behavior (the `else` branch below is never reached).
 
+    growth_rate_path (2026-10-01, HessGrp growth-forecast methodology, see
+    calc_hessgrp_growth_path()): optional list of length growth_period,
+    one explicit growth rate PER YEAR instead of one constant rate for the
+    whole explicit period. When provided, year `n`'s explicit-period
+    growth is growth_rate_path[n] (the flat `growth_rate` argument is
+    ignored for those years), and the transition-period fade starts from
+    growth_rate_path[-1] (the final explicit year's rate) instead of a
+    flat scalar -- the fade mechanics themselves are completely unchanged,
+    only their starting point differs. reinvestment_rate is NOT given a
+    per-year path -- it stays the single accounting figure it always was;
+    growth and reinvestment are independent inputs to this function either
+    way, this parameter only changes how GROWTH varies across the
+    explicit years. None (the default) preserves the exact prior flat-rate
+    behavior for every existing caller.
+
     Returns (fcff_n, ebit_n, ebiat_n, reinv_n, growth_n) -- reinv_n and
     growth_n are the per-year RATES actually used (constant for the first
     growth_period years, fading thereafter) -- not dollar amounts. Callers
@@ -2208,6 +2433,13 @@ def calc_expected_fcff(
     own inline loop) -- see docs/known_errors.md 2026-07-31's rule on
     duplicated valuation-path math.
     """
+    if growth_rate_path is not None and len(growth_rate_path) != growth_period:
+        raise ValueError(
+            f"growth_rate_path has {len(growth_rate_path)} entries, expected "
+            f"growth_period={growth_period} (one explicit rate per year)"
+        )
+    fade_start_growth = growth_rate_path[-1] if growth_rate_path is not None else growth_rate
+
     ebit_n = []
     ebiat_n = []
     fcff_n = []
@@ -2216,12 +2448,12 @@ def calc_expected_fcff(
     total_years = growth_period + transition_period
     for year in range(total_years):
         if year < growth_period:
-            g = growth_rate
+            g = growth_rate_path[year] if growth_rate_path is not None else growth_rate
             rr = reinvestment_rate
         else:
             fade_year = year - growth_period + 1  # 1..transition_period
             fraction = fade_year / transition_period
-            g = growth_rate + (stable_growth - growth_rate) * fraction
+            g = fade_start_growth + (stable_growth - fade_start_growth) * fraction
             rr = reinvestment_rate + (stable_reinvestment_rate - reinvestment_rate) * fraction
         if year == 0:
             ebit_n.append(adjusted_ebit * (1 + g))
@@ -2892,7 +3124,9 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
     """
     logger.info(f"Valuing {ticker} ...")
     try:
-        rd_years = hg_dcflib.get_rAndD_years(industry) + 1
+        # Amortization LIFE, not the history-fetch count -- see
+        # capitalizerAndD()'s docstring (2026-10-01 fix). Do not add +1 here.
+        rd_years = hg_dcflib.get_rAndD_years(industry)
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
@@ -2928,6 +3162,14 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         # on any failure — a thin annual-history fetch failing must never
         # add a new failure mode to the nightly ~2,300-ticker batch. See
         # calc_cyclical_normalized_ebit()'s docstring.
+        #
+        # annual_reports is also reused below by the HessGrp growth-forecast
+        # methodology (2026-10-01) -- initialized to [] here so it's always
+        # defined even if the fetch itself fails, avoiding a second fetch
+        # for the common (non-cyclical) case. [] degrades calc_hessgrp_
+        # growth_path() to its own industry-anchor fallback, same as any
+        # other insufficient-history case.
+        annual_reports = []
         try:
             annual_reports = annual_income_statement(ticker, MY_API_KEY)
             cyclical_ebit, cyclical_diag = calc_cyclical_normalized_ebit(
@@ -3029,15 +3271,52 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
             )
         # Uncapped 2026-09-13 -- Ginzu has no cap here either; see
         # high_growth_rate_note(), wired into `notes` below instead.
+        # 2026-10-01: kept only as Section 10's diagnostic consistency-check
+        # value now (see docs/decisions.md) -- no longer feeds
+        # calc_expected_fcff() directly except as the Adaptive Growth
+        # fallback value below.
         growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
+        growth_rate_path = None
+        growth_forecast_diag = None
         # Adaptive Growth override (2026-09-22): the first place in this
         # file growth_rate deliberately diverges from reinvestment_rate x
         # return_on_capital -- see calc_adaptive_growth_rate()'s docstring
         # and docs/decisions.md for why this is safe (return_on_capital,
         # wealth_pc, and calc_terminal_value()'s moat blending never read
-        # growth_rate, confirmed by reading every call site).
+        # growth_rate, confirmed by reading every call site). Left
+        # completely untouched by the 2026-10-01 HessGrp growth-forecast
+        # methodology below, per explicit instruction -- Adaptive Growth
+        # keeps overriding growth_rate exactly as it already did for the
+        # tickers it applies to; growth_rate_path stays None so
+        # calc_expected_fcff() uses this flat rate unchanged.
         if adaptive_growth_rate is not None:
             growth_rate = adaptive_growth_rate
+        else:
+            # HessGrp growth-forecast methodology (2026-10-01) -- the
+            # default Year 1-5 growth generator for every ticker NOT
+            # handled by Adaptive Growth above. See
+            # calc_hessgrp_growth_path()'s docstring and
+            # docs/decisions.md 2026-10-01 for the full design and the
+            # ~/Desktop/HessGrp_RR_Work_2026-09/ginzu/ workstream this
+            # came from. Wrapped in try/except, same "a thin fetch
+            # failing must never add a new nightly-batch failure mode"
+            # convention as every other guarded block in this function --
+            # degrades to the flat RR x ROIC growth_rate above on failure.
+            try:
+                growth_rate_path, growth_forecast_diag = calc_hessgrp_growth_path(
+                    ticker, industry, annual_reports, growth_period=growth_period
+                )
+                # growth_rate itself (the DB field, and the low/high-growth-
+                # rate notes below) must reflect the Year-1 rate actually
+                # being used, not the now-unused RR x ROIC figure -- that
+                # value is a stale diagnostic once growth_rate_path exists.
+                growth_rate = growth_rate_path[0]
+            except Exception as exc:
+                growth_forecast_diag = {"source": "fetch_failed", "reason": str(exc)}
+                logger.warning(
+                    f"{ticker}: HessGrp growth-path forecast skipped ({exc}) "
+                    f"-- falling back to RR x ROIC growth_rate for this ticker only."
+                )
 
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         discount_rate = calc_discount_rate(
@@ -3045,36 +3324,19 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         )
         logger.info(f"disc rate {discount_rate:,.4f}")
 
-        # Anomalous wealth-creator fallback (2026-09-29): keep the raw
-        # accounting RR for auditability, but do not let it drive the DCF
-        # when ROIC > WACC and RR is outside [0,1].  Use independent
-        # operating growth + level sales/capital economics instead.  A
-        # ticker already handled by the dedicated cyclical normalization
-        # path is left alone so the two normalization regimes never stack.
-        sales_capital_diag = {"applied": False, "reason": "gate_not_triggered"}
-        if (
-            return_on_capital > discount_rate
-            and (reinvestment_rate < 0.0 or reinvestment_rate > 1.0)
-            and not cyclical_diag.get("applied")
-        ):
-            try:
-                fallback_income = annual_income_statement(ticker, MY_API_KEY, years=4)
-                fallback_balance = annual_balance_sheet(ticker, MY_API_KEY, years=4)
-                fallback_growth, fallback_rr, sales_capital_diag = (
-                    calc_sales_capital_reinvestment_fallback(
-                        ticker, inc_stmnt["totalRevenue"][0], adjusted_ebiat,
-                        fallback_income, fallback_balance,
-                    )
-                )
-                if fallback_growth is not None and fallback_rr is not None:
-                    growth_rate = fallback_growth
-                    reinvestment_rate = fallback_rr
-            except Exception as exc:
-                sales_capital_diag = {"applied": False, "reason": f"fetch_failed: {exc}"}
-                logger.warning(
-                    f"{ticker}: anomalous wealth-creator reinvestment fallback skipped "
-                    f"({exc}) -- retaining production RR/growth."
-                )
+        # Anomalous wealth-creator fallback (2026-09-29) -- SUPERSEDED
+        # 2026-10-01 by the HessGrp growth-forecast methodology above,
+        # which solves the same underlying problem (an out-of-band
+        # accounting RR distorting the growth forecast) more generally:
+        # growth is now sourced independently of reinvestment_rate for
+        # every non-cyclical ticker, not just the ROIC>WACC/RR-outside-
+        # [0,1] subset this fallback targeted. reinvestment_rate itself
+        # stays the real accounting figure, deliberately -- see
+        # docs/decisions.md 2026-10-01. calc_sales_capital_reinvestment_
+        # fallback()/annual_balance_sheet() are kept but no longer called
+        # from this path -- not deleted, in case a future diagnostic needs
+        # them.
+        sales_capital_diag = {"applied": False, "reason": "superseded_by_hessgrp_growth_methodology"}
 
         terminal_cost_of_capital = calc_discount_rate(
             inc_stmnt, bv_debt, market_cap, stable_beta, RISK_FREE, EQ_PREM,
@@ -3093,6 +3355,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
             adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period,
             transition_period=TRANSITION_PERIOD, stable_growth=STABLE_GROWTH,
             stable_reinvestment_rate=stable_reinv_rate_target,
+            growth_rate_path=growth_rate_path,
         )
         # Discount-rate fade (2026-09-13, see calc_fading_discount_rates()
         # docstring) -- same transition window as the growth/reinvestment
@@ -3159,6 +3422,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 cyclical_ebit_normalization_note(cyclical_diag),
                 cyclical_reinvestment_normalization_note(reinvest_diag),
                 sales_capital_reinvestment_fallback_note(sales_capital_diag),
+                hessgrp_growth_forecast_note(growth_forecast_diag),
             ) if n
         )
 
@@ -3691,7 +3955,9 @@ def _value_stock_detail_fcff(
 ) -> dict | None:
     """FCFF detail dict for non-financial firms (used for Excel output)."""
     try:
-        rd_years = hg_dcflib.get_rAndD_years(industry) + 1
+        # Amortization LIFE, not the history-fetch count -- see
+        # capitalizerAndD()'s docstring (2026-10-01 fix). Do not add +1 here.
+        rd_years = hg_dcflib.get_rAndD_years(industry)
         unlevered_beta = hg_dcflib.get_beta(industry)
 
         inc_stmnt = income_statement(ticker, MY_API_KEY)
@@ -3716,6 +3982,11 @@ def _value_stock_detail_fcff(
 
         amort_schedule = capitalizerAndD(ticker, rd_years, MY_API_KEY)
 
+        # annual_reports is also reused below by the HessGrp growth-forecast
+        # methodology (2026-10-01) -- initialized to [] so it's always
+        # defined even if the fetch fails. See the batch path's matching
+        # comment in _value_stock_fcff() for the full reasoning.
+        annual_reports = []
         try:
             annual_reports = annual_income_statement(ticker, MY_API_KEY)
             cyclical_ebit, cyclical_diag = calc_cyclical_normalized_ebit(
@@ -3789,11 +4060,32 @@ def _value_stock_detail_fcff(
         # Uncapped 2026-09-13 -- Ginzu has no cap here either; this path has
         # no `notes` field (it's the single-ticker Excel report, already
         # human-reviewed directly), see high_growth_rate_note()'s docstring.
+        # 2026-10-01: kept only as a diagnostic value now, see the matching
+        # batch-path comment.
         growth_rate = calc_growth_rate(reinvestment_rate, return_on_capital)
+        growth_rate_path = None
+        growth_forecast_diag = None
         # Adaptive Growth override (2026-09-22) -- see the matching
         # batch-path comment and calc_adaptive_growth_rate()'s docstring.
+        # Left completely untouched by the 2026-10-01 HessGrp growth-
+        # forecast methodology below, same as the batch path.
         if adaptive_growth_rate is not None:
             growth_rate = adaptive_growth_rate
+        else:
+            # HessGrp growth-forecast methodology (2026-10-01) -- see
+            # calc_hessgrp_growth_path()'s docstring and the matching
+            # batch-path comment for the full design.
+            try:
+                growth_rate_path, growth_forecast_diag = calc_hessgrp_growth_path(
+                    ticker, industry, annual_reports, growth_period=growth_period
+                )
+                growth_rate = growth_rate_path[0]
+            except Exception as exc:
+                growth_forecast_diag = {"source": "fetch_failed", "reason": str(exc)}
+                logger.warning(
+                    f"{ticker}: HessGrp growth-path forecast skipped ({exc}) "
+                    f"-- falling back to RR x ROIC growth_rate for this ticker only."
+                )
 
         # Compute discount rate components inline to capture intermediates
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
@@ -3817,33 +4109,11 @@ def _value_stock_detail_fcff(
             cost_of_equity * percent_equity
         )
 
-        # Same anomalous wealth-creator fallback as the batch path.  The
-        # detail/Excel route must use identical forecast assumptions or it
-        # ceases to be a diagnostic view of production.
-        sales_capital_diag = {"applied": False, "reason": "gate_not_triggered"}
-        if (
-            return_on_capital > discount_rate
-            and (reinvestment_rate < 0.0 or reinvestment_rate > 1.0)
-            and not cyclical_diag.get("applied")
-        ):
-            try:
-                fallback_income = annual_income_statement(ticker, MY_API_KEY, years=4)
-                fallback_balance = annual_balance_sheet(ticker, MY_API_KEY, years=4)
-                fallback_growth, fallback_rr, sales_capital_diag = (
-                    calc_sales_capital_reinvestment_fallback(
-                        ticker, inc_stmnt["totalRevenue"][0], adjusted_ebiat,
-                        fallback_income, fallback_balance,
-                    )
-                )
-                if fallback_growth is not None and fallback_rr is not None:
-                    growth_rate = fallback_growth
-                    reinvestment_rate = fallback_rr
-            except Exception as exc:
-                sales_capital_diag = {"applied": False, "reason": f"fetch_failed: {exc}"}
-                logger.warning(
-                    f"{ticker}: anomalous wealth-creator reinvestment fallback skipped "
-                    f"({exc}) -- retaining production RR/growth."
-                )
+        # Anomalous wealth-creator fallback (2026-09-29) -- SUPERSEDED
+        # 2026-10-01 by the HessGrp growth-forecast methodology above, same
+        # reasoning as the matching batch-path comment. Kept, unused, in
+        # case a future diagnostic needs it.
+        sales_capital_diag = {"applied": False, "reason": "superseded_by_hessgrp_growth_methodology"}
 
         # Stable phase
         stable_levered_beta = calc_levered_beta(stable_beta, bv_debt, market_cap, MARGINAL_TAX_RATE, de_cap=hg_dcflib.get_industry_de(industry))
@@ -3870,6 +4140,7 @@ def _value_stock_detail_fcff(
             adjusted_ebit, eff_tax_rate, growth_rate, reinvestment_rate, growth_period,
             transition_period=TRANSITION_PERIOD, stable_growth=stable_growth,
             stable_reinvestment_rate=stable_reinv_rate,
+            growth_rate_path=growth_rate_path,
         )
         # Dollar reinvestment per year (ebiat * rate) -- the Excel report's
         # capex/WC breakdown rows split this proportionally; kept as a
@@ -4044,6 +4315,8 @@ def _value_stock_detail_fcff(
             # --- Growth phase parameters ---
             "growth_period": total_explicit_years,
             "growth_rate": growth_rate,
+            "growth_rate_path": growth_rate_path,
+            "hessgrp_growth_forecast": growth_forecast_diag,
             "reinvestment_rate": reinvestment_rate,
             "sales_capital_fallback": sales_capital_diag,
             "return_on_capital": return_on_capital,
