@@ -17,6 +17,7 @@ fred_api.txt
 !/reference_data/RD_Amortization.xlsx
 !/reference_data/industry_revenue_growth.xlsx
 !/reference_data/industry_sales_to_capital.xlsx
+!/reference_data/industry_roe_2026.xlsx
 
 # pdf files
 *.pdf

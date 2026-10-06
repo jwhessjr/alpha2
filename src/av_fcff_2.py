@@ -27,6 +27,14 @@ from pathlib import Path as _Path
 # in HessGrp/lib), without shadowing a same-directory hg_dcflib.py copy.
 _sys.path.append(str(_Path.home() / "HessGrp" / "lib"))
 import hg_dcflib
+# hg_financial_classifier / hg_financial_adapter are deliberately NOT
+# imported at module scope here -- hg_financial_adapter.py itself does
+# `import av_fcff_2 as prod` and reads `prod.GROWTH_PERIOD` as a default
+# parameter value at function-definition time; importing it before this
+# module finishes defining GROWTH_PERIOD creates a circular-import
+# AttributeError (confirmed live, 2026-10-06). Both are imported locally,
+# inside _classify_and_route()/value_stock()/value_stock_detail(), where
+# this module is already fully initialized by the time they run.
 from av_fetcher import av_fetch
 from config import INTRINIO_KEY
 import json
@@ -3085,6 +3093,175 @@ def value_bank_stock(ticker: str, growth_period: int):
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class RoutingDecision:
+    """
+    The single, centralized production-routing decision shared by
+    value_stock() and value_stock_detail() (2026-10-06 production-routing
+    implementation -- see docs/decisions.md and
+    ~/Desktop/HessGrp_RR_Work_2026-09/banks/hessgrp_financial_production_routing_design_audit_2026-10-06.md).
+
+    route is one of:
+      "fcff"            -> ordinary operating company, or financial-SIC
+                           ticker that isn't a bank/insurer/REIT by the new
+                           classifier (unchanged legacy behavior for the
+                           non-financial-SIC case; see value_stock() itself
+                           for the financial-SIC-but-unclassifiable case,
+                           which is NOT this -- that's "unsupported" below)
+      "reit"            -> existing REIT/AFFO path, unchanged. Checked
+                           BEFORE the new financial classifier is ever
+                           consulted -- the classifier has no REIT category
+                           at all and would otherwise misroute REITs.
+      "bank_adapter"    -> hg_financial_adapter.build_financial_valuation()
+                           (DivGinzu primary, EqExRet cross-check) -- only
+                           for a confirmed BANK_DEPOSITORY ticker with a
+                           resolved Damodaran peer-beta bucket.
+      "legacy_insurer"  -> value_bank_stock()/_value_bank_stock_detail(),
+                           gated now by an explicit INSURER classification
+                           (SIC-confirmed), not a Damodaran-string keyword
+                           match. Temporary -- not an endorsement that the
+                           insurer model has had the same audit as the new
+                           bank path (docs/decisions.md, 2026-10-06).
+      "unsupported"     -> structured failure. Never falls through to FCFF,
+                           never falls back to value_bank_stock(). Covers:
+                           BANK_DEPOSITORY with an unresolved peer bucket
+                           (COF/ALLY-class), BROKER_DEALER, ASSET_MANAGER,
+                           CONSUMER_FINANCE, OTHER_FINANCIAL, and UNKNOWN
+                           (missing SIC that nonetheless reached this point
+                           via the REIT/financial-keyword... no -- see
+                           note below) subtypes.
+
+    classification is the full hg_financial_classifier.FinancialClassification
+    when route is "bank_adapter"/"unsupported" (for BANK_DEPOSITORY-shaped
+    results) or None otherwise (fcff/reit/legacy_insurer don't need it --
+    the industry string alone already decided those).
+    """
+    route: str
+    classification: "hg_financial_classifier.FinancialClassification | None"
+    industry: str
+
+
+def _classify_and_route(ticker: str, industry: str) -> RoutingDecision:
+    """
+    The one place production decides which valuation model a ticker uses.
+    Called identically by value_stock() and value_stock_detail() so the
+    two entry points cannot drift (2026-10-06).
+
+    Delegates ALL financial-subtype classification to
+    hg_financial_classifier.classify_financial_firm() -- the SIC-primary
+    authoritative classifier committed in f32e8d2. Does NOT reproduce
+    classification logic here, and does NOT use is_financial_firm()/
+    is_insurance_firm()'s Damodaran-industry-string keyword matching to
+    pick a valuation model anymore -- that mechanism is confirmed (design
+    audit, 2026-10-06) to be the root cause of GS/MS/SCHW/BX/KKR being
+    valued as banks and COF/AXP getting wrong insurance-style NI
+    normalization in production today.
+
+    is_reit() is checked FIRST and still owns REIT detection entirely --
+    the new classifier has no REIT category and must never be reached
+    ahead of this check.
+    """
+    import hg_financial_classifier  # local -- see module-top import note
+
+    sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
+
+    if is_reit(industry):
+        return RoutingDecision(route="reit", classification=None, industry=industry)
+
+    if sic is None and not is_financial_firm(industry):
+        # SIC is the authoritative classifier whenever it's available (see
+        # below) -- but when it's genuinely unavailable, there is no SIC
+        # signal to consult at all, and classify_sic(None) always returns
+        # UNKNOWN regardless of the industry string. Without this check,
+        # EVERY ticker with a transiently-failed SIC lookup (including
+        # obviously non-financial ones, e.g. a software company) would be
+        # marked unsupported rather than correctly reaching FCFF -- a real
+        # regression this check exists specifically to prevent (confirmed
+        # live, 2026-10-06, via the existing test suite). is_financial_firm()
+        # is used here ONLY as a last-resort "is this even plausibly a
+        # financial firm at all" gate when SIC can't answer that -- it is
+        # NEVER used to pick a subtype or a valuation model; that remains
+        # classify_financial_firm()'s sole job whenever SIC is available.
+        return RoutingDecision(route="fcff", classification=None, industry=industry)
+
+    classification = hg_financial_classifier.classify_financial_firm(ticker, sic, industry)
+    Subtype = hg_financial_classifier.FinancialSubtype
+
+    if classification.subtype == Subtype.BANK_DEPOSITORY and classification.peer_beta_status == "resolved":
+        return RoutingDecision(route="bank_adapter", classification=classification, industry=industry)
+
+    if classification.subtype == Subtype.INSURER:
+        return RoutingDecision(route="legacy_insurer", classification=classification, industry=industry)
+
+    # BANK_DEPOSITORY-unresolved-bucket, BROKER_DEALER, ASSET_MANAGER,
+    # CONSUMER_FINANCE, OTHER_FINANCIAL, UNKNOWN, NOT_FINANCIAL-reached-here
+    # (shouldn't happen given the SIC pre-filter already ran, but never
+    # silently treated as "fall through to FCFF" regardless) -- all
+    # structured unsupported, never a guess, never FCFF, never the legacy
+    # bank model.
+    return RoutingDecision(route="unsupported", classification=classification, industry=industry)
+
+
+def _stock_value_from_financial_valuation(ticker: str, industry: str, growth_period: int, result: "hg_financial_adapter.HgFinancialValuation") -> "Stock_Value":
+    """
+    Converts a DivGinzu/EqExRet hg_financial_adapter.HgFinancialValuation
+    result into the Stock_Value shape every other value_* function already
+    returns -- required because insert_valuation()/main()'s batch loop
+    read specific Stock_Value attributes (.ticker, .share_value, etc.),
+    not HgFinancialValuation's own differently-named fields (2026-10-06).
+
+    build_financial_valuation() doesn't itself fetch/expose price/market
+    cap/CIK/dividend yield/analyst count (out of its original scope --
+    pure valuation math only), so this helper fetches them the same way
+    value_bank_stock() does, via the same cached enterprise_quote()/
+    get_cik() calls (cheap -- enterprise_quote() is already cached per
+    (ticker, provider) for the run, see _QUOTE_CACHE).
+    """
+    ent_quote = enterprise_quote(ticker, MY_API_KEY)
+    price = ent_quote[0]
+    shares_outstanding = ent_quote[1]
+    market_cap = ent_quote[2]
+    ent_name = ent_quote[3]
+    dividend_yield = ent_quote[4]
+    analyst_count = int(ent_quote[5])
+    cik = hg_dcflib.get_cik(ticker)
+
+    dg = result.divginzu
+    d = result.diagnostics
+    growth_explicit = dg.years[1].growth if len(dg.years) > 1 else dg.years[0].growth
+    intrinsic_value = dg.value_per_share
+    safety_margin = float(intrinsic_value - price)
+    safety_margin_pc = 1 - (price / intrinsic_value) if intrinsic_value != 0 else 0.0
+    target_price = intrinsic_value * (1 + d.current_cost_of_equity)
+
+    return Stock_Value(
+        ticker=ticker, valuation_date=str(date.today()), ent_name=ent_name,
+        industry=industry, cik=cik, beta=result.beta_peer_levered,
+        market_cap=market_cap, price=price, shares_outstanding=shares_outstanding,
+        risk_free_rate=result.risk_free_rate, eq_premium=result.equity_risk_premium,
+        growth_rate=growth_explicit, cost_of_capital=d.current_cost_of_equity,
+        wealth_pc=d.current_roe - d.current_cost_of_equity,
+        fcff_value=dg.pv_explicit_dividends, terminal_value=dg.pv_terminal_value,
+        share_value=intrinsic_value, margin_of_safety=safety_margin,
+        margin_of_safety_pc=safety_margin_pc, target_price=target_price,
+        earnings_yield=0.0, dividend_yield=dividend_yield, analyst_count=analyst_count,
+        notes=(
+            f"DivGinzu primary | EqExRet cross-check ${d.eqexret_iv:,.2f} "
+            f"({d.percentage_divergence:+.1%}) | {d.divergence_flag or 'divergence within normal range'}"
+        ),
+    )
+
+
+def _log_unsupported_financial(ticker: str, decision: RoutingDecision) -> None:
+    """Single, consistent log line for every UNSUPPORTED_FINANCIAL_SUBTYPE
+    outcome -- greppable, testable, and the one place this message format
+    is defined (2026-10-06)."""
+    c = decision.classification
+    reason = "; ".join(c.notes) if c and c.notes else "no evidence-supported valuation model for this subtype yet"
+    subtype = c.subtype.value if c else "UNKNOWN"
+    logger.warning(f"{ticker}: UNSUPPORTED_FINANCIAL_SUBTYPE ({subtype}) -- {reason}")
+
+
 def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
     """
     Route to the correct valuation model based on industry:
@@ -3094,9 +3271,21 @@ def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
         REIT routing on its own -- an in-range SIC just falls through to the
         checks below unchanged. See is_financial_sic() and
         docs/known_errors.md 2026-09-01.
-      - REITs → skipped (FCFF/FCFE not applicable; FFO/AFFO model pending Phase 2)
-      - Financial firms (banks, insurance, etc.) → FCFE equity DCF
-      - All others → FCFF firm DCF
+      - REITs → existing AFFO DDM path, unchanged, checked before any
+        financial-subtype classification (see _classify_and_route()).
+      - Confirmed, peer-bucket-resolved banks → the new DivGinzu/EqExRet
+        adapter (hg_financial_adapter.build_financial_valuation()).
+      - Confirmed insurers → legacy value_bank_stock(), temporarily
+        (docs/decisions.md 2026-10-06).
+      - Every other financial subtype (broker/dealer, asset manager,
+        consumer finance, unresolved-bucket bank, unclassifiable) →
+        structured UNSUPPORTED_FINANCIAL_SUBTYPE. Never FCFF, never a
+        silent fallback to the legacy bank model.
+      - All non-financial-SIC tickers → FCFF firm DCF, unchanged.
+
+    See _classify_and_route() -- this is the single, centralized routing
+    decision point value_stock_detail() also uses, so the two entry points
+    cannot drift.
     """
     try:
         industry = hg_dcflib.get_industry(ticker)
@@ -3108,13 +3297,35 @@ def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
     if sic is not None and not is_financial_sic(sic):
         return _value_stock_fcff(ticker, growth_period, industry, db_path)
 
-    if is_reit(industry):
+    decision = _classify_and_route(ticker, industry)
+
+    if decision.route == "fcff":
+        return _value_stock_fcff(ticker, growth_period, industry, db_path)
+
+    if decision.route == "reit":
         return value_reit_stock(ticker, growth_period)
 
-    if is_financial_firm(industry):
+    if decision.route == "bank_adapter":
+        import hg_financial_adapter  # local -- see module-top import note
+        try:
+            result = hg_financial_adapter.build_financial_valuation(ticker, growth_period)
+        except hg_financial_adapter.HgFinancialAdapterUnsupported as e:
+            logger.warning(f"{ticker}: UNSUPPORTED_FINANCIAL_SUBTYPE (bank_adapter_failure) -- {e.reason}: {e.detail}")
+            return None
+        return _stock_value_from_financial_valuation(ticker, industry, growth_period, result)
+
+    if decision.route == "legacy_insurer":
         return value_bank_stock(ticker, growth_period)
 
-    return _value_stock_fcff(ticker, growth_period, industry, db_path)
+    if decision.route == "unsupported":
+        _log_unsupported_financial(ticker, decision)
+        return None
+
+    # Should not be reachable (is_reit()/classify_financial_firm() always
+    # return one of the above), but never silently fall through to FCFF
+    # for a ticker that reached this point via the financial-SIC branch.
+    logger.warning(f"{ticker}: unrecognized routing decision {decision.route!r} -- treating as unsupported")
+    return None
 
 
 def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: str | None = None):
@@ -3640,6 +3851,10 @@ def _stock_value_from_detail(d: dict) -> Stock_Value:
         cost_of_capital = d["cost_of_equity"]
         wealth_pc = d["roe"] - d["cost_of_equity"]
         fcff_value = d["excess_return_pv"]
+    elif d["model"] == "DivGinzu":  # 2026-10-06 -- see _divginzu_detail_dict()
+        cost_of_capital = d["cost_of_equity"]
+        wealth_pc = d["roe"] - d["cost_of_equity"]
+        fcff_value = d["excess_return_pv"]
     elif d["model"] == "AFFO":
         cost_of_capital = d["cost_of_equity"]
         wealth_pc = d["roe"] - d["cost_of_equity"]
@@ -3675,13 +3890,68 @@ def _stock_value_from_detail(d: dict) -> Stock_Value:
     )
 
 
+def _divginzu_detail_dict(ticker: str, growth_period: int, industry: str, result: "hg_financial_adapter.HgFinancialValuation") -> dict:
+    """
+    Detail-dict shape for a bank_adapter ("model": "DivGinzu") result --
+    carries the fields _stock_value_from_detail() needs for DB insertion
+    (2026-10-06 production-routing implementation). DOES NOT yet have a
+    dedicated Excel template (_generate_xlsx_divginzu()) -- main()'s Excel
+    writer has no "DivGinzu" branch and would currently fall through to
+    _generate_xlsx_fcff(), mislabeling the sheet. Flagged as a known,
+    separate follow-up (docs/decisions.md, 2026-10-06) -- out of scope for
+    this routing-only pass. The DB-write path (value_stock(), the nightly
+    batch driver) does not go through this function at all and is
+    unaffected by this gap.
+    """
+    ent_quote = enterprise_quote(ticker, MY_API_KEY)
+    price = ent_quote[0]
+    ent_name = ent_quote[3]
+    cik = hg_dcflib.get_cik(ticker)
+
+    dg = result.divginzu
+    d = result.diagnostics
+    growth_explicit = dg.years[1].growth if len(dg.years) > 1 else dg.years[0].growth
+    intrinsic_value = dg.value_per_share
+    safety_margin = float(intrinsic_value - price)
+    safety_margin_pc = 1 - (price / intrinsic_value) if intrinsic_value != 0 else 0.0
+    target_price = intrinsic_value * (1 + d.current_cost_of_equity)
+    return {
+        "model": "DivGinzu",
+        "ticker": ticker, "valuation_date": str(date.today()), "ent_name": ent_name,
+        "industry": industry, "cik": cik,
+        "beta": result.beta_peer_levered, "market_cap": ent_quote[2], "price": price,
+        "shares_outstanding": dg.inputs.shares_outstanding,
+        "risk_free": result.risk_free_rate, "eq_prem": result.equity_risk_premium,
+        "growth_rate": growth_explicit,
+        "cost_of_equity": d.current_cost_of_equity,
+        "roe": d.current_roe,
+        "excess_return_pv": dg.pv_explicit_dividends,
+        "terminal_value_pv": dg.pv_terminal_value,
+        "intrinsic_value": intrinsic_value,
+        "margin_of_safety": safety_margin, "margin_of_safety_pc": safety_margin_pc, "target_price": target_price,
+        "earnings_yield": 0.0, "analyst_count": 0,
+        "growth_period": growth_period,
+        # Cross-check, not used by _stock_value_from_detail() -- diagnostic only.
+        "eqexret_value_per_share": result.eqexret.value_per_share,
+        "divergence_pct": d.percentage_divergence,
+    }
+
+
 def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = None) -> dict | None:
     """
     Route to the correct detail valuation for the Excel report:
       - SIC pre-filter → same as value_stock(), see is_financial_sic()
-      - REITs          → skipped (FFO/AFFO model pending Phase 2)
-      - Financial firms → FCFE bank detail
-      - All others      → FCFF detail
+      - REITs          → existing AFFO DDM detail, unchanged
+      - Confirmed, peer-bucket-resolved banks → new DivGinzu/EqExRet
+        adapter detail (no dedicated Excel template yet -- see
+        _divginzu_detail_dict()'s docstring)
+      - Confirmed insurers → legacy bank/FCFE detail, temporarily
+      - Every other financial subtype → None (structured
+        UNSUPPORTED_FINANCIAL_SUBTYPE, logged)
+      - All others → FCFF detail
+
+    Uses the identical centralized decision, _classify_and_route(), that
+    value_stock() uses -- the two entry points cannot drift (2026-10-06).
     """
     try:
         industry = hg_dcflib.get_industry(ticker)
@@ -3693,12 +3963,32 @@ def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = No
     if sic is not None and not is_financial_sic(sic):
         return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
 
-    if is_reit(industry):
+    decision = _classify_and_route(ticker, industry)
+
+    if decision.route == "fcff":
+        return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
+
+    if decision.route == "reit":
         return _value_reit_stock_detail(ticker, growth_period, industry)
 
-    if is_financial_firm(industry):
+    if decision.route == "bank_adapter":
+        import hg_financial_adapter  # local -- see module-top import note
+        try:
+            result = hg_financial_adapter.build_financial_valuation(ticker, growth_period)
+        except hg_financial_adapter.HgFinancialAdapterUnsupported as e:
+            logger.warning(f"{ticker}: UNSUPPORTED_FINANCIAL_SUBTYPE (bank_adapter_failure) -- {e.reason}: {e.detail}")
+            return None
+        return _divginzu_detail_dict(ticker, growth_period, industry, result)
+
+    if decision.route == "legacy_insurer":
         return _value_bank_stock_detail(ticker, growth_period, industry)
-    return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
+
+    if decision.route == "unsupported":
+        _log_unsupported_financial(ticker, decision)
+        return None
+
+    logger.warning(f"{ticker}: unrecognized routing decision {decision.route!r} -- treating as unsupported")
+    return None
 
 
 def _value_bank_stock_detail(
