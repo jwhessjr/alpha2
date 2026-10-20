@@ -3108,10 +3108,17 @@ class RoutingDecision:
                            non-financial-SIC case; see value_stock() itself
                            for the financial-SIC-but-unclassifiable case,
                            which is NOT this -- that's "unsupported" below)
-      "reit"            -> existing REIT/AFFO path, unchanged. Checked
-                           BEFORE the new financial classifier is ever
-                           consulted -- the classifier has no REIT category
-                           at all and would otherwise misroute REITs.
+      "reit"            -> 2026-10-19: production HOLD, not the legacy
+                           REIT/AFFO path. value_stock()/value_stock_detail()
+                           now return REIT_HOLD (structured, via
+                           _log_reit_hold()) and produce no intrinsic value
+                           for this route -- value_reit_stock()/
+                           _value_reit_stock_detail() still exist as code but
+                           are no longer called from production routing.
+                           Checked BEFORE the new financial classifier is
+                           ever consulted -- the classifier has no REIT
+                           category at all and would otherwise misroute
+                           REITs.
       "bank_adapter"    -> hg_financial_adapter.build_financial_valuation()
                            (DivGinzu primary, EqExRet cross-check) -- only
                            for a confirmed BANK_DEPOSITORY ticker with a
@@ -3262,17 +3269,46 @@ def _log_unsupported_financial(ticker: str, decision: RoutingDecision) -> None:
     logger.warning(f"{ticker}: UNSUPPORTED_FINANCIAL_SUBTYPE ({subtype}) -- {reason}")
 
 
+REIT_HOLD_STATUS = "REIT_HOLD"
+
+
+def _log_reit_hold(ticker: str, industry: str) -> None:
+    """Single, consistent log line for every REIT_HOLD outcome -- greppable
+    and testable, mirroring _log_unsupported_financial()'s format (2026-10-19
+    production hold).
+
+    This is an intentional production POLICY hold, not an error: is_reit()
+    identified the ticker correctly, but REIT valuation (legacy AFFO DDM via
+    value_reit_stock()/_value_reit_stock_detail(), and the newer Architecture
+    D AFFO/NRCF/subtype-classifier stack which lives only in a development
+    worktree) is disabled in production pending completion and explicit
+    cutover authorization of the REIT valuation methodology. No intrinsic
+    value is produced for this ticker -- it must never reach FCFF, the
+    bank/financial adapter, or the legacy REIT model as a fallback.
+    """
+    logger.warning(
+        f"{ticker}: {REIT_HOLD_STATUS} ({industry}) -- REIT valuation is on an "
+        f"explicit production policy hold pending completion of the REIT "
+        f"AFFO/NRCF production methodology; no intrinsic value produced. "
+        f"See docs/decisions.md 2026-10-19."
+    )
+
+
 def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
     """
     Route to the correct valuation model based on industry:
+      - REITs → 2026-10-19 production HOLD (REIT_HOLD, no intrinsic value;
+        see _log_reit_hold()), checked FIRST, unconditionally, before the
+        SIC pre-filter below -- some REITs (hotel/lodging: PK, SHO, XHR)
+        carry an operating-business SIC outside SIC_FINANCIAL_RANGE, which
+        would otherwise let them bypass the hold straight to FCFF (real
+        leak, confirmed live 2026-10-19).
       - SIC pre-filter → SEC's own SIC code, when available and outside the
         Finance/Insurance/Real-Estate division, sends the ticker straight to
         FCFF regardless of Damodaran's bucket. Never forces bank/insurance/
         REIT routing on its own -- an in-range SIC just falls through to the
         checks below unchanged. See is_financial_sic() and
         docs/known_errors.md 2026-09-01.
-      - REITs → existing AFFO DDM path, unchanged, checked before any
-        financial-subtype classification (see _classify_and_route()).
       - Confirmed, peer-bucket-resolved banks → the new DivGinzu/EqExRet
         adapter (hg_financial_adapter.build_financial_valuation()).
       - Confirmed insurers → legacy value_bank_stock(), temporarily
@@ -3293,6 +3329,20 @@ def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
         logger.warning(f"Skipping {ticker}: {e}")
         return None
 
+    # 2026-10-19: the REIT hold must run BEFORE the SIC pre-filter below --
+    # confirmed live (full production REIT population, 126 tickers) that 3
+    # hotel/lodging REITs (PK, SHO, XHR) carry an operating-business SIC
+    # code (7011, Hotels & Motels) OUTSIDE SIC_FINANCIAL_RANGE rather than a
+    # real-estate SIC. The SIC pre-filter's early return to FCFF would
+    # otherwise bypass _classify_and_route() (and therefore is_reit())
+    # entirely for exactly these tickers -- a real, demonstrated leak, not a
+    # theoretical one. is_reit() depends only on the Damodaran industry
+    # string, never on SIC, so this check is safe to run unconditionally,
+    # first, regardless of what SIC says. See docs/decisions.md 2026-10-19.
+    if is_reit(industry):
+        _log_reit_hold(ticker, industry)
+        return None
+
     sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
     if sic is not None and not is_financial_sic(sic):
         return _value_stock_fcff(ticker, growth_period, industry, db_path)
@@ -3303,7 +3353,15 @@ def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
         return _value_stock_fcff(ticker, growth_period, industry, db_path)
 
     if decision.route == "reit":
-        return value_reit_stock(ticker, growth_period)
+        # Defense-in-depth only -- unreachable via this function now that
+        # is_reit() is checked unconditionally above, before the SIC
+        # pre-filter. _classify_and_route() still classifies REITs as
+        # route="reit" on its own (used directly by its own test suite);
+        # kept here so this function never silently falls through to
+        # another model if that ever changes. See _log_reit_hold()'s
+        # docstring and docs/decisions.md.
+        _log_reit_hold(ticker, industry)
+        return None
 
     if decision.route == "bank_adapter":
         import hg_financial_adapter  # local -- see module-top import note
@@ -3940,8 +3998,11 @@ def _divginzu_detail_dict(ticker: str, growth_period: int, industry: str, result
 def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = None) -> dict | None:
     """
     Route to the correct detail valuation for the Excel report:
+      - REITs          → 2026-10-19 production HOLD (REIT_HOLD, no detail
+        dict produced; see _log_reit_hold()), checked FIRST, unconditionally,
+        before the SIC pre-filter -- see value_stock()'s identical docstring
+        note (PK/SHO/XHR SIC-7011 leak, confirmed live 2026-10-19).
       - SIC pre-filter → same as value_stock(), see is_financial_sic()
-      - REITs          → existing AFFO DDM detail, unchanged
       - Confirmed, peer-bucket-resolved banks → new DivGinzu/EqExRet
         adapter detail (no dedicated Excel template yet -- see
         _divginzu_detail_dict()'s docstring)
@@ -3959,6 +4020,14 @@ def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = No
         logger.warning(f"Skipping {ticker}: {e}")
         return None
 
+    # 2026-10-19: see value_stock()'s identical check -- the REIT hold must
+    # run BEFORE the SIC pre-filter below, or hotel/lodging REITs (SIC 7011,
+    # outside SIC_FINANCIAL_RANGE; confirmed live: PK, SHO, XHR) bypass
+    # _classify_and_route()/is_reit() entirely and reach FCFF.
+    if is_reit(industry):
+        _log_reit_hold(ticker, industry)
+        return None
+
     sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
     if sic is not None and not is_financial_sic(sic):
         return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
@@ -3969,7 +4038,10 @@ def value_stock_detail(ticker: str, growth_period: int, db_path: str | None = No
         return _value_stock_detail_fcff(ticker, growth_period, industry, db_path)
 
     if decision.route == "reit":
-        return _value_reit_stock_detail(ticker, growth_period, industry)
+        # Defense-in-depth only -- unreachable via this function now; see
+        # value_stock()'s identical branch.
+        _log_reit_hold(ticker, industry)
+        return None
 
     if decision.route == "bank_adapter":
         import hg_financial_adapter  # local -- see module-top import note
