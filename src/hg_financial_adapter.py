@@ -42,9 +42,15 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
-sys.path.insert(0, "/Users/jhess/HessGrp/scripts")
-sys.path.insert(0, "/Users/jhess/HessGrp/lib")
+# Resolved relative to this file, not a hardcoded path into the other
+# (primary HessGrp) checkout -- mirrors the fix applied to the primary
+# lib/hg_financial_adapter.py copy. This Alpha2 tree uses a flat src/
+# layout (no lib/ vs scripts/ split), so both av_fcff_2.py and hg_dcflib.py
+# already live alongside this file in src/ -- one insert covers both.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pandas as pd
 
@@ -57,7 +63,7 @@ from hg_financial_divginzu import DivGinzuInputs, DivGinzuResult, value_divginzu
 from hg_financial_eqexret import EqExRetInputs, EqExRetResult, value_eqexret, EqExRetInvalidInputs
 from hg_financial_stable_roe import get_stable_roe, StableRoeUnavailable
 
-BETAS_WORKBOOK_PATH = "/Users/jhess/HessGrp/reference_data/betas_2026.xls"
+BETAS_WORKBOOK_PATH = str(_REPO_ROOT / "reference_data" / "betas_2026.xls")
 
 
 class HgFinancialAdapterUnsupported(Exception):
