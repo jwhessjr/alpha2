@@ -2046,6 +2046,134 @@ def sales_capital_reinvestment_fallback_note(diag: dict) -> str:
     )
 
 
+# Owner Earnings diagnostic (2026-10-22). Reports an approximation of
+# Buffett's "owner earnings" concept (Net Income + D&A - maintenance capex +-
+# chng WC) using the standard analyst proxy maintenance_capex = depreciation,
+# plus an independent cross-check against the sales-to-capital-implied
+# reinvestment the company's own realized revenue growth required. Detail-
+# only: never feeds calc_reinvestment(), firm_reinvestment, reinvestment_rate,
+# growth_rate, or calc_expected_fcff() -- reported in notes/Excel only.
+#
+# Buffett himself (1986 Berkshire shareholder letter) is explicit that
+# maintenance capex "must be a guess... sometimes very difficult to make" --
+# this diagnostic is a disclosed proxy/estimate, never presented as his real
+# number. The classification thresholds below are this diagnostic's own
+# provisional starting point, not sourced from Damodaran or Buffett -- named
+# as constants specifically so they are easy to revisit.
+OWNER_EARNINGS_SPEND_RATIO_HIGH = 1.5  # net reinvestment > 1.5x growth-required -> likely disguised maintenance
+OWNER_EARNINGS_SPEND_RATIO_LOW = 0.5   # net reinvestment < 0.5x growth-required -> unusually efficient growth or under-investment
+
+
+def calc_owner_earnings_diagnostic(
+    ticker: str,
+    net_income: float,
+    capex: float,
+    depreciation: float,
+    chng_nc_wc: float,
+    current_revenue: float,
+    adjusted_ebiat: float,
+    annual_income_reports: list,
+    annual_balance_reports: list,
+) -> dict:
+    """Owner Earnings proxy + maintenance/growth capex split, reported only.
+
+    net_capex = capex - depreciation is today's implicit "growth capex"
+    component under the depreciation-as-maintenance-capex proxy (the same
+    term already buried inside calc_reinvestment()'s firm_reinvestment
+    formula, just surfaced and named here). owner_earnings_proxy algebraically
+    reduces to net_income + chng_nc_wc under this proxy (depreciation cancels
+    against maintenance_capex_proxy) -- this is a disclosed limitation of the
+    simple proxy, not hidden.
+
+    The cross-check reuses calc_sales_capital_reinvestment_fallback() directly
+    and unmodified -- an independent, revenue-growth-driven estimate of how
+    much total reinvestment the company's realized growth required. Comparing
+    actual net reinvestment (net_capex + chng_nc_wc) against that figure flags
+    when the simple proxy is probably wrong: spending far more than the
+    realized growth required suggests some of net_capex is disguised
+    maintenance (replacement-cost inflation, deferred-maintenance catch-up),
+    not true expansion.
+
+    Always uses raw capex (never a cyclically-normalized variant) -- this
+    diagnostic explains actual historical spending, not a hypothetical
+    normalized figure.
+    """
+    net_capex = capex - depreciation
+    maintenance_capex_proxy = depreciation
+    net_reinvestment = net_capex + chng_nc_wc
+    owner_earnings_proxy = net_income + depreciation - maintenance_capex_proxy + chng_nc_wc
+
+    diag: dict = {
+        "net_capex": net_capex,
+        "maintenance_capex_proxy": maintenance_capex_proxy,
+        "owner_earnings_proxy": owner_earnings_proxy,
+        "net_reinvestment": net_reinvestment,
+        "growth_required_reinvestment": None,
+        "reinvestment_ratio": None,
+        "cross_check_applied": False,
+        "classification": None,
+        "reason": None,
+    }
+
+    _, _, stc_diag = calc_sales_capital_reinvestment_fallback(
+        ticker, current_revenue, adjusted_ebiat, annual_income_reports, annual_balance_reports
+    )
+
+    if not stc_diag or not stc_diag.get("applied"):
+        diag["reason"] = (stc_diag or {}).get("reason", "sales_capital_fallback_not_applied")
+        return diag
+
+    growth_required_reinvestment = stc_diag.get("required_reinvestment")
+    if (
+        growth_required_reinvestment is None
+        or not math.isfinite(growth_required_reinvestment)
+        or growth_required_reinvestment <= 0
+    ):
+        diag["reason"] = "nonpositive_growth_required_reinvestment"
+        return diag
+
+    reinvestment_ratio = net_reinvestment / growth_required_reinvestment
+    if reinvestment_ratio > OWNER_EARNINGS_SPEND_RATIO_HIGH:
+        classification = "spending_exceeds_growth_need"
+    elif reinvestment_ratio < OWNER_EARNINGS_SPEND_RATIO_LOW:
+        classification = "growth_unusually_efficient_or_underinvesting"
+    else:
+        classification = "within_expected_range"
+
+    diag.update({
+        "growth_required_reinvestment": growth_required_reinvestment,
+        "reinvestment_ratio": reinvestment_ratio,
+        "cross_check_applied": True,
+        "classification": classification,
+    })
+    return diag
+
+
+def owner_earnings_diagnostic_note(diag: dict) -> str:
+    if not diag:
+        return ""
+    net_capex = diag.get("net_capex")
+    owner_earnings_proxy = diag.get("owner_earnings_proxy")
+    if net_capex is None or owner_earnings_proxy is None:
+        return ""
+    if abs(net_capex) < 1.0 and not diag.get("cross_check_applied"):
+        return ""
+
+    base = (
+        f"Owner Earnings proxy (estimate, maintenance capex approximated as depreciation): "
+        f"${owner_earnings_proxy:,.0f}; net capex (capex - depreciation) ${net_capex:,.0f}."
+    )
+    if diag.get("cross_check_applied"):
+        base += (
+            f" Growth-required reinvestment (sales/capital cross-check) ${diag['growth_required_reinvestment']:,.0f}, "
+            f"ratio {diag['reinvestment_ratio']:.2f}x -- {diag['classification']}."
+        )
+    else:
+        reason = diag.get("reason") or "unavailable"
+        base += f" Growth cross-check not available ({reason})."
+    return base
+
+
 # HessGrp FCFF growth-forecast methodology (2026-10-01). Replaces
 # calc_growth_rate() (reinvestment_rate x return_on_capital) and the
 # 2026-09-29 anomalous-wealth-creator sales/capital fallback as the
@@ -3500,6 +3628,30 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
 
+        # Owner Earnings diagnostic (2026-10-22) — detail-only, never feeds
+        # firm_reinvestment/growth_rate/calc_expected_fcff(). Wrapped as one
+        # unit (including the net_income/revenue extraction and the new
+        # annual_balance_sheet() fetch, which is not otherwise made on this
+        # path) so this new, purely additive diagnostic can never become a
+        # new batch failure mode regardless of why it fails.
+        try:
+            current_revenue = inc_stmnt["totalRevenue"][0]
+            net_income = inc_stmnt["netIncome"][0]
+            annual_balance_reports = annual_balance_sheet(ticker, MY_API_KEY)
+            owner_earnings_diag = calc_owner_earnings_diagnostic(
+                ticker, net_income, capex, depreciation, chng_nc_wc,
+                current_revenue, adjusted_ebiat, annual_reports, annual_balance_reports,
+            )
+        except Exception as exc:
+            logger.warning(f"{ticker}: owner-earnings diagnostic skipped ({exc}).")
+            owner_earnings_diag = {
+                "net_capex": None, "maintenance_capex_proxy": None,
+                "owner_earnings_proxy": None, "net_reinvestment": None,
+                "growth_required_reinvestment": None, "reinvestment_ratio": None,
+                "cross_check_applied": False, "classification": None,
+                "reason": "owner_earnings_diagnostic_error",
+            }
+
         # Sanity check: if |EBIT| dwarfs the market cap by more than 10×,
         # the quarterly working-capital data is almost certainly corrupted.
         if market_cap > 0 and abs(adjusted_ebit) > 10 * market_cap:
@@ -3692,6 +3844,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                 cyclical_reinvestment_normalization_note(reinvest_diag),
                 sales_capital_reinvestment_fallback_note(sales_capital_diag),
                 hessgrp_growth_forecast_note(growth_forecast_diag),
+                owner_earnings_diagnostic_note(owner_earnings_diag),
             ) if n
         )
 
@@ -4396,6 +4549,28 @@ def _value_stock_detail_fcff(
         adjusted_bv_equity = calc_adj_bv_equity(bal_sht, amort_schedule)
         bv_debt = calc_bv_debt(bal_sht)
 
+        # Owner Earnings diagnostic (2026-10-22) — detail-only, see the
+        # matching batch-path comment in _value_stock_fcff(). Wrapped as one
+        # unit so this new, purely additive diagnostic can never become a
+        # new failure mode regardless of why it fails.
+        try:
+            current_revenue = inc_stmnt["totalRevenue"][0]
+            net_income = inc_stmnt["netIncome"][0]
+            annual_balance_reports = annual_balance_sheet(ticker, MY_API_KEY)
+            owner_earnings_diag = calc_owner_earnings_diagnostic(
+                ticker, net_income, capex, depreciation, chng_nc_wc,
+                current_revenue, adjusted_ebiat, annual_reports, annual_balance_reports,
+            )
+        except Exception as exc:
+            logger.warning(f"{ticker}: owner-earnings diagnostic skipped ({exc}).")
+            owner_earnings_diag = {
+                "net_capex": None, "maintenance_capex_proxy": None,
+                "owner_earnings_proxy": None, "net_reinvestment": None,
+                "growth_required_reinvestment": None, "reinvestment_ratio": None,
+                "cross_check_applied": False, "classification": None,
+                "reason": "owner_earnings_diagnostic_error",
+            }
+
         if market_cap > 0 and abs(adjusted_ebit) > 10 * market_cap:
             raise ValueError(
                 f"Adjusted EBIT ({adjusted_ebit:,.0f}) is > 10× market cap "
@@ -4662,6 +4837,13 @@ def _value_stock_detail_fcff(
             "cyclical_reinvestment_direction_mismatch": (
                 reinvest_diag.get("reason") == "direction_mismatch_possible_structural_change"
             ),
+            "owner_earnings_net_capex": owner_earnings_diag.get("net_capex"),
+            "owner_earnings_maintenance_capex_proxy": owner_earnings_diag.get("maintenance_capex_proxy"),
+            "owner_earnings_proxy": owner_earnings_diag.get("owner_earnings_proxy"),
+            "owner_earnings_growth_required_reinvestment": owner_earnings_diag.get("growth_required_reinvestment"),
+            "owner_earnings_reinvestment_ratio": owner_earnings_diag.get("reinvestment_ratio"),
+            "owner_earnings_cross_check_applied": owner_earnings_diag.get("cross_check_applied", False),
+            "owner_earnings_classification": owner_earnings_diag.get("classification"),
             "adjusted_ebit": adjusted_ebit,
             "interest_expense": inc_stmnt["interest_expense"][0],
             "capex": capex,
@@ -5185,6 +5367,11 @@ def _generate_xlsx_fcff(
         ("Cyclical Reinvestment Normalization Applied?", "Yes" if d["cyclical_reinvestment_normalization_applied"] else "No", "text"),
         ("Cyclically Normalized Capex", d["cyclical_normalized_capex"], "dollar"),
         ("Capex Used in Reinvestment Calc", d["reinvest_capex_used"], "dollar"),
+        ("Owner Earnings Proxy (estimate, maintenance capex ~ depreciation)", d["owner_earnings_proxy"], "dollar"),
+        ("Net Capex (Capex - Depreciation)", d["owner_earnings_net_capex"], "dollar"),
+        ("Growth-Required Reinvestment (Sales/Capital cross-check)", d["owner_earnings_growth_required_reinvestment"], "dollar"),
+        ("Reinvestment vs. Growth-Required Ratio", d["owner_earnings_reinvestment_ratio"], "pct"),
+        ("Owner Earnings Classification", d["owner_earnings_classification"] or "n/a", "text"),
         ("Adjusted Depreciation & Amort'n", d["depreciation"], "dollar"),
         ("Tax Rate on Income", d["eff_tax_rate"], "pct"),
         ("Current Revenues", d["revenue"], "dollar"),
