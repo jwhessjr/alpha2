@@ -27,6 +27,23 @@ from pathlib import Path as _Path
 # in HessGrp/lib), without shadowing a same-directory hg_dcflib.py copy.
 _sys.path.append(str(_Path.home() / "HessGrp" / "lib"))
 import hg_dcflib
+from financial_data_repository_reader import fetch_quarterly_ttm, fetch_point_in_time_series
+# Phase 1 ownership-controls flag (research-validated, see
+# ~/Desktop/HessGrp_RR_Work_2026-10/stage_v_ownership_controls_phase1_revision/).
+# Flag-only: never changes fcff_value/terminal_value/share_value/
+# margin_of_safety_pc/cost_of_capital for any ticker. Import is defensive
+# -- a missing/broken dependency must never prevent this module (or the
+# nightly batch) from loading at all.
+try:
+    from hg_ownership_controls import ownership_control_note
+except Exception as _ownership_import_exc:  # noqa: BLE001 -- deliberately broad
+    # Python clears the `as` exception variable once this except block
+    # exits -- must capture the message into a plain string NOW, or the
+    # closure below raises NameError the first time it's actually called.
+    _ownership_import_exc_msg = str(_ownership_import_exc)
+    def ownership_control_note(ticker, market_cap, db_path, valuation_date):  # type: ignore
+        return f"[OWNERSHIP_SCREEN_ERROR] dependency unavailable: {_ownership_import_exc_msg}"
+FINANCIAL_DATA_DB_PATH = "/Volumes/Financial_Data/financial_data.db"
 # hg_financial_classifier / hg_financial_adapter are deliberately NOT
 # imported at module scope here -- hg_financial_adapter.py itself does
 # `import av_fcff_2 as prod` and reads `prod.GROWTH_PERIOD` as a default
@@ -35,7 +52,6 @@ import hg_dcflib
 # AttributeError (confirmed live, 2026-10-06). Both are imported locally,
 # inside _classify_and_route()/value_stock()/value_stock_detail(), where
 # this module is already fully initialized by the time they run.
-from av_fetcher import av_fetch
 from config import INTRINIO_KEY
 import json
 import logging
@@ -399,6 +415,13 @@ def _fetch_with_fallback(ticker, intrinio_fn, av_fn, label):
 
     When DATA_PROVIDER == "av" explicitly (manual/shadow-mode AV-only runs),
     no fallback applies -- calls AV directly, unchanged from Phase 1/2.
+
+    RETIRED 2026-11-17 (dcf_financial_repository_migration) for income_
+    statement/balance_sheet/cash_flow_statement/research_and_development --
+    those four are now sourced exclusively from financial_data_repository,
+    with no AV/live-Intrinio fallback of any kind. This helper's only
+    remaining caller is enterprise_quote()/prefetch_quotes() (price/quote
+    data, explicitly out of scope for that migration).
     """
     if DATA_PROVIDER != "intrinio":
         return av_fn()
@@ -412,125 +435,140 @@ def _fetch_with_fallback(ticker, intrinio_fn, av_fn, label):
 
 
 def income_statement(ticker, api_key, is_financial_or_reit: bool = False):
-    return _fetch_with_fallback(
-        ticker,
-        lambda: hg_dcflib.get_inc_stmnt_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit),
-        lambda: hg_dcflib.get_inc_stmnt(ticker, api_key),
-        "income statement",
-    )
+    """RETIRED 2026-11-17 (dcf_financial_repository_migration): no more
+    live Intrinio/AV fetch or fallback here -- sourced exclusively from
+    /Volumes/Financial_Data/financial_data.db via
+    hg_dcflib.get_inc_stmnt_repository(). See that function's docstring
+    for the exact field mapping, TTM-block construction, and the shared
+    bank-template-misclassification guard. Missing/insufficient repository
+    data raises ValueError, caught by every caller's existing broad
+    except-and-skip handling -- never a silent AV fallback, never a
+    misleading valuation."""
+    return hg_dcflib.get_inc_stmnt_repository(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit)
 
 
 def annual_income_statement(ticker, api_key, years: int = CYCLICAL_MARGIN_MAX_YEARS):
     """Up to `years` years of annual (revenue, ebit) pairs, most-recent-first.
-    Feeds calc_cyclical_normalized_ebit() -- see its docstring. Intrinio-
-    primary via hg_dcflib.get_inc_stmnt_intrinio_annual() (already returns
-    this exact shape); AV-fallback normalizes AV's raw annualReports through
-    hg_dcflib.annual_ebit_proxy() so the caller never needs to know which
-    provider served a given ticker."""
-    def _av_annual():
-        raw = av_fetch("INCOME_STATEMENT", symbol=ticker).get("annualReports", [])
-        return [
-            {
-                "totalRevenue": hg_dcflib.safe_float(row.get("totalRevenue")),
-                "ebit": hg_dcflib.annual_ebit_proxy(row),
-            }
-            for row in raw[:years]
-        ]
+    Feeds calc_cyclical_normalized_ebit() -- see its docstring.
 
-    return _fetch_with_fallback(
-        ticker,
-        lambda: hg_dcflib.get_inc_stmnt_intrinio_annual(ticker, INTRINIO_KEY, years=years),
-        _av_annual,
-        "annual income statement (cyclical normalization)",
+    RETIRED 2026-11-17 (dcf_financial_repository_migration): previously
+    Intrinio-primary via get_inc_stmnt_intrinio_annual() (Intrinio's native
+    FY-period annual filings) with an AV annualReports fallback. financial_
+    data.db has NO 'FY' periods for income_statement at all (confirmed
+    live -- it only ingests Q1-Q4, a true 40-quarter flow-statement
+    repository) -- and per docs/decisions.md 2026-10-01 ("HessGrp's
+    canonical flow-variable methodology is quarterly-derived trailing-12-
+    month periods, not fiscal-year statements, even where FY data happen
+    to be directly available"), switching THIS shape to true FY periods
+    was already explicitly rejected for the sibling R&D case. So this now
+    reuses the exact same TTM-rolling-quarter-block mechanic as
+    income_statement() above (fetch_quarterly_ttm(), up to `years*4`
+    quarters), just reshaped into AV's own {totalRevenue, ebit} dict-per-
+    year shape so calc_cyclical_normalized_ebit() needs no changes. No
+    AV/live-Intrinio fallback -- an insufficient-history ValueError
+    propagates to this function's own callers, all of which already wrap
+    it in a try/except that degrades to "cyclical normalization skipped,
+    use raw TTM EBIT" (see _value_stock_fcff())."""
+    result = fetch_quarterly_ttm(
+        ticker, "income_statement",
+        {"revenue": "totalrevenue", "ebit": "totaloperatingincome"},
+        n_quarters=years * 4,
     )
+    if result is None:
+        raise ValueError(f"No quarterly income-statement history for {ticker} in financial_data_repository")
+    fields = result["fields"]
+    n = min(len(fields["revenue"]), len(fields["ebit"]))
+    return [
+        {"totalRevenue": fields["revenue"][i], "ebit": fields["ebit"][i]}
+        for i in range(n)
+    ]
 
 
 def annual_cash_flow_statement(ticker, api_key, years: int = CYCLICAL_MARGIN_MAX_YEARS):
     """Up to `years` years of annual capex history, most-recent-first,
     POSITIVE-magnitude sign convention (matches calc_capital_expenditures()'s
-    existing contract -- the current-year figure calc_reinvestment() already
-    expects). Feeds calc_cyclical_normalized_reinvestment() -- see its
-    docstring. 2026-09-22 follow-up to annual_income_statement() (same
-    fetch/fallback template).
+    existing contract). Feeds calc_cyclical_normalized_reinvestment().
 
-    SIGN FLIP, explicit and isolated to this one function: Intrinio's
-    get_cash_flow_intrinio_annual() deliberately returns capitalExpenditures
-    RAW/NEGATIVE (see its own docstring) -- that's the correct convention
-    for its other consumer, moat_score.py, but the OPPOSITE of what every
-    capex figure in THIS file expects (calc_capital_expenditures(),
-    calc_reinvestment()'s capex parameter). The flip happens once, here,
-    at the vendor boundary -- never inside the calc functions themselves.
-    AV's own annual capitalExpenditures is already positive (matches AV's
-    quarterly convention, summed with no flip by calc_capital_expenditures()
-    today) -- the AV branch below does NOT flip."""
-    def _av_annual():
-        raw = av_fetch("CASH_FLOW", symbol=ticker).get("annualReports", [])
-        return [
-            {"capitalExpenditures": hg_dcflib.safe_float(row.get("capitalExpenditures"))}
-            for row in raw[:years]
-        ]
-
-    def _intrinio_annual():
-        raw = hg_dcflib.get_cash_flow_intrinio_annual(ticker, INTRINIO_KEY, years=years)
-        return [
-            {"capitalExpenditures": -hg_dcflib.safe_float(row.get("capitalExpenditures"))}
-            for row in raw
-        ]
-
-    return _fetch_with_fallback(
-        ticker,
-        _intrinio_annual,
-        _av_annual,
-        "annual cash flow (cyclical reinvestment normalization)",
+    RETIRED 2026-11-17 (dcf_financial_repository_migration): same TTM-
+    rolling-quarter-block reasoning as annual_income_statement() above --
+    financial_data.db has no 'FY' periods for cash_flow_statement either.
+    purchaseofplantpropertyandequipment is negative-signed in the
+    repository (same convention as live Intrinio) -- flipped here, once,
+    at this fetch boundary, exactly like get_cash_flow_repository()'s own
+    capex sign flip. No AV/live-Intrinio fallback -- see
+    annual_income_statement()'s docstring for the caller's existing
+    graceful-degrade handling, identical pattern here."""
+    result = fetch_quarterly_ttm(
+        ticker, "cash_flow_statement",
+        {"capex": "purchaseofplantpropertyandequipment"},
+        n_quarters=years * 4,
     )
-
+    if result is None:
+        raise ValueError(f"No quarterly cash-flow history for {ticker} in financial_data_repository")
+    return [{"capitalExpenditures": -v} for v in result["fields"]["capex"]]
 
 
 def annual_balance_sheet(ticker, api_key, years: int = 4):
-    """Up to ``years`` annual balance sheets, most-recent-first.
+    """Up to ``years`` annual balance sheets, most-recent-first, AV field
+    names (totalShareholderEquity/longTermDebt/shortTermDebt/
+    cashAndShortTermInvestments) -- used only by the (diagnostic-only,
+    already-superseded-as-a-growth-source) sales/capital reinvestment
+    fallback and the Owner Earnings diagnostic's cross-check.
 
-    Used only by the anomalous-reinvestment fallback.  The fallback needs a
-    multi-year *level* sales-to-capital ratio; it must not infer capital
-    efficiency from the same current-period reinvestment number that triggered
-    the anomaly.  Intrinio is primary and AV is the normal provider fallback.
-    """
-    def _av_annual():
-        raw = av_fetch("BALANCE_SHEET", symbol=ticker).get("annualReports", [])
-        return raw[:years]
-
-    return _fetch_with_fallback(
-        ticker,
-        lambda: hg_dcflib.get_bal_sheet_intrinio_annual(ticker, INTRINIO_KEY, years=years),
-        _av_annual,
-        "annual balance sheet (sales/capital reinvestment fallback)",
-    )
+    RETIRED 2026-11-17 (dcf_financial_repository_migration): sourced from
+    fetch_point_in_time_series() (the same year-over-year point-in-time
+    mechanic as balance_sheet()/get_bal_sheet_repository() below) instead
+    of a live Intrinio/AV call. No lease-liability addback here --
+    deliberately: this diagnostic-only path never fed calc_bv_debt() or
+    any production WACC/ROIC figure even before this migration, so the one
+    narrow live exception preserved in get_bal_sheet_repository() (see its
+    docstring) is not worth extending to a path this secondary. No AV/
+    live-Intrinio fallback -- an insufficient-history ValueError propagates
+    to this function's own callers, both wrapped in a try/except that
+    degrades the diagnostic to "skipped" (see _value_stock_fcff())."""
+    tags = {
+        "equity": "totalcommonequity", "ltd": "longtermdebt", "std": "shorttermdebt",
+        "cash": "cashandequivalents", "sti": "shortterminvestments",
+    }
+    result = fetch_point_in_time_series(ticker, "balance_sheet_statement", tags, n_periods=years)
+    if result is None:
+        raise ValueError(f"No balance sheet history for {ticker} in financial_data_repository")
+    fields = result["fields"]
+    n = len(result["periods"])
+    out = []
+    for i in range(n):
+        cash = hg_dcflib.safe_float(fields["cash"][i]) + hg_dcflib.safe_float(fields["sti"][i])
+        out.append({
+            "totalShareholderEquity": fields["equity"][i],
+            "longTermDebt": fields["ltd"][i],
+            "shortTermDebt": fields["std"][i],
+            "cashAndShortTermInvestments": cash if cash > 0 else None,
+        })
+    return out
 
 
 def balance_sheet(ticker, api_key, is_financial_or_reit: bool = False):
-    return _fetch_with_fallback(
-        ticker,
-        lambda: hg_dcflib.get_bal_sheet_intrinio(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit),
-        lambda: hg_dcflib.get_bal_sheet(ticker, api_key, is_financial_or_reit=is_financial_or_reit),
-        "balance sheet",
-    )
+    """RETIRED 2026-11-17 (dcf_financial_repository_migration): no more
+    live Intrinio/AV fetch or fallback here -- sourced exclusively from
+    financial_data.db via hg_dcflib.get_bal_sheet_repository(), which keeps
+    ONE narrow, explicit, live-Intrinio exception for lease-liability
+    addback only (the repository has no as-reported/raw-XBRL tags at all
+    -- see that function's docstring)."""
+    return hg_dcflib.get_bal_sheet_repository(ticker, INTRINIO_KEY, is_financial_or_reit=is_financial_or_reit)
 
 
 def cash_flow_statement(ticker, api_key):
-    return _fetch_with_fallback(
-        ticker,
-        lambda: hg_dcflib.get_cash_flow_intrinio(ticker, INTRINIO_KEY),
-        lambda: hg_dcflib.get_cash_flow(ticker, api_key),
-        "cash flow statement",
-    )
+    """RETIRED 2026-11-17 (dcf_financial_repository_migration): no more
+    live Intrinio/AV fetch or fallback here -- sourced exclusively from
+    financial_data.db via hg_dcflib.get_cash_flow_repository()."""
+    return hg_dcflib.get_cash_flow_repository(ticker, INTRINIO_KEY)
 
 
 def research_and_development(ticker, rd_years, api_key):
-    return _fetch_with_fallback(
-        ticker,
-        lambda: hg_dcflib.get_rAndD_intrinio(ticker, rd_years, INTRINIO_KEY),
-        lambda: hg_dcflib.get_rAndD(ticker, rd_years, api_key),
-        "R&D",
-    )
+    """RETIRED 2026-11-17 (dcf_financial_repository_migration): no more
+    live Intrinio/AV fetch or fallback here -- sourced exclusively from
+    financial_data.db via hg_dcflib.get_rAndD_repository()."""
+    return hg_dcflib.get_rAndD_repository(ticker, rd_years, INTRINIO_KEY)
 
 
 # Populated by prefetch_quotes() before a batch run — see that function's
@@ -2942,6 +2980,7 @@ def _rescore_tickers(db_path: str, tickers: list) -> None:
         from composite_score import (
             score_row, upsert, ensure_table as ensure_score_table,
         )
+        from financial_data_repository_reader import fetch_snapshot_fields_bulk
     except ImportError:
         logger.warning("composite_score not importable; skipping auto-rescore")
         return
@@ -2951,8 +2990,7 @@ def _rescore_tickers(db_path: str, tickers: list) -> None:
         ensure_score_table(conn)
         moat_map = {r["ticker"]: dict(r)
                     for r in conn.execute("SELECT * FROM moat_scores").fetchall()}
-        fd_map   = {r["ticker"]: dict(r)
-                    for r in conn.execute("SELECT * FROM financial_data").fetchall()}
+        fd_map   = fetch_snapshot_fields_bulk(tickers)
         for ticker in tickers:
             vrow = conn.execute(
                 "SELECT * FROM valuation WHERE ticker=?", (ticker,)
@@ -3498,6 +3536,20 @@ def value_stock(ticker: str, growth_period: int, db_path: str | None = None):
         except hg_financial_adapter.HgFinancialAdapterUnsupported as e:
             logger.warning(f"{ticker}: UNSUPPORTED_FINANCIAL_SUBTYPE (bank_adapter_failure) -- {e.reason}: {e.detail}")
             return None
+        except Exception as e:
+            # Found live 2026-11-18: an empty/malformed repository field
+            # (e.g. inc_stmnt["netIncome"] == []) raised a raw IndexError
+            # here that propagated all the way through main()'s batch loop
+            # and killed the ENTIRE 2071-ticker run at ticker ~1268/2071 --
+            # this route was the only one of the four (fcff/bank_adapter/
+            # legacy_insurer/reit) without the "a thin fetch failing must
+            # never add a new failure mode" safety net every other route
+            # already has (see this file's own convention, e.g. the
+            # "Skipping TICKER: ..." pattern in _value_stock_fcff()). Same
+            # treatment as that convention: log and skip this ticker only,
+            # never let one bad ticker's data abort every ticker after it.
+            logger.warning(f"{ticker}: bank_adapter valuation failed unexpectedly ({type(e).__name__}: {e}) -- skipping")
+            return None
         return _stock_value_from_financial_valuation(ticker, industry, growth_period, result)
 
     if decision.route == "legacy_insurer":
@@ -3836,6 +3888,7 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         notes = " | ".join(
             n for n in (
                 notes,
+                ownership_control_note(ticker, market_cap, FINANCIAL_DATA_DB_PATH, valuation_date),
                 terminal_value_dominance_note(terminal_value_pv, market_cap),
                 low_growth_rate_note(growth_rate, RISK_FREE),
                 extreme_reinvestment_rate_note(reinvestment_rate),
@@ -5875,10 +5928,14 @@ def main():
                              "Use when AV balance sheet data is known to be incorrect (e.g., PPG Q1 2026). "
                              "Example: --equity-override 8104000000")
     parser.add_argument("--provider", choices=["av", "intrinio"], default="intrinio",
-                        help="Fundamentals data source (default: intrinio, with automatic fallback "
-                             "to AV per-ticker if an Intrinio fetch fails — see docs/decisions.md, "
-                             "'Data provider: Intrinio becomes primary'). Pass --provider av to force "
-                             "AV only, no fallback, e.g. for a manual AV-side comparison run.")
+                        help="Quote/price data source only (default: intrinio, with automatic "
+                             "fallback to AV per-ticker if an Intrinio quote fetch fails). RETIRED "
+                             "2026-11-17 (dcf_financial_repository_migration) for FUNDAMENTALS "
+                             "(income statement/balance sheet/cash flow/R&D): those are now sourced "
+                             "exclusively from financial_data.db, with no AV/live-Intrinio fallback "
+                             "of any kind -- this flag no longer affects them at all. Pass "
+                             "--provider av to force AV-only quotes, e.g. for a manual AV-side "
+                             "comparison run.")
     args = parser.parse_args()
 
     growth_period = args.growth
@@ -5889,9 +5946,11 @@ def main():
         print(f"  equity override active: ${EQUITY_OVERRIDE:,.0f}")
     DATA_PROVIDER = args.provider
     if DATA_PROVIDER == "intrinio":
-        print("  data provider: Intrinio (primary), AV fallback on per-ticker failure")
+        print("  quote provider: Intrinio (primary), AV fallback on per-ticker failure "
+              "(fundamentals: financial_data_repository only, no fallback)")
     else:
-        print("  data provider: AV only (--provider av — no Intrinio fallback)")
+        print("  quote provider: AV only (--provider av — no Intrinio fallback) "
+              "(fundamentals: financial_data_repository only, unaffected by this flag)")
     db_path       = args.db
 
     # ---- Fetch market reference data (deferred from module level) --------

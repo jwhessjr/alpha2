@@ -44,13 +44,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Resolved relative to this file, not a hardcoded path into the other
-# (primary HessGrp) checkout -- mirrors the fix applied to the primary
-# lib/hg_financial_adapter.py copy. This Alpha2 tree uses a flat src/
-# layout (no lib/ vs scripts/ split), so both av_fcff_2.py and hg_dcflib.py
-# already live alongside this file in src/ -- one insert covers both.
+# Resolved relative to this file (lib/hg_financial_adapter.py), not a
+# hardcoded absolute repo path -- same convention as this file's sibling,
+# lib/hg_financial_stable_roe.py's INDUSTRY_ROE_WORKBOOK_PATH, and
+# lib/hg_dcflib.py's _DATA_DIR. Works identically from the primary HessGrp
+# checkout, the hessgrp-unified/engine subtree, and inside the production
+# Docker image, none of which share Jim's own /Users/jhess filesystem layout.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+sys.path.insert(0, str(_REPO_ROOT / "lib"))
 
 import pandas as pd
 

@@ -247,11 +247,17 @@ def _av_get(url: str) -> dict:
             data = resp.json()
             if not data:
                 # A genuinely successful AV response is never an empty JSON
-                # object for any endpoint we call — this is another shape of
-                # transient rate-limit rejection (confirmed 2026-07-17: 9
-                # tickers hit a downstream KeyError on 'SharesOutstanding'
-                # from get_quote() after OVERVIEW silently returned {}).
-                raise RuntimeError("AV returned an empty response (likely transient rate-limit)")
+                # object for any endpoint we call. This was mislabeled as a
+                # "likely transient rate-limit" from 2026-07-17 until
+                # 2026-10-21, when a live AAPL control check during that
+                # day's ticker-universe audit proved AV's quota was not
+                # exhausted while 5 other tickers (then-stale/delisted
+                # universe entries) still returned {} — i.e. an empty body
+                # is evidence AV has no data for this specific request, not
+                # evidence of rate-limiting. Reported neutrally; retry/
+                # backoff behavior below is unchanged since either cause
+                # benefits from a retry.
+                raise RuntimeError("AV returned no data for ticker/request")
             if "Note" in data:
                 raise RuntimeError(f"AV rate-limit: {data['Note']}")
             if "Information" in data:
@@ -879,13 +885,7 @@ def get_quote(company, apiKey):
     marketCap = safe_float(data["MarketCapitalization"])
     company_name = data["Name"]
     dividend_yield = safe_float(data.get("DividendYield", 0))
-    analyst_count = int(
-        safe_float(data.get("AnalystRatingStrongBuy", 0))
-        + safe_float(data.get("AnalystRatingBuy", 0))
-        + safe_float(data.get("AnalystRatingHold", 0))
-        + safe_float(data.get("AnalystRatingSell", 0))
-        + safe_float(data.get("AnalystRatingStrongSell", 0))
-    )
+    analyst_count = 0  # removed 2026-11-18, Jim's direct call -- "it is of no value whatsoever"
     entQuote = price, sharesOutstanding, marketCap, company_name, dividend_yield, analyst_count
     return entQuote
 
@@ -1486,6 +1486,321 @@ def get_cash_flow_intrinio(company: str, apiKey: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# financial_data_repository (/Volumes/Financial_Data/financial_data.db)
+# fetchers (2026-11-17, dcf_financial_repository_migration) -- same return
+# shapes as the live get_*_intrinio() fetchers immediately above, so
+# av_fcff_2.py's income_statement()/balance_sheet()/cash_flow_statement()/
+# research_and_development() wrappers need no parsing changes, only a
+# swapped fetch call. Sourced from lib/financial_data_repository_reader.py's
+# field-specific fetch_quarterly_ttm()/fetch_point_in_time_series() --
+# period discovery is NEVER gated by any one tag's presence, so a company
+# missing gross_profit/ebit (confirmed common for banks/REITs/insurers in
+# the legacy_financial_table_retirement population comparison) still gets
+# cash/debt/net_income/operating_cf -- each field is read independently.
+#
+# No AV fallback, no live-Intrinio fallback, for any field sourced from the
+# repository. Missing/insufficient repository data raises the SAME
+# ValueError messages the live-Intrinio versions already raised for the
+# equivalent condition -- callers' existing try/except handling (the
+# nightly-batch "a thin fetch failing must never add a new failure mode"
+# convention already used throughout av_fcff_2.py) is unchanged.
+#
+# ONE NARROW, EXPLICIT, LABELED EXCEPTION: lease-liability addback
+# (_intrinio_lease_debt_addback()) needs Intrinio's as-reported/raw-XBRL
+# view, which financial_data.db does not store at all -- confirmed live,
+# zero CamelCase/as-reported-style tags of any kind; it ingests only
+# Intrinio's STANDARDIZED tag set (196 tags total). get_bal_sheet_
+# repository() below still makes ONE live Intrinio call for this piece,
+# for the CURRENT period only (bv_debt/short_term_debt/long_term_debt are
+# never read beyond index [0] anywhere in av_fcff_2.py -- confirmed via
+# grep -- so computing the addback for older comparison periods, as the
+# live-Intrinio version did, would be live-API cost spent on a value
+# nothing downstream reads). A live-fetch failure for just this piece
+# degrades to "add no lease liability" (0.0), the exact same conservative
+# bias _intrinio_lease_debt_addback() already uses when detection is
+# ambiguous -- it never blocks or falls back the rest of the (otherwise
+# fully repository-sourced) balance sheet.
+# ---------------------------------------------------------------------------
+
+from financial_data_repository_reader import (
+    fetch_quarterly_ttm, fetch_point_in_time_series,
+    FINANCIAL_DATA_REPOSITORY_DB_PATH, _connect, resolve_company_id,
+    _recent_periods, _values_for_fundamentals,
+)
+
+
+def _live_lease_addback_for_current_period(company: str, apiKey: str, standardized_longtermdebt: float) -> tuple[float, float]:
+    """The one narrow live-Intrinio exception in this module -- see the
+    section docstring above. Looks up only the single most recent
+    balance-sheet period live (1 discovery call + 1 as-reported call),
+    never the multi-year history get_bal_sheet_intrinio() used to fetch.
+    Returns (0.0, 0.0) -- add nothing, the function's own existing
+    conservative default -- if the live lookup fails for any reason; never
+    raises, since this is supplementary enrichment of an otherwise
+    complete, repository-sourced balance sheet, not a required field."""
+    try:
+        periods = _intrinio_periods(company, "balance_sheet_statement", apiKey, n=1)
+        if not periods:
+            return 0.0, 0.0
+        return _intrinio_lease_debt_addback(periods[0]["id"], apiKey, standardized_longtermdebt)
+    except Exception as exc:
+        logger.warning(
+            f"{company}: live lease-liability addback lookup failed ({exc}) -- "
+            f"adding no lease liability for the current period (conservative default)."
+        )
+        return 0.0, 0.0
+
+
+def get_inc_stmnt_repository(company: str, apiKey: str, is_financial_or_reit: bool = False) -> dict:
+    """
+    financial_data_repository-backed equivalent of get_inc_stmnt_intrinio()
+    -- same return shape, same TTM-rolling-quarter-block aggregation, same
+    single-quarter EBIT anomaly detection, same bank-template-misclassification
+    guard. `apiKey` is accepted for call-site parity with the live-Intrinio
+    version but unused -- no live call is made for any field here except
+    via get_bal_sheet_repository()'s separate, narrow lease exception.
+    """
+    tags = {
+        "ebit": "totaloperatingincome", "pretax": "totalpretaxincome",
+        "tax": "incometaxexpense", "int_exp": "totalinterestexpense",
+        "int_inc": "totalinterestincome", "revenue": "totalrevenue",
+        "net_income": "netincome",
+    }
+    result = fetch_quarterly_ttm(company, "income_statement", tags, n_quarters=12)
+    if result is None:
+        raise ValueError(f"No quarterly reports found for {company} in financial_data_repository")
+
+    latest_values = result["latest_values"]
+    if not is_financial_or_reit and "totaloperatingincome" not in latest_values and "totalinterestincome" in latest_values:
+        raise ValueError(
+            f"{company}: financial_data_repository has the bank/financial-institution "
+            f"template (totalinterestincome present, totaloperatingincome "
+            f"absent) for a non-financial ticker -- likely an industry "
+            f"misclassification upstream, not a real zero-EBIT company."
+        )
+
+    fields = result["fields"]
+
+    def _interest_expense_block(i):
+        # Mirrors _intrinio_quarter_interest_expense()'s per-quarter
+        # preference, applied per TTM block instead: prefer the dedicated
+        # gross interest-expense block sum; fall back to the net combined
+        # interest-income block sum (sign-flipped) only when the dedicated
+        # series doesn't reach this block.
+        if i < len(fields["int_exp"]):
+            return fields["int_exp"][i]
+        if i < len(fields["int_inc"]):
+            return -fields["int_inc"][i]
+        return 0.0
+
+    n_years = max(len(fields["ebit"]), len(fields["pretax"]), len(fields["tax"]),
+                   len(fields["revenue"]), len(fields["net_income"]),
+                   len(fields["int_exp"]), len(fields["int_inc"]))
+
+    income_statement = {
+        "ebit": list(fields["ebit"]),
+        "incomeBeforeTax": list(fields["pretax"]),
+        "income_tax_expense": list(fields["tax"]),
+        "interest_expense": [_interest_expense_block(i) for i in range(n_years)],
+        "totalRevenue": list(fields["revenue"]),
+        "netIncome": list(fields["net_income"]),
+    }
+
+    # Single-quarter EBIT anomaly detection -- same mechanic as
+    # get_inc_stmnt_intrinio(): look at the 4 most recent REAL quarters
+    # (not the TTM block sum) for the worst single-quarter EBIT dragging
+    # down an otherwise-positive trailing year.
+    ebit_anomaly = None
+    if fields["ebit"]:
+        conn_periods = result["periods"][:4]
+        if len(conn_periods) == 4:
+            conn = _connect(FINANCIAL_DATA_REPOSITORY_DB_PATH)
+            try:
+                cid = resolve_company_id(conn, company)
+                ttm_periods = _recent_periods(conn, cid, "income_statement", limit=4)
+                vals = _values_for_fundamentals(conn, [p["fundamental_id"] for p in ttm_periods])
+                q_ebits = [safe_float(vals.get(p["fundamental_id"], {}).get("totaloperatingincome")) for p in ttm_periods]
+            finally:
+                conn.close()
+            ttm = sum(q_ebits)
+            if ttm < 0 and q_ebits:
+                worst_idx = min(range(len(q_ebits)), key=lambda i: q_ebits[i])
+                worst_ebit = q_ebits[worst_idx]
+                normalized_ttm = ttm - worst_ebit
+                if normalized_ttm > 0:
+                    ebit_anomaly = {
+                        "quarter_date": None,
+                        "quarter_ebit": worst_ebit,
+                        "normalized_ttm_ebit": normalized_ttm,
+                        "quarters": list(enumerate(q_ebits)),
+                    }
+    income_statement["ebit_anomaly"] = ebit_anomaly
+
+    return income_statement
+
+
+def get_bal_sheet_repository(company: str, apiKey: str, is_financial_or_reit: bool = False) -> dict:
+    """
+    financial_data_repository-backed equivalent of get_bal_sheet_intrinio()
+    -- same return shape, same point-in-time year-over-year aggregation,
+    same cash+short-term-investments definition (granular sum preferred,
+    falling back to restrictedcash -- see get_bal_sheet_intrinio()'s own
+    docstring for why this is the correct convention, confirmed against
+    Damodaran's own NVDA valuation).
+
+    `is_financial_or_reit` accepted for signature parity, unused here --
+    same as get_bal_sheet_intrinio(), the repository's cashandequivalents
+    tag has shown no financial-firm/REIT cash-tagging quirk.
+
+    See this module's section docstring (above get_inc_stmnt_repository())
+    for the one narrow live-Intrinio exception this function makes: lease-
+    liability addback, current period only.
+    """
+    tags = {
+        "cash": "cashandequivalents", "sti": "shortterminvestments",
+        "restricted_cash": "restrictedcash",
+        "tca": "totalcurrentassets", "tcl": "totalcurrentliabilities",
+        "std": "shorttermdebt", "ltd": "longtermdebt",
+        "equity": "totalcommonequity",
+    }
+    result = fetch_point_in_time_series(company, "balance_sheet_statement", tags, n_periods=5)
+    if result is None:
+        raise ValueError(f"No quarterly balance sheet reports found for {company} in financial_data_repository")
+
+    fields = result["fields"]
+    n = len(result["periods"])
+
+    def _cash(i):
+        granular = safe_float(fields["cash"][i]) + safe_float(fields["sti"][i])
+        if granular > 0:
+            return granular
+        return safe_float(fields["restricted_cash"][i])
+
+    cash_and_equivalents = [_cash(i) for i in range(n)]
+    total_current_assets = [safe_float(fields["tca"][i]) for i in range(n)]
+    total_current_liabilities = [safe_float(fields["tcl"][i]) for i in range(n)]
+
+    raw_short_term_debt = [safe_float(fields["std"][i]) for i in range(n)]
+    raw_long_term_debt = [safe_float(fields["ltd"][i]) for i in range(n)]
+
+    short_term_debt = list(raw_short_term_debt)
+    long_term_debt = list(raw_long_term_debt)
+    if n > 0:
+        lease_current, lease_noncurrent = _live_lease_addback_for_current_period(
+            company, apiKey, raw_long_term_debt[0]
+        )
+        short_term_debt[0] = raw_short_term_debt[0] + lease_current
+        long_term_debt[0] = raw_long_term_debt[0] + lease_noncurrent
+
+    total_stockholders_equity = [safe_float(fields["equity"][i]) for i in range(n)]
+
+    if not cash_and_equivalents:
+        raise ValueError(f"Insufficient quarterly data to build balance sheet for {company} from financial_data_repository")
+
+    return {
+        "cash_and_equivalents": cash_and_equivalents,
+        "total_current_assets": total_current_assets,
+        "total_current_liabilities": total_current_liabilities,
+        "short_term_debt": short_term_debt,
+        "long_term_debt": long_term_debt,
+        "total_stockholders_equity": total_stockholders_equity,
+    }
+
+
+def get_cash_flow_repository(company: str, apiKey: str) -> dict:
+    """
+    financial_data_repository-backed equivalent of get_cash_flow_intrinio()
+    -- same return shape, same sign convention (capex returned as a
+    POSITIVE magnitude -- the repository's purchaseofplantpropertyand-
+    equipment tag is negative-signed, same as live Intrinio's, so the same
+    sign flip applies here).
+    """
+    tags = {
+        "capex": "purchaseofplantpropertyandequipment",
+        "depr": "depreciationexpense", "amort": "amortizationexpense",
+        "divs": "paymentofdividends",
+        "buyback": "repurchaseofcommonequity", "issuance": "issuanceofcommonequity",
+        "debt_issued": "issuanceofdebt", "debt_repaid": "repaymentofdebt",
+    }
+    result = fetch_quarterly_ttm(company, "cash_flow_statement", tags, n_quarters=20)
+    if result is None:
+        raise ValueError(f"No quarterly cash-flow reports found for {company} in financial_data_repository")
+
+    fields = result["fields"]
+
+    # NOTE: deliberately no per-field raise here (e.g. for empty capex/
+    # depreciation) -- this function is SHARED by the FCFF route (which
+    # needs capex/depreciation) AND the bank/insurer route (which reads
+    # only dividends_paid/buybacks from this same dict, never capex or
+    # depreciation at all -- confirmed via grep). Raising here on a field
+    # that happens to be unavailable would conflate FIELD AVAILABILITY
+    # with CALCULATION ELIGIBILITY -- exactly the coupling this migration
+    # was told to avoid. An empty `capex`/`depreciation` list (confirmed
+    # live: DAL genuinely has zero depreciationexpense/amortizationexpense
+    # coverage in this repository's cash_flow_statement) is instead
+    # surfaced naturally where it actually matters: calc_capital_
+    # expenditures()/calc_depreciation() in av_fcff_2.py index [0]
+    # unconditionally, which raises IndexError for a ticker missing that
+    # specific field -- already caught by _value_stock_fcff()'s existing
+    # broad try/except (every insufficient-data case in this module
+    # degrades the same way), while the bank/insurer route is completely
+    # unaffected since it never reads those two fields.
+    capex = [-v for v in fields["capex"]]
+    depreciation = _combine_blocks_tolerant(fields["depr"], fields["amort"])
+    dividends_paid = list(fields["divs"])
+    buybacks = _combine_blocks_tolerant(fields["buyback"], fields["issuance"])
+    net_new_debt = _combine_blocks_tolerant(fields["debt_issued"], fields["debt_repaid"])
+
+    return {
+        "capex": capex,
+        "depreciation": depreciation,
+        "dividends_paid": dividends_paid,
+        "buybacks": buybacks,
+        "net_new_debt": net_new_debt,
+    }
+
+
+def _combine_blocks_tolerant(a: list, b: list) -> list:
+    """Combine two independently-fetched TTM block series into one,
+    treating EITHER series having a value at a given block index as
+    sufficient -- the other defaults to 0.0 for that block, matching
+    get_cash_flow_intrinio()'s own PER-QUARTER safe_float()-default-to-zero
+    tolerance for these specific paired fields (depreciation+amortization,
+    buyback+issuance, debt issued+repaid). Confirmed live necessary: JPM
+    has real `repurchaseofcommonequity` coverage but zero
+    `issuanceofcommonequity` coverage -- a strict "both must be present"
+    rule would have wrongly reported real buyback data as unavailable.
+    Truncates only at the first block where BOTH series are absent
+    (genuinely no data for either side of the pair) -- never fabricates a
+    block neither series reaches."""
+    n = max(len(a), len(b))
+    out = []
+    for i in range(n):
+        va = a[i] if i < len(a) else None
+        vb = b[i] if i < len(b) else None
+        if va is None and vb is None:
+            break
+        out.append((va or 0.0) + (vb or 0.0))
+    return out
+
+
+def get_rAndD_repository(company: str, rd_years: int, apiKey: str):
+    """
+    financial_data_repository-backed equivalent of get_rAndD_intrinio() --
+    same non-standard 2-tuple return (dict with a list of yearly R&D
+    expenses, years actually processed). rdexpense is a single,
+    unambiguous repository tag, fetched via the same TTM-block mechanic as
+    every other flow field.
+    """
+    result = fetch_quarterly_ttm(company, "income_statement", {"rd": "rdexpense"}, n_quarters=rd_years * 4)
+    if result is None:
+        raise ValueError(f"No quarterly reports found for {company} in financial_data_repository")
+
+    rd_amount = result["fields"]["rd"][:rd_years]
+    return {"research_and_development": rd_amount}, len(rd_amount)
+
+
+# ---------------------------------------------------------------------------
 # Annual-history Intrinio fetchers (Phase 4, 2026-08-26) — moat_score.py/
 # lynch_score.py/growth_screen_2.py want up to 10 years of true ANNUAL
 # figures (AV's annualReports semantic), a different shape from the
@@ -1872,14 +2187,13 @@ def get_quote_intrinio(company: str, apiKey: str):
                             the whole Zacks package (which would carry this)
                             is separately plan-gated too, confirmed
                             2026-08-26 (see project_intrinio_zacks_
-                            analyst_count_gate memory). Sourced from Yahoo
-                            Finance instead (get_analyst_count_yahoo(),
-                            2026-08-26) -- an unofficial, undocumented feed
-                            with a known history of breaking, so this
-                            degrades to 0 with a logged warning on ANY
-                            failure rather than raising, exactly like this
-                            field's original all-Intrinio-plans-lack-it
-                            degrade did before Yahoo was wired in.
+                            analyst_count_gate memory). A Yahoo Finance
+                            fallback (get_analyst_count_yahoo(), 2026-08-26)
+                            was tried and removed 2026-11-18 -- confirmed
+                            live to stall the quote fetch for hours (an
+                            unofficial endpoint's crumb negotiation hanging
+                            in the critical path, not just failing cleanly)
+                            and judged to have no value regardless. Always 0.
 
     Raises
     ------
@@ -1913,15 +2227,7 @@ def get_quote_intrinio(company: str, apiKey: str):
     except Exception:
         dividend_yield = 0.0
 
-    try:
-        analyst_count = get_analyst_count_yahoo(company)
-    except Exception as exc:
-        analyst_count = 0
-        logger.warning(
-            f"{company}: analyst_count fetch failed (neither Intrinio nor AV "
-            f"has this field; Yahoo Finance fallback also failed: {exc}) — "
-            f"defaulting to 0."
-        )
+    analyst_count = 0  # removed 2026-11-18, Jim's direct call -- "it is of no value whatsoever"
 
     return price, shares_outstanding, market_cap, company_name, dividend_yield, analyst_count
 
@@ -2121,85 +2427,15 @@ def get_price_on_or_before_intrinio(company: str, apiKey: str, target_date: str,
     raise ValueError(f"No price on or before {target_date} for {company} within {lookback_days} days")
 
 
-# ── Yahoo Finance (unofficial) — analyst_count only ──────────────────────────
-#
-# Neither Intrinio (Zacks package plan-gated, see project_intrinio_zacks_
-# analyst_count_gate memory) nor AV ever provided a usable analyst_count.
-# Yahoo's undocumented quoteSummary endpoint has a direct
-# numberOfAnalystOpinions field (confirmed live 2026-08-26, AAPL=39) --
-# but Jim has direct prior experience with this exact feed breaking
-# repeatedly ("the feed kept changing... I eventually quit beating my head
-# against the wall"). Deliberately isolated from every other fetcher in this
-# file: never called from get_quote_intrinio()'s core price/name/marketCap
-# path, only wired into that function's already-optional analyst_count slot
-# (which already degraded to 0 on failure before this existed). A break here
-# must never be able to threaten a valuation run.
-
-_yahoo_session: "requests.Session | None" = None
-_yahoo_crumb: str | None = None
-
-
-def _yahoo_get_crumb(force_refresh: bool = False) -> tuple["requests.Session", str]:
-    """
-    Lazily creates and caches one requests.Session + crumb token for the
-    life of the process -- re-fetching a crumb (and a fresh cookie jar) on
-    every single ticker in a full-universe batch would be both slow and a
-    faster route to Yahoo rate-limiting/blocking. Call with
-    force_refresh=True to discard a stale cached crumb and get a new one
-    (get_analyst_count_yahoo() does this once on an "Invalid Crumb" response
-    before giving up).
-    """
-    global _yahoo_session, _yahoo_crumb
-    if _yahoo_session is None or force_refresh:
-        _yahoo_session = requests.Session()
-        _yahoo_session.headers.update({"User-Agent": "Mozilla/5.0"})
-        resp = _yahoo_session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=15)
-        resp.raise_for_status()
-        crumb = resp.text.strip()
-        if not crumb or "error" in crumb.lower():
-            raise RuntimeError(f"Yahoo Finance: could not obtain a crumb token (got: {crumb!r})")
-        _yahoo_crumb = crumb
-    return _yahoo_session, _yahoo_crumb
-
-
-def get_analyst_count_yahoo(company: str) -> int:
-    """
-    Yahoo Finance (unofficial, undocumented, no API key) equivalent of an
-    analyst-coverage-count field neither Intrinio nor AV ever provided.
-    Field map (confirmed live 2026-08-26 against AAPL, 39 analysts):
-      numberOfAnalystOpinions -> quoteSummary?modules=financialData ->
-                                 financialData.numberOfAnalystOpinions.raw
-
-    Retries once with a freshly-fetched crumb on an auth failure (a stale
-    cached crumb, not necessarily a real outage) before raising. Raises
-    (does not silently return 0) on any failure -- matches every other
-    fetcher in this file; the caller (get_quote_intrinio()) decides how to
-    degrade, same pattern already used for its dividend_yield field.
-    """
-    session, crumb = _yahoo_get_crumb()
-    url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{company}"
-    resp = session.get(url, params={"modules": "financialData", "crumb": crumb}, timeout=15)
-
-    if resp.status_code == 401:
-        session, crumb = _yahoo_get_crumb(force_refresh=True)
-        resp = session.get(url, params={"modules": "financialData", "crumb": crumb}, timeout=15)
-
-    resp.raise_for_status()
-    data = resp.json()
-
-    error = data.get("quoteSummary", {}).get("error")
-    if error:
-        raise RuntimeError(f"Yahoo Finance error for {company}: {error}")
-
-    results = data.get("quoteSummary", {}).get("result") or []
-    if not results:
-        raise ValueError(f"Yahoo Finance: no quoteSummary result for {company}")
-
-    count = results[0].get("financialData", {}).get("numberOfAnalystOpinions", {}).get("raw")
-    if count is None:
-        raise ValueError(f"Yahoo Finance: numberOfAnalystOpinions missing for {company}")
-
-    return int(count)
+# analyst_count's Yahoo Finance backend (get_analyst_count_yahoo(),
+# 2026-08-26) was removed 2026-11-18: Jim's direct call, "it is of no value
+# whatsoever" -- confirmed live the same day as a real, severe production
+# defect, not just noise: the Yahoo crumb/quoteSummary negotiation sat in
+# the critical path of every ticker's quote fetch (get_quote_intrinio())
+# and stalled for hours (TCP SYN_SENT, never completing) during the
+# post-catchup valuation refresh, with no way to fail fast since the hang
+# occurs before any exception can be raised. get_quote_intrinio()/get_quote()
+# both now return analyst_count=0 unconditionally -- see their own docstrings.
 
 
 def _get_with_retry(url: str, params: dict | None = None, max_attempts: int = 3, timeout: int = 15) -> "requests.Response":
