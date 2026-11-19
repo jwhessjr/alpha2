@@ -324,6 +324,22 @@ def assess(profile: OwnershipProfile, curated: Optional[CuratedStructuralEvidenc
         a.overall_readiness = OverallReadiness.NOT_READY_REVIEW_REQUIRED
         return a
 
+    if structure_type == OwnershipStructureType.NO_CLAIM:
+        # Gap found 2026-11-19: NO_CLAIM is a declared enum value but had no
+        # handling branch here -- it fell into the generic UNKNOWN/else
+        # branch below and was treated as UNRESOLVED, the opposite of what
+        # a confirmed filing-verified no-claim determination should do.
+        # Mirrors the curated-is-None explicit-zero auto-clear above, but
+        # for the case where current observations are a MIXED
+        # explicit-zero/missing pair (so that auto-clear never fires) and a
+        # human has filing-verified there is in fact no claim at all.
+        a.calculability = CalculabilityStatus.NOT_APPLICABLE_NO_CLAIM
+        a.materiality = MaterialityStatus.NOT_APPLICABLE_NO_CLAIM
+        a.materiality_basis = "No NCI claim reported -- filing-verified (see curated structural evidence), not merely database-screened."
+        a.wacc_status = WaccStatus.NOT_APPLICABLE_NO_CLAIM
+        a.overall_readiness = OverallReadiness.READY_NO_CLAIM
+        return a
+
     if structure_type == OwnershipStructureType.MANAGER_VIE_NO_EQUITY_CLAIM:
         a.calculability = CalculabilityStatus.NOT_CALCULABLE
         a.calculability_reasons = ["Registrant holds no direct equity interest in the consolidated entity — the ownership-waterfall model does not apply to this claim type at all, regardless of size."]

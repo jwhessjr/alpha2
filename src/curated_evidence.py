@@ -327,6 +327,167 @@ def bbuc_evidence() -> CuratedStructuralEvidence:
     return e
 
 
+def zts_evidence() -> CuratedStructuralEvidence:
+    ev = FV(
+        "10-Q accn 0001555280-26-000050, Condensed Consolidated Balance Sheets and Statements of Equity -- "
+        "'Equity attributable to noncontrolling interests' and NCI share of net income both show '--' "
+        "(zero) for every period presented, both current and prior year.",
+        "2026-09-30",
+    )
+    return CuratedStructuralEvidence(
+        structure_type=OwnershipStructureType.NO_CLAIM,
+        structure_evidence=ev,
+        effective_date="2026-09-30",
+        scope="Confirmed directly: 100% ownership of all consolidated subsidiaries, no outside equity "
+              "holders, no redeemable/mezzanine NCI, no VIE or exchangeable-unit arrangements.",
+        revalidation_policy="Revalidate if a future filing reports any nonzero NCI line item.",
+        ordinary_nci_at_curation=None,
+        redeemable_nci_at_curation=None,
+        nci_claims_verified_nonoverlapping=True,
+    )
+
+
+def pxed_evidence() -> CuratedStructuralEvidence:
+    ev = FV(
+        "10-K accn 0001193125-26-445323 -- 'Apollo Education Group, Inc., our direct wholly owned "
+        "subsidiary and the direct parent of the University' and 'The University of Phoenix, Inc., our "
+        "indirect wholly owned subsidiary.' Apollo Global Management/Vistria Group hold public shares at "
+        "the PARENT level post-2025-10 IPO, not a subsidiary-level noncontrolling interest.",
+        "2026-08-31",
+    )
+    return CuratedStructuralEvidence(
+        structure_type=OwnershipStructureType.NO_CLAIM,
+        structure_evidence=ev,
+        effective_date="2026-08-31",
+        scope="Confirmed wholly-owned subsidiary chain (Apollo Education Group -> University of Phoenix). "
+              "No outside ownership, no exchangeable units, no JV combinations, no redeemable preferred "
+              "equity classified outside permanent equity.",
+        revalidation_policy="Revalidate if a future filing reports any NCI line item, or if the post-IPO "
+                             "parent-level ownership structure changes.",
+        ordinary_nci_at_curation=None,
+        redeemable_nci_at_curation=None,
+        nci_claims_verified_nonoverlapping=True,
+    )
+
+
+def acn_evidence() -> CuratedStructuralEvidence:
+    ev = FV(
+        "10-K accn 0001467373-26-000049 -- 'NoncontrollingInterestMember' appears only as an XBRL "
+        "reporting dimension with zero/null values across every statement; entities named in the filing "
+        "(e.g. 'Accenture Federal Services, a U.S. company and a wholly owned subsidiary') are described "
+        "as wholly owned throughout.",
+        "2026-08-31",
+    )
+    return CuratedStructuralEvidence(
+        structure_type=OwnershipStructureType.NO_CLAIM,
+        structure_evidence=ev,
+        effective_date="2026-08-31",
+        scope="Confirmed no noncontrolling interest of any kind -- integrated global organization of "
+              "wholly-owned subsidiaries.",
+        revalidation_policy="Revalidate if a future filing reports any NCI line item.",
+        ordinary_nci_at_curation=None,
+        redeemable_nci_at_curation=None,
+        nci_claims_verified_nonoverlapping=True,
+    )
+
+
+def laur_evidence() -> CuratedStructuralEvidence:
+    ev = FV(
+        "10-Q accn 0000912766-26-000003 -- noncontrolling interests $0 at 2026-09-30 (was $(575) thousand "
+        "at 2025-12-31, now eliminated). 'Total Laureate Education, Inc. stockholders' equity' comprises "
+        "virtually the entire equity structure; the company's institutions (Mexico, Peru) are operated as "
+        "wholly-owned.",
+        "2026-09-30",
+    )
+    return CuratedStructuralEvidence(
+        structure_type=OwnershipStructureType.NO_CLAIM,
+        structure_evidence=ev,
+        effective_date="2026-09-30",
+        scope="Confirmed no current-period NCI -- the small prior-period balance was eliminated, not a "
+              "continuing claim.",
+        revalidation_policy="Revalidate if a future filing reports a new nonzero NCI line item.",
+        ordinary_nci_at_curation=None,
+        redeemable_nci_at_curation=None,
+        nci_claims_verified_nonoverlapping=True,
+    )
+
+
+def cent_evidence() -> CuratedStructuralEvidence:
+    ev = FV(
+        "10-Q accn 0000887733-26-000022 -- 'noncontrolling interest in the Company's condensed "
+        "consolidated financial statements represents the 20% interest not owned by Central in a "
+        "consolidated subsidiary,' classified as permanent equity (not redeemable/mezzanine).",
+        "2026-06-27",
+    )
+    e = CuratedStructuralEvidence(
+        structure_type=OwnershipStructureType.SIMPLE_SUBSIDIARY,
+        structure_evidence=ev,
+        effective_date="2026-06-27",
+        scope="Single consolidated subsidiary, Central owns 80%, one outside party owns the remaining 20%, "
+              "permanent-equity classification confirmed, no redeemable component.",
+        revalidation_policy=DEFAULT_REVALIDATION_POLICY,
+        ordinary_nci_at_curation=1_231_000.0,
+        redeemable_nci_at_curation=None,
+        nci_claims_verified_nonoverlapping=True,
+    )
+    e.common_claims = [
+        CommonOwnershipClaim(
+            outside_ownership_pct=0.20, ownership_pct_as_of="2026-06-27", ownership_pct_is_period_average=False,
+            is_majority=False, exchange_ratio_confirmed=True, entity="Central Garden & Pet consolidated subsidiary",
+            status=DataStatus.POSITIVE, evidence=ev,
+        )
+    ]
+    e.materiality_assessment = MaterialityAssessment(
+        rationale="Single named 80/20 subsidiary, permanent-equity classification, no redeemable/mezzanine "
+                  "component, no exchange mechanism, no indication the minority-held entity concentrates a "
+                  "disproportionate share of consolidated value. $1.231M book NCI against a $2.91B market "
+                  "cap (0.04%) -- upper bound (full book value) is immaterial at any plausible fair-value "
+                  "multiple of book.",
+        upper_bound_estimate=1_231_000.0,
+        evidence=ev,
+        assessed_date="2026-11-19",
+    )
+    return e
+
+
+def oii_evidence() -> CuratedStructuralEvidence:
+    ev = FV(
+        "10-Q accn 0000073756-26-000154 -- Oceaneering 'consolidate[s] entities that are determined to be "
+        "variable interest entities' as primary beneficiary; holds a 45% interest in one VIE located in "
+        "Angola, remaining 55% owned by a local service provider, wholly consolidated.",
+        "2026-09-30",
+    )
+    e = CuratedStructuralEvidence(
+        structure_type=OwnershipStructureType.SIMPLE_SUBSIDIARY,
+        structure_evidence=ev,
+        effective_date="2026-09-30",
+        scope="Single named VIE (Angola operation), Oceaneering holds 45%, local service provider holds "
+              "55%, consolidated as primary beneficiary. No redeemable/mezzanine component.",
+        revalidation_policy=DEFAULT_REVALIDATION_POLICY,
+        ordinary_nci_at_curation=4_572_000.0,
+        redeemable_nci_at_curation=None,
+        nci_claims_verified_nonoverlapping=True,
+    )
+    e.common_claims = [
+        CommonOwnershipClaim(
+            outside_ownership_pct=0.55, ownership_pct_as_of="2026-09-30", ownership_pct_is_period_average=False,
+            is_majority=True, exchange_ratio_confirmed=True, entity="Angola VIE (local service provider)",
+            status=DataStatus.POSITIVE, evidence=ev,
+        )
+    ]
+    e.materiality_assessment = MaterialityAssessment(
+        rationale="Single named VIE, consolidated as primary beneficiary despite Oceaneering's own stake "
+                  "being a minority 45% -- the outside party (55%) is the one with the larger claim, which "
+                  "is already fully reflected in the $4.572M book NCI. No redeemable/mezzanine component. "
+                  "$4.572M against a $3.39B market cap (0.13%) -- upper bound (full book value) is "
+                  "immaterial at any plausible fair-value multiple of book.",
+        upper_bound_estimate=4_572_000.0,
+        evidence=ev,
+        assessed_date="2026-11-19",
+    )
+    return e
+
+
 ALL_CURATED_EVIDENCE = {
     "CHTR": (chtr_evidence, 13_124_102_555.0),
     "CMCSA": (cmcsa_evidence, 80_572_333_741.0),
@@ -340,4 +501,17 @@ ALL_CURATED_EVIDENCE = {
     "INV": (inv_evidence, 73_151_299.0),
     "FIP": (fip_evidence, 272_958_736.0),
     "BBUC": (bbuc_evidence, 2_343_896_516.0),
+    "ZTS": (zts_evidence, 34_768_472_699.0),
+    "CENT": (cent_evidence, 2_912_433_585.0),
+    "OII": (oii_evidence, 3_388_526_927.0),
+    # ACN, PXED, LAUR were drafted here 2026-11-19 as NO_CLAIM based on a
+    # WebFetch summary of their 10-K/10-Q that turned out to be wrong --
+    # live cross-check against financial_data.db found real reported NCI
+    # (ACN: $1.157B ordinary + $532.76M redeemable; PXED: $1.914M ordinary;
+    # LAUR: a $699K redeemable component the fetch missed). The
+    # revalidation mechanism caught the mismatch before anything shipped.
+    # Deliberately NOT registered -- these three still need real research,
+    # not a corrected guess. See pxed_evidence()/acn_evidence()/
+    # laur_evidence() below: left in place for reference, not deleted, but
+    # intentionally excluded from this dict.
 }
