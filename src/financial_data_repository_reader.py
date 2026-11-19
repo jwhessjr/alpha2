@@ -665,14 +665,21 @@ def fetch_point_in_time_series(
 def fetch_lynch_annual_reports(
     ticker: str, years: int = 10, db_path: str = FINANCIAL_DATA_REPOSITORY_DB_PATH,
 ) -> Optional[dict]:
-    """Aligned fiscal-year Lynch inputs; no network or cash-flow dependency.
+    """Aligned fiscal-year annual statement inputs; no network or cash-flow
+    dependency. Despite the name, also serves growth_monitor.py's and
+    growth_screen_2.py's identical annual-statement need (both migrated
+    2026-11-18) -- the field set is a strict superset of what either
+    caller needs, so this is reuse, not a near-duplicate second function.
 
     Flows require Q1-Q4; balance-sheet values are FY snapshots for the
     SAME fiscal year. Stop at a missing year rather than compressing time
     in CAGR calculations. Annual weighted-average diluted shares are the
     mean of quarterly observations (basic shares only if diluted coverage
     is incomplete); this is a proxy for the former provider FY denominator.
-    Optional missing fields remain None; the scorer retains its existing
+    operatingIncome/incomeBeforeTax/incomeTaxExpense (added 2026-11-18 for
+    growth_screen_2.py's ROIC reporting field, never a screen gate for any
+    caller) are optional the same way grossProfit already was. Optional
+    missing fields remain None; the caller retains its existing
     single-field defaults and records those gaps explicitly.
     """
     conn = _connect(db_path)
@@ -691,7 +698,13 @@ def fetch_lynch_annual_reports(
         pit = _values_for_fundamentals(conn, [r['fundamental_id'] for r in by_year.values()])
         tags = {'totalRevenue': 'totalrevenue', 'netIncome': 'netincome',
                 'grossProfit': 'totalgrossprofit', 'diluted': 'weightedavebasicdilutedsharesos',
-                'basic': 'weightedavebasicsharesos'}
+                'basic': 'weightedavebasicsharesos',
+                # Added 2026-11-18 for growth_monitor.py's/growth_screen_2.py's
+                # ROIC reporting field (never a gate for either caller) --
+                # same optional-field treatment as grossProfit below, never
+                # part of the completeness check two lines down.
+                'operatingIncome': 'totaloperatingincome', 'incomeBeforeTax': 'totalpretaxincome',
+                'incomeTaxExpense': 'incometaxexpense'}
         flows = {f: _quarterly_values(conn, cid, 'income_statement', tag) for f, tag in tags.items()}
         inc, bal, fiscal_years, gaps = [], [], [], set()
         for year in range(snapshots[0]['fiscal_year'], snapshots[0]['fiscal_year']-years, -1):
@@ -706,7 +719,8 @@ def fetch_lynch_annual_reports(
             shares = diluted/4 if diluted is not None else basic/4 if basic is not None else None
             if diluted is None:
                 gaps.add('historical shares use basic proxy' if basic is not None else 'historical shares unavailable; legacy EPS fallback applies')
-            income = {f: annual(f) for f in ('totalRevenue','netIncome','grossProfit')}
+            income = {f: annual(f) for f in ('totalRevenue','netIncome','grossProfit',
+                                              'operatingIncome','incomeBeforeTax','incomeTaxExpense')}
             income['commonStockSharesOutstanding'] = shares
             raw = pit.get(by_year[year]['fundamental_id'], {})
             mapping = {'totalShareholderEquity': 'totalcommonequity', 'longTermDebt':'longtermdebt',
@@ -724,5 +738,54 @@ def fetch_lynch_annual_reports(
             return None
         return {'income':inc,'balance':bal,'fiscal_years':fiscal_years,
                 'notes':'; '.join(sorted(gaps)), 'source':'financial_data_repository'}
+    finally:
+        conn.close()
+
+
+def fetch_quarterly_eps_series(
+    ticker: str, n_quarters: int = 20, db_path: str = FINANCIAL_DATA_REPOSITORY_DB_PATH,
+) -> Optional[list[dict]]:
+    """Up to `n_quarters` individual, UNAGGREGATED quarterly EPS observations,
+    most-recent-first -- the shape growth_monitor.py's/growth_screen_2.py's
+    negative-quarterly-EPS growth-screen gate needs (added 2026-11-18,
+    migrating them off hg_dcflib.get_quarterly_eps_intrinio()). Deliberately
+    separate from fetch_quarterly_ttm()/fetch_lynch_annual_reports(): those
+    both SUM quarters into TTM blocks or fiscal years; this caller needs each
+    quarter's own reported figure, not a rolling or annual aggregate.
+
+    Field map (confirmed live against real repository data):
+      reportedEPS -> dilutedeps, falling back to basiceps for a period where
+                     the diluted tag is absent -- same per-period fallback
+                     get_quarterly_eps_intrinio() already used.
+      fiscalDateEnding -> period_end_date (the real calendar date this
+                          repository already stores -- strictly better than
+                          the live function's own synthesized
+                          "{fiscal_year}-{fiscal_period}" label, which was
+                          only ever a stand-in for a date Intrinio's live
+                          discovery call didn't expose at that call site).
+
+    Returns None only if the ticker can't be resolved or has zero
+    income_statement periods on file at all. A period present but missing
+    BOTH eps tags gets reportedEPS=None (never fabricated, never skipped --
+    matches the live function's own per-period degrade, so callers' existing
+    None-handling needs no changes).
+    """
+    conn = _connect(db_path)
+    try:
+        company_id = resolve_company_id(conn, ticker)
+        if company_id is None:
+            return None
+        periods = _recent_periods(conn, company_id, "income_statement", limit=n_quarters)
+        if not periods:
+            return None
+        values = _values_for_fundamentals(conn, [p["fundamental_id"] for p in periods])
+        out = []
+        for p in periods:
+            tag_values = values.get(p["fundamental_id"], {})
+            eps = tag_values.get("dilutedeps")
+            if eps is None:
+                eps = tag_values.get("basiceps")
+            out.append({"fiscalDateEnding": p["period_end_date"], "reportedEPS": eps})
+        return out
     finally:
         conn.close()
