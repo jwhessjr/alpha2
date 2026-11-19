@@ -34,6 +34,36 @@ from user_facing_flags import format_for_report_surface
 NCI_ORDINARY_TAG = "noncontrollinginterests"
 NCI_REDEEMABLE_TAG = "redeemablenoncontrollinginterest"
 
+#: Balance-sheet identity cross-check, used only when BOTH direct NCI tags
+#: are MISSING (never when either is present, even as explicit zero or a
+#: real value -- this never overrides a directly-reported figure). Many
+#: filers simply omit the NCI line item entirely when it's zero, rather
+#: than reporting an explicit "$0" -- so MISSING-on-both conflates "no
+#: claim, never reported" with a genuine data/coverage gap. Confirmed
+#: live, 2026-11-19, against 129 real "insufficient evidence" tickers:
+#: 69 resolve cleanly via this identity, 57 had a real direct NCI tag
+#: (not this case at all), 3 failed the balance check by a small
+#: rounding-sized amount and correctly stay unresolved.
+#:
+#: Two independent checks, both required:
+#:   1. totalequity == totalequityandnoncontrollinginterests
+#:      -> ordinary (permanent-equity) NCI is zero.
+#:   2. totalassets == totalliabilities + totalequityandnoncontrollinginterests
+#:      -> the balance sheet balances with no additional mezzanine/temporary-
+#:         equity layer, so redeemable NCI (reported outside both liabilities
+#:         and permanent equity per ASC 480-10-S99) is zero too. Check 1 alone
+#:         cannot prove this -- redeemable NCI is scoped outside the equity
+#:         rollup entirely, so a nonzero redeemable claim could sit alongside
+#:         a clean ordinary-equity identity undetected by check 1.
+#: Both are exact-dollar XBRL figures in practice; a $1 tolerance absorbs
+#: float round-trip noise without being loose enough to paper over a real
+#: (if small) mezzanine claim -- see the 3 real-world near-misses above.
+NCI_TOTAL_EQUITY_TAG = "totalequity"
+NCI_TOTAL_EQUITY_AND_NCI_TAG = "totalequityandnoncontrollinginterests"
+NCI_TOTAL_ASSETS_TAG = "totalassets"
+NCI_TOTAL_LIABILITIES_TAG = "totalliabilities"
+NCI_IDENTITY_TOLERANCE = 1.0
+
 
 class OwnershipScreenError(Exception):
     """Raised internally only — always caught by ownership_control_note()
@@ -118,12 +148,33 @@ def fetch_current_observations(ticker: str, financial_data_db_path: str, today_i
         ord_val, ord_status = _classify_value(get_tag(NCI_ORDINARY_TAG))
         red_val, red_status = _classify_value(get_tag(NCI_REDEEMABLE_TAG))
 
+        derived_zero = False
+        if ord_status == DataStatus.MISSING and red_status == DataStatus.MISSING:
+            def get_raw(tag_name):
+                row = get_tag(tag_name)
+                return row[0] if row is not None else None
+
+            total_equity = get_raw(NCI_TOTAL_EQUITY_TAG)
+            total_equity_and_nci = get_raw(NCI_TOTAL_EQUITY_AND_NCI_TAG)
+            total_assets = get_raw(NCI_TOTAL_ASSETS_TAG)
+            total_liabilities = get_raw(NCI_TOTAL_LIABILITIES_TAG)
+            if None not in (total_equity, total_equity_and_nci, total_assets, total_liabilities):
+                ordinary_proven_zero = abs(total_equity - total_equity_and_nci) < NCI_IDENTITY_TOLERANCE
+                balances_with_no_mezzanine = abs(
+                    total_assets - (total_liabilities + total_equity_and_nci)
+                ) < NCI_IDENTITY_TOLERANCE
+                if ordinary_proven_zero and balances_with_no_mezzanine:
+                    ord_val, ord_status = 0.0, DataStatus.EXPLICIT_ZERO
+                    red_val, red_status = 0.0, DataStatus.EXPLICIT_ZERO
+                    derived_zero = True
+
         return OwnershipProfile(
             ticker=ticker,
             ordinary_nci_book=ord_val, ordinary_nci_status=ord_status,
             redeemable_nci_book=red_val, redeemable_nci_status=red_status,
             balance_sheet_as_of=bs_date, balance_sheet_freshness_days=freshness_days,
             fundamentals_quarantined=fundamentals_quarantined, identity_quarantined=bool(identity_quarantined),
+            nci_zero_derived_from_balance_sheet_identity=derived_zero,
         )
     finally:
         conn.close()

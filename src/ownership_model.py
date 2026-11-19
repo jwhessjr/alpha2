@@ -192,3 +192,11 @@ class OwnershipProfile:
     identity_quarantined: bool = False
     no_company_match: bool = False
     registrant_deregistered: bool = False
+    nci_zero_derived_from_balance_sheet_identity: bool = False
+    """True when both ordinary_nci_status and redeemable_nci_status were
+    set to EXPLICIT_ZERO not from a directly-reported tag, but derived
+    from the balance-sheet identity check in hg_ownership_controls.py
+    (totalequity == totalequityandnoncontrollinginterests, and
+    totalassets == totalliabilities + totalequityandnoncontrollinginterests).
+    Lets assess() disclose the difference rather than presenting a
+    derivation as if it were a directly-reported explicit zero."""

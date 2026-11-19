@@ -278,7 +278,20 @@ def assess(profile: OwnershipProfile, curated: Optional[CuratedStructuralEvidenc
         if profile.ordinary_nci_status == DataStatus.EXPLICIT_ZERO and profile.redeemable_nci_status == DataStatus.EXPLICIT_ZERO:
             a.calculability = CalculabilityStatus.NOT_APPLICABLE_NO_CLAIM
             a.materiality = MaterialityStatus.NOT_APPLICABLE_NO_CLAIM
-            a.materiality_basis = "No NCI claim reported (explicit zero on both fields)."
+            if profile.nci_zero_derived_from_balance_sheet_identity:
+                a.materiality_basis = (
+                    "No NCI claim reported -- derived from balance-sheet identity "
+                    "(totalequity == totalequityandnoncontrollinginterests, and "
+                    "totalassets == totalliabilities + totalequityandnoncontrollinginterests), "
+                    "not a directly-reported explicit-zero tag."
+                )
+                a.preserved_caveats.append(
+                    "NCI confirmed zero via balance-sheet identity derivation, not a "
+                    "directly-reported explicit-zero tag -- see hg_ownership_controls.py's "
+                    "NCI_IDENTITY_TOLERANCE check."
+                )
+            else:
+                a.materiality_basis = "No NCI claim reported (explicit zero on both fields)."
             a.wacc_status = WaccStatus.NOT_APPLICABLE_NO_CLAIM
             a.overall_readiness = OverallReadiness.READY_NO_CLAIM
             return a
