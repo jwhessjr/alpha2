@@ -1841,6 +1841,63 @@ def extreme_reinvestment_rate_note(reinvestment_rate: float) -> str:
     )
 
 
+# SIC codes in which Intrinio's standardized depreciationexpense/
+# amortizationexpense tags are confirmed (EDGAR-verified, UPBD + PRG,
+# 2026-11-20) to bundle depreciation of a non-PP&E asset base --
+# specifically, rent-to-own/lease-to-own consumer merchandise depreciation
+# -- that has no counterpart in this repository's
+# purchaseofplantpropertyandequipment tag. SIC 7359 ("Services-Equipment
+# Rental & Leasing, NEC") is NOT uniformly affected: United Rentals (URI,
+# same SIC, a genuine equipment-rental-fleet business where fleet
+# depreciation legitimately tracks fleet capex) shows a normal
+# depreciation/capex ratio (~8.5x TTM) and is correctly excluded by the
+# ratio test below, not by this SIC set alone. See docs/decisions.md
+# 2026-11-20.
+RENTAL_MERCHANDISE_DEPRECIATION_SIC = {7359}
+
+# UPBD (~23.1x) and PRG (~99.8x) TTM depreciation/capex are both confirmed
+# real defects via EDGAR; URI (~8.5x, same SIC, confirmed legitimate) sets
+# the safe floor. 15x leaves a wide margin on both sides but has only
+# been validated against this one SIC's current population -- revisit if
+# a new SIC-7359 ticker is ever added and lands near this line.
+RENTAL_MERCHANDISE_DEPRECIATION_RATIO = 15.0
+
+
+def rental_merchandise_depreciation_note(sic: int | None, capex: float, depreciation: float) -> str:
+    """
+    Flag when a SIC 7359 ticker's TTM depreciation vastly exceeds its TTM
+    capex -- the signature of Intrinio's standardized depreciationexpense
+    tag bundling rental/lease merchandise depreciation (a recurring
+    operating cost tied to a non-PP&E asset base) rather than true
+    property depreciation. Both call sites treat a non-empty note as a
+    withhold-the-valuation condition, not a mere flag -- unlike
+    extreme_reinvestment_rate_note() just above (a genuine "flag, don't
+    filter" case for legitimate reinvestment outliers like EOG/CMCSA),
+    this specific combination means there is no real reinvestment signal
+    in this repository to read at all for this ticker, not an
+    unusual-but-real economic state. See docs/decisions.md 2026-11-20.
+    """
+    if sic not in RENTAL_MERCHANDISE_DEPRECIATION_SIC:
+        return ""
+    if capex is None or capex <= 0:
+        return ""
+    if depreciation is None:
+        return ""
+    ratio = depreciation / capex
+    if ratio <= RENTAL_MERCHANDISE_DEPRECIATION_RATIO:
+        return ""
+    return (
+        f"SIC {sic} (equipment rental & leasing) with TTM depreciation "
+        f"{ratio:.1f}x TTM capex -- confirmed via EDGAR that this SIC's "
+        "standardized depreciation tag can include merchandise/lease-asset "
+        "depreciation with no matching capex counterpart in this "
+        "repository, making the reinvestment rate and growth rate "
+        "meaningless rather than merely unusual. Valuation withheld "
+        "rather than computed from a reinvestment figure with no real "
+        "asset-base counterpart."
+    )
+
+
 def high_growth_rate_note(growth_rate: float, cap: float = 0.30) -> str:
     """
     Flag (never cap) when the explicit-period growth rate exceeds `cap`.
@@ -3723,6 +3780,25 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
         reinvestment_rate = firm_reinvestment / adjusted_ebiat
         logger.info(f"Reinvestment rate = {reinvestment_rate:,.4f}")
 
+        sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
+        rental_merch_note = rental_merchandise_depreciation_note(sic, capex, depreciation)
+        if rental_merch_note:
+            logger.warning(f"{ticker}: {rental_merch_note}")
+            return Stock_Value(
+                ticker=ticker, valuation_date=valuation_date, ent_name=ent_name,
+                industry=industry, cik=cik,
+                beta=calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE),
+                market_cap=market_cap,
+                price=price, shares_outstanding=shares_outstanding,
+                risk_free_rate=RISK_FREE, eq_premium=EQ_PREM,
+                growth_rate=0.0, cost_of_capital=0.0, wealth_pc=0.0,
+                fcff_value=0.0, terminal_value=0.0, share_value=0.0,
+                margin_of_safety=0.0, margin_of_safety_pc=0.0, target_price=0.0,
+                earnings_yield=0.0, dividend_yield=dividend_yield,
+                notes=rental_merch_note,
+                analyst_count=analyst_count,
+            )
+
         return_on_capital, roc_notes = calc_gated_return_on_capital(
             ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
         )
@@ -4688,6 +4764,12 @@ def _value_stock_detail_fcff(
         _extreme_rr_note = extreme_reinvestment_rate_note(reinvestment_rate)
         if _extreme_rr_note:
             logger.warning(f"{ticker}: {_extreme_rr_note}")
+
+        sic = hg_dcflib.get_sic(ticker, INTRINIO_KEY)
+        rental_merch_note = rental_merchandise_depreciation_note(sic, capex, depreciation)
+        if rental_merch_note:
+            raise ValueError(rental_merch_note)
+
         return_on_capital, roc_notes = calc_gated_return_on_capital(
             ticker, adjusted_ebiat, adjusted_bv_equity, bv_debt, bal_sht, inc_stmnt, db_path
         )
