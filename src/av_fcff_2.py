@@ -3791,6 +3791,54 @@ def _value_stock_fcff(ticker: str, growth_period: int, industry: str, db_path: s
                     f"-- falling back to RR x ROIC growth_rate for this ticker only."
                 )
 
+        # Insufficient reliable growth history (decided 2026-11-19, Jim's
+        # direct call): source == "industry_anchor" means BOTH the latest-
+        # year growth AND the 3yr CAGR were distorted (calc_hessgrp_growth_
+        # path()'s own fallback chain only reaches the industry anchor when
+        # neither company-specific signal is trustworthy -- confirmed
+        # equivalent to latest_distorted AND cagr_distorted, since
+        # _revenue_growth_rate_distorted() returns True for a None rate
+        # too). Previously this silently substituted the industry-average
+        # growth rate and produced a full, confident-looking IV anyway --
+        # live-confirmed on CRMD (a 2016-era shell that only began
+        # generating real commercial revenue in 2023-24; 8+ years of near-
+        # zero-revenue history makes its own long-run CAGR meaningless, and
+        # its 1yr growth is a post-peak reversal, not a trend) to produce a
+        # 94%-margin-of-safety IV built almost entirely on a generic
+        # industry growth assumption with no genuine company-specific
+        # signal behind it. Jim's call: don't substitute a industry-wide
+        # guess for a company that hasn't shown us what it's actually
+        # capable of -- withhold the valuation instead of manufacturing a
+        # false-confidence number. Still writes a row (never a silent skip
+        # -- see the "Write the row even when..." comment below for why a
+        # skip is indistinguishable from "not yet attempted" and causes
+        # endless nightly re-attempts) with zeroed numerics and a note
+        # explaining why, exactly like the return_on_capital-is-None stop
+        # above.
+        if growth_forecast_diag is not None and growth_forecast_diag.get("source") == "industry_anchor":
+            insufficient_history_note = (
+                "Insufficient reliable growth history -- both the latest-year revenue "
+                "growth and the 3-year CAGR are distorted (see hessgrp_growth_forecast_note "
+                "fields), so no trustworthy company-specific growth signal exists. "
+                "Substituting an industry-average growth rate would produce a false-"
+                "confidence IV; valuation withheld rather than manufactured."
+            )
+            logger.warning(f"{ticker}: {insufficient_history_note}")
+            return Stock_Value(
+                ticker=ticker, valuation_date=valuation_date, ent_name=ent_name,
+                industry=industry, cik=cik,
+                beta=calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE),
+                market_cap=market_cap,
+                price=price, shares_outstanding=shares_outstanding,
+                risk_free_rate=RISK_FREE, eq_premium=EQ_PREM,
+                growth_rate=0.0, cost_of_capital=0.0, wealth_pc=0.0,
+                fcff_value=0.0, terminal_value=0.0, share_value=0.0,
+                margin_of_safety=0.0, margin_of_safety_pc=0.0, target_price=0.0,
+                earnings_yield=0.0, dividend_yield=dividend_yield,
+                notes=insufficient_history_note,
+                analyst_count=analyst_count,
+            )
+
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
         discount_rate = calc_discount_rate(
             inc_stmnt, bv_debt, market_cap, unlevered_beta, RISK_FREE, EQ_PREM
@@ -4676,6 +4724,20 @@ def _value_stock_detail_fcff(
                     f"{ticker}: HessGrp growth-path forecast skipped ({exc}) "
                     f"-- falling back to RR x ROIC growth_rate for this ticker only."
                 )
+
+        # Insufficient reliable growth history (2026-11-19) -- see the
+        # matching batch-path comment for the full reasoning. This path
+        # raises (not returns a zeroed object) matching its own existing
+        # stop-condition convention a few lines above (return_on_capital
+        # is None -> raise ValueError).
+        if growth_forecast_diag is not None and growth_forecast_diag.get("source") == "industry_anchor":
+            raise ValueError(
+                "Insufficient reliable growth history -- both the latest-year revenue "
+                "growth and the 3-year CAGR are distorted, so no trustworthy company-"
+                "specific growth signal exists. Substituting an industry-average growth "
+                "rate would produce a false-confidence IV; valuation withheld rather than "
+                "manufactured."
+            )
 
         # Compute discount rate components inline to capture intermediates
         levered_beta = calc_levered_beta(unlevered_beta, bv_debt, market_cap, MARGINAL_TAX_RATE)
